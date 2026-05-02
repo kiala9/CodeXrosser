@@ -164,6 +164,12 @@ class SessionDetail:
     timeline: list[SessionTimelineItem]
     timeline_total: int
     timeline_next_offset: int | None
+    # Repository SQL offset of ``timeline[0]`` before any client-side
+    # dedup. Lets the detail panel know where the loaded slice starts in
+    # the full session and request older pages incrementally as the user
+    # scrolls past the loaded edge. Defaults to 0 so existing callers
+    # that hand over a complete timeline keep working unchanged.
+    timeline_loaded_offset: int = 0
 
 
 @dataclass(frozen=True)
