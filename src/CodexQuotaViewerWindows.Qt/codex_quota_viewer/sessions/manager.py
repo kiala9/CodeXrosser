@@ -132,7 +132,7 @@ class SessionsManager:
             return page
         return SessionTimelinePage(
             items=deduped,
-            total=len(deduped),
+            total=page.total,
             next_offset=page.next_offset,
         )
 

@@ -2209,6 +2209,7 @@ class SessionsPage(QWidget):
             and event.type() == QEvent.Resize
         ):
             self._reposition_list_overlay()
+            self._reposition_floating_actions()
         if (
             obj is getattr(self, "_list_container", None)
             and event.type() == QEvent.Resize
@@ -2329,7 +2330,7 @@ class SessionsPage(QWidget):
             self._extending_scroll_range = False
 
     def _reposition_floating_actions(self) -> None:
-        """Center the floating action bar over the bottom of the list card.
+        """Center the floating action bar over the visible session list.
 
         The bar truly floats: it overlays the tree's viewport without
         shrinking it, so mid-scroll rows pass under the bar (image 2). To
@@ -2341,10 +2342,17 @@ class SessionsPage(QWidget):
         if bar is None:
             return
         container = self._list_container
-        bar.adjustSize()
-        bar_size = bar.size()
+        bar_size = bar.sizeHint().expandedTo(bar.minimumSizeHint())
+        bar.resize(bar_size)
         margin = 18
-        x = max(margin, (container.width() - bar_size.width()) // 2)
+        # Center over the list section (panel) rather than the tree's
+        # viewport. When the tree shows a vertical scrollbar the viewport
+        # is ~12px narrower than the section, and centering on the viewport
+        # made the bar visibly offset to the left of the panel's centre.
+        # The panel border is what the user perceives as "the list", so
+        # center the bar relative to it.
+        centered_x = (container.width() - bar_size.width()) // 2
+        x = max(margin, min(centered_x, container.width() - bar_size.width() - margin))
         y = max(margin, container.height() - bar_size.height() - margin)
         bar.move(x, y)
         bar.raise_()

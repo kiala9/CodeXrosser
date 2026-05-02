@@ -47,6 +47,32 @@ SESSION_SELECT_COLUMNS = """
 """
 
 
+SESSION_SELECT_COLUMNS_QUALIFIED = """
+    sessions.id as id,
+    coalesce(sessions.active_path, sessions.archive_path, sessions.snapshot_path) as filePath,
+    sessions.active_path as activePath,
+    sessions.archive_path as archivePath,
+    sessions.snapshot_path as snapshotPath,
+    sessions.original_relative_path as originalRelativePath,
+    sessions.cwd as cwd,
+    sessions.started_at as startedAt,
+    sessions.originator as originator,
+    sessions.source as source,
+    sessions.cli_version as cliVersion,
+    sessions.model_provider as modelProvider,
+    sessions.size_bytes as sizeBytes,
+    sessions.line_count as lineCount,
+    sessions.event_count as eventCount,
+    sessions.tool_call_count as toolCallCount,
+    sessions.user_prompt_excerpt as userPromptExcerpt,
+    sessions.latest_agent_message_excerpt as latestAgentMessageExcerpt,
+    sessions.status as status,
+    sessions.created_at as created_at,
+    sessions.updated_at as updated_at,
+    sessions.indexed_at as indexed_at
+"""
+
+
 class SessionRepository:
     def __init__(self, database_path: Path):
         self.database_path = Path(database_path)
@@ -413,14 +439,14 @@ class SessionRepository:
     def _list_sessions_with_fts(self, filters: SessionFilters) -> list[SessionRecord]:
         if not self.fts_available:
             raise sqlite3.Error("session_search FTS unavailable")
-        clause, params = _build_session_filter_clause(filters)
+        clause, params = _build_session_filter_clause(filters, table="sessions")
         rows = self._connection.execute(
             f"""
-            select {SESSION_SELECT_COLUMNS}
+            select {SESSION_SELECT_COLUMNS_QUALIFIED}
             from sessions
             inner join session_search on session_search.session_id = sessions.id
             where {clause} and session_search match :query
-            order by started_at desc, id asc
+            order by sessions.started_at desc, sessions.id asc
             """,
             {**params, "query": filters.query or ""},
         ).fetchall()
@@ -688,18 +714,21 @@ def _timeline_item_to_params(session_id: str, ordinal: int, item: SessionTimelin
     )
 
 
-def _build_session_filter_clause(filters: SessionFilters) -> tuple[str, dict[str, Any]]:
+def _build_session_filter_clause(
+    filters: SessionFilters, *, table: str | None = None
+) -> tuple[str, dict[str, Any]]:
     clauses = ["1 = 1"]
     params: dict[str, Any] = {}
+    prefix = f"{table}." if table else ""
     if filters.status:
         if filters.status == "archived":
-            clauses.append("(status = :status or status = 'restorable')")
+            clauses.append(f"({prefix}status = :status or {prefix}status = 'restorable')")
             params["status"] = filters.status
         else:
-            clauses.append("status = :status")
+            clauses.append(f"{prefix}status = :status")
             params["status"] = filters.status
     if filters.cwd:
-        clauses.append("cwd = :cwd")
+        clauses.append(f"{prefix}cwd = :cwd")
         params["cwd"] = filters.cwd
     return " and ".join(clauses), params
 

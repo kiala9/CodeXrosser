@@ -48,6 +48,8 @@ from .models import (
     WritePreview,
     now_utc,
 )
+from .sessions.errors import SessionError
+from .sessions.paths import ensure_inside_realpath
 
 
 class ApiAccountError(Exception):
@@ -2235,6 +2237,23 @@ class SessionMetaSynchronizer:
         return True
 
 
+def _safe_session_jsonl_file(root: Path, file: Path) -> Path | None:
+    try:
+        safe_file = ensure_inside_realpath(root, file)
+        return safe_file if safe_file.is_file() else None
+    except (OSError, SessionError):
+        return None
+
+
+def _safe_session_jsonl_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for file in root.rglob("*.jsonl"):
+        safe_file = _safe_session_jsonl_file(root, file)
+        if safe_file is not None:
+            files.append(safe_file)
+    return files
+
+
 class ProviderVisibilitySynchronizer:
     def sync(self, paths: AppPaths, target: CodexHomeTarget, target_provider: str) -> ProviderVisibilitySyncSummary:
         changed = 0
@@ -2247,7 +2266,11 @@ class ProviderVisibilitySynchronizer:
                 continue
             for file in root.rglob("*.jsonl"):
                 try:
-                    result = self._sync_session_file(file, target_provider)
+                    safe_file = _safe_session_jsonl_file(root, file)
+                    if safe_file is None:
+                        skipped += 1
+                        continue
+                    result = self._sync_session_file(safe_file, target_provider)
                 except OSError:
                     skipped += 1
                     continue
@@ -3524,7 +3547,7 @@ class SafeSwitchService:
         files: list[Path] = []
         for root in self.paths.session_roots(target):
             if root.exists():
-                files.extend(root.rglob("*.jsonl"))
+                files.extend(_safe_session_jsonl_files(root))
         return files
 
     def _files_to_backup(self, target: CodexHomeTarget, include_config: bool) -> list[Path]:

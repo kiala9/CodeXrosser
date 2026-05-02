@@ -1448,6 +1448,26 @@ def test_real_switch_syncs_provider_visibility_when_provider_changes(tmp_path: P
     assert {"auth.json", "config.toml", "state_5.sqlite", "one.jsonl"}.issubset(backed_up)
 
 
+def test_provider_visibility_sync_skips_session_symlink_outside_root(tmp_path: Path) -> None:
+    paths = AppPaths.for_current_user(str(tmp_path / "data"), str(tmp_path / ".codex"), str(tmp_path / "heavy"))
+    paths.ensure_created()
+    session_root = paths.real_codex_home / "sessions"
+    session_root.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside.jsonl"
+    _write_session_file(outside, "thread-1", "old-provider", 100)
+    link = session_root / "linked.jsonl"
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError) as ex:
+        pytest.skip(f"symlink creation is unavailable: {ex}")
+
+    summary = ProviderVisibilitySynchronizer().sync(paths, CodexHomeTarget.REAL, "openai")
+
+    assert summary.changed_session_files == 0
+    assert summary.skipped_session_files == 1
+    assert '"model_provider":"old-provider"' in outside.read_text(encoding="utf-8").splitlines()[0]
+
+
 def test_real_oauth_to_oauth_switch_writes_only_auth(tmp_path: Path) -> None:
     paths = AppPaths.for_current_user(str(tmp_path / "data"), str(tmp_path / ".codex"), str(tmp_path / "heavy"))
     paths.ensure_created()
