@@ -3413,6 +3413,24 @@ class _SessionDetailPanel(QFrame):
         new_start = max(0, self._window_start - _WINDOW_HALF)
         new_end = min(len(self._all_blocks), new_start + _WINDOW_SIZE)
 
+        # Capture the topmost-visible bubble's blockIndex + viewport
+        # offset so we can land scroll precisely after layout. Using
+        # ``widget.sizeHint().height()`` summed across freshly-inserted
+        # widgets undercounts (word-wrap height-for-width isn't computed
+        # before a layout pass), which made setValue(prev + added_height)
+        # land far above the user's prior view — the "scrolling up jumps"
+        # symptom.
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        raw_scroll = scrollbar.value()
+        top_widget = self._topmost_visible_widget()
+        anchor_block_index: int | None = None
+        anchor_offset = 0
+        if top_widget is not None:
+            candidate = top_widget.property("blockIndex")
+            if isinstance(candidate, int):
+                anchor_block_index = candidate
+                anchor_offset = raw_scroll - top_widget.y()
+
         drop_count = self._window_end - new_end
         if drop_count > 0:
             tail_first = self._timeline_layout.count() - 2  # before stretch
@@ -3420,18 +3438,29 @@ class _SessionDetailPanel(QFrame):
                 list(range(tail_first, tail_first - drop_count, -1))
             )
 
-        scrollbar = self._timeline_scroll.verticalScrollBar()
-        prev_value = scrollbar.value()
-        added_height = self._build_window_widgets(
-            new_start, self._window_start, prepend=True
-        )
         self._suppress_edge_slide = True
-        scrollbar.setValue(prev_value + added_height)
-        self._suppress_edge_slide = False
+        try:
+            self._build_window_widgets(
+                new_start, self._window_start, prepend=True
+            )
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+        finally:
+            self._suppress_edge_slide = False
         self._window_start = new_start
         self._window_end = new_end
         self._refresh_status_label()
         self._refresh_minimap()
+
+        # Defer the scroll restore one event-loop tick so Qt has finished
+        # propagating the real wrapped-text heights to widget.y(); the
+        # apply re-finds the anchor block and lands at widget.y() + offset.
+        if anchor_block_index is not None:
+            QTimer.singleShot(
+                0,
+                lambda b=anchor_block_index, off=anchor_offset, raw=raw_scroll:
+                    self._apply_prepend_anchor(b, off, raw),
+            )
 
     # --- older-page pagination ------------------------------------------
     #
@@ -3494,10 +3523,19 @@ class _SessionDetailPanel(QFrame):
             self._timeline_item_count = len(self._all_timeline_items)
             return
 
-        # Anchor by the active user-prompt's id so we can land the user
-        # back on the same content after recoalescing shifts every block
-        # index by some amount.
-        anchor_item_id = self._current_user_anchor_id()
+        # Capture the topmost-visible bubble + its viewport offset so we
+        # can land the user back at the same pixel position after the
+        # recoalesce. Anchoring on the active user prompt (the prior
+        # behavior) snapped the view to that prompt's absolute y on every
+        # older-page fetch — felt like a forced jump.
+        bar = self._timeline_scroll.verticalScrollBar()
+        raw_scroll = bar.value()
+        top_widget = self._topmost_visible_widget()
+        anchor_item_id = self._anchor_id_for_widget(top_widget)
+        anchor_offset = (
+            raw_scroll - top_widget.y() if top_widget is not None else 0
+        )
+        fallback_user_id = self._current_user_anchor_id()
 
         self._all_timeline_items = list(items) + self._all_timeline_items
         self._loaded_offset = max(0, sql_offset)
@@ -3509,16 +3547,23 @@ class _SessionDetailPanel(QFrame):
             if kind == "single" and payload.type == "message:user"
         ]
 
-        new_anchor_block = self._block_for_message_id(anchor_item_id)
+        new_anchor_block = self._block_for_anchor_id(anchor_item_id)
+        if new_anchor_block is None:
+            # Defensive: top-visible item somehow not in the new blocks.
+            # Fall back to the active user prompt (loses px precision
+            # but keeps the view in the same conversational section),
+            # then to the first user prompt, then to 0.
+            new_anchor_block = self._block_for_message_id(fallback_user_id)
         if new_anchor_block is None and self._user_anchor_blocks:
-            # Fallback: anchor on whatever user prompt now corresponds
-            # to roughly the user's previous section position. Picking
-            # the first newly-loaded user prompt is the worst case but
-            # at least keeps us in-bounds.
             new_anchor_block = self._user_anchor_blocks[0]
         if new_anchor_block is None:
             new_anchor_block = 0 if self._all_blocks else None
-        self._current_user_block = new_anchor_block
+
+        # Track which user section we're in for the minimap highlight —
+        # the user-prompt id may have shifted to a new block index.
+        new_user_block = self._block_for_message_id(fallback_user_id)
+        if new_user_block is not None:
+            self._current_user_block = new_user_block
 
         focus = new_anchor_block if new_anchor_block is not None else 0
         self._set_window_centered_on(focus)
@@ -3533,15 +3578,75 @@ class _SessionDetailPanel(QFrame):
         finally:
             self._suppress_edge_slide = False
 
-        # Defer the scroll-to-anchor so Qt has propagated geometry —
+        # Defer the scroll restore so Qt has propagated geometry —
         # widget.y() is unreliable in the same tick as the activate().
-        QTimer.singleShot(0, self._scroll_to_anchor_after_prepend)
+        if new_anchor_block is not None:
+            QTimer.singleShot(
+                0,
+                lambda b=new_anchor_block, off=anchor_offset, raw=raw_scroll:
+                    self._apply_prepend_anchor(b, off, raw),
+            )
         self._refresh_status_label()
         self._refresh_minimap()
 
-    def _scroll_to_anchor_after_prepend(self) -> None:
-        if self._current_user_block is None:
-            return
+    def _topmost_visible_widget(self) -> QWidget | None:
+        """The first materialized bubble whose bottom edge sits below the
+        viewport top — i.e. the one that visually anchors the user's
+        current view. ``count() - 1`` skips the trailing stretch."""
+        bar = self._timeline_scroll.verticalScrollBar()
+        viewport_top = bar.value()
+        for i in range(self._timeline_layout.count() - 1):
+            item = self._timeline_layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is None or widget.isHidden():
+                continue
+            if widget.y() + widget.height() > viewport_top:
+                return widget
+        return None
+
+    def _anchor_id_for_widget(self, widget: QWidget | None) -> str | None:
+        """Pull a stable item id from the block this widget represents.
+        For tool-group blocks the leading tool_call's id is used — that
+        leading edge survives recoalesce even when the group merges with
+        newly-prepended tool_calls at the boundary."""
+        if widget is None:
+            return None
+        block_index = widget.property("blockIndex")
+        if not isinstance(block_index, int):
+            return None
+        if not 0 <= block_index < len(self._all_blocks):
+            return None
+        kind, payload = self._all_blocks[block_index]
+        if kind == "single":
+            return getattr(payload, "id", None)
+        if kind == "tool_group" and payload:
+            return getattr(payload[0], "id", None)
+        return None
+
+    def _block_for_anchor_id(self, item_id: str | None) -> int | None:
+        """Find the block (post-recoalesce) that contains ``item_id``.
+        Searches tool-group payload contents too — a leading tool_call
+        may now sit inside a larger merged group at a different index."""
+        if not item_id:
+            return None
+        for index, (kind, payload) in enumerate(self._all_blocks):
+            if kind == "single":
+                if getattr(payload, "id", None) == item_id:
+                    return index
+            elif kind == "tool_group":
+                for tool_item in payload:
+                    if getattr(tool_item, "id", None) == item_id:
+                        return index
+        return None
+
+    def _apply_prepend_anchor(
+        self, block_index: int, offset: int, raw_scroll: int
+    ) -> None:
+        """Restore scroll so the anchored bubble sits at the same viewport
+        offset as before the older-page prepend. Falls back to the raw
+        pre-prepend scroll value (clamped) when the anchor widget isn't
+        materialized — defensive only; ``_set_window_centered_on`` should
+        have brought it into the window."""
         bar = self._timeline_scroll.verticalScrollBar()
         target_y: int | None = None
         for i in range(self._timeline_layout.count() - 1):
@@ -3549,14 +3654,15 @@ class _SessionDetailPanel(QFrame):
             widget = item.widget() if item is not None else None
             if widget is None:
                 continue
-            if widget.property("blockIndex") == self._current_user_block:
+            if widget.property("blockIndex") == block_index:
                 target_y = widget.y()
                 break
-        if target_y is None:
-            return
         self._suppress_edge_slide = True
         try:
-            bar.setValue(min(target_y, bar.maximum()))
+            if target_y is not None:
+                bar.setValue(min(max(0, target_y + offset), bar.maximum()))
+            else:
+                bar.setValue(min(max(0, raw_scroll), bar.maximum()))
         finally:
             self._suppress_edge_slide = False
 

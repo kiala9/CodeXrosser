@@ -481,6 +481,142 @@ def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
     panel.close()
 
 
+def test_prepend_older_anchors_to_topmost_visible_bubble() -> None:
+    """Older-page prepend must anchor the scroll restore onto the bubble
+    that was at the viewport top — not snap to the active user prompt.
+    The bug being regressed: ``_scroll_to_anchor_after_prepend`` set
+    scroll to ``_current_user_block.widget.y()`` unconditionally, so
+    every fetch yanked the view back to the nearest user prompt."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+    from PySide6.QtWidgets import QWidget
+
+    QApplication.instance() or QApplication([])
+    rec = _record("anchor-topmost")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+
+    # Pick a non-user item as the simulated "topmost-visible" bubble.
+    # If the fix is working, the prepend will anchor on this exact id;
+    # if the old bug were back, it would anchor on the nearest user
+    # prompt (e-800 or e-805) instead.
+    target_id = "e-803"
+    target_block_index = next(
+        i
+        for i, (kind, payload) in enumerate(panel._all_blocks)
+        if kind == "single" and getattr(payload, "id", None) == target_id
+    )
+    fake_top = QWidget()
+    fake_top.setProperty("blockIndex", target_block_index)
+    panel._topmost_visible_widget = lambda: fake_top  # type: ignore[method-assign]
+
+    captured: dict[str, object] = {}
+
+    def stub_apply(block_index: int, offset: int, raw_scroll: int) -> None:
+        captured["block_index"] = block_index
+        captured["offset"] = offset
+        captured["raw_scroll"] = raw_scroll
+
+    panel._apply_prepend_anchor = stub_apply  # type: ignore[method-assign]
+
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+    QApplication.processEvents()
+
+    # The anchor must be the new index of e-803, not of the surrounding
+    # user prompts. _block_for_anchor_id resolves the post-recoalesce
+    # block index for the same id we captured before the prepend.
+    new_target_block = panel._block_for_anchor_id(target_id)
+    assert new_target_block is not None
+    assert captured.get("block_index") == new_target_block
+    user_block_e800 = panel._block_for_message_id("e-800")
+    user_block_e805 = panel._block_for_message_id("e-805")
+    assert captured.get("block_index") not in {user_block_e800, user_block_e805}
+    panel.close()
+
+
+def test_block_for_anchor_id_resolves_tool_group_inner_ids() -> None:
+    """``_block_for_anchor_id`` must find a tool_call by id even when
+    coalesce has merged it into a tool_group block. ``_block_for_message_id``
+    only checks single-item blocks and returns None for tool_group inner
+    ids — the new helper has to cover that gap so prepend's topmost-
+    visible anchor survives a tool-group merge at the boundary."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("anchor-toolgroup")
+    timeline = [
+        SessionTimelineItem(
+            id="e-user", type="message:user", timestamp="t", text="hi"
+        ),
+        SessionTimelineItem(
+            id="e-tc-1",
+            type="tool_call",
+            timestamp="t",
+            tool_name="read",
+            summary="r1",
+            status="completed",
+        ),
+        SessionTimelineItem(
+            id="e-tc-2",
+            type="tool_call",
+            timestamp="t",
+            tool_name="read",
+            summary="r2",
+            status="completed",
+        ),
+        SessionTimelineItem(
+            id="e-asst", type="message:assistant", timestamp="t", text="ok"
+        ),
+    ]
+    detail = SessionDetail(
+        record=rec, audit_entries=[], timeline=timeline,
+        timeline_total=len(timeline), timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+
+    # tool_call items coalesce into a tool_group block.
+    group_block = next(
+        i for i, (kind, _payload) in enumerate(panel._all_blocks) if kind == "tool_group"
+    )
+    # The legacy helper can't see inner tool_call ids.
+    assert panel._block_for_message_id("e-tc-2") is None
+    # The new helper must.
+    assert panel._block_for_anchor_id("e-tc-2") == group_block
+    assert panel._block_for_anchor_id("e-tc-1") == group_block
+    # Single-block lookups still work.
+    assert panel._block_for_anchor_id("e-user") == panel._block_for_message_id("e-user")
+    assert panel._block_for_anchor_id("e-asst") == panel._block_for_message_id("e-asst")
+    panel.close()
+
+
 def test_scroll_settled_at_top_edge_triggers_older_fetch() -> None:
     """Regression: when the panel is tail-loaded with _window_start == 0
     but _loaded_offset > 0, scrolling near the top edge MUST trigger
