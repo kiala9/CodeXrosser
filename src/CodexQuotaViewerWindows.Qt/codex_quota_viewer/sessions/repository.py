@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from ._perf import _perf_timer
 from .models import (
     AuditEntry,
     CatalogSessionEntry,
@@ -82,23 +81,22 @@ class SessionRepository:
 
     def replace_catalog(self, entries: list[CatalogSessionEntry]) -> list[SessionRecord]:
         indexed_at = _now_iso()
-        with _perf_timer("repository.replace_catalog", entries=len(entries)):
-            with self._lock, self._transaction():
-                existing = self._read_all_session_rows()
-                self._connection.execute("delete from timeline_items")
-                self._connection.execute("delete from sessions")
-                self._clear_session_search()
-                for entry in entries:
-                    prior = existing.get(entry.summary.id)
-                    created_at = prior["created_at"] if prior else indexed_at
-                    updated_at = (
-                        prior["updated_at"]
-                        if prior and not _did_catalog_entry_change(prior, entry)
-                        else indexed_at
-                    )
-                    self._insert_session(entry, created_at=created_at, updated_at=updated_at, indexed_at=indexed_at)
-                    self._insert_session_search(entry)
-                    self._insert_timeline_items(entry)
+        with self._lock, self._transaction():
+            existing = self._read_all_session_rows()
+            self._connection.execute("delete from timeline_items")
+            self._connection.execute("delete from sessions")
+            self._clear_session_search()
+            for entry in entries:
+                prior = existing.get(entry.summary.id)
+                created_at = prior["created_at"] if prior else indexed_at
+                updated_at = (
+                    prior["updated_at"]
+                    if prior and not _did_catalog_entry_change(prior, entry)
+                    else indexed_at
+                )
+                self._insert_session(entry, created_at=created_at, updated_at=updated_at, indexed_at=indexed_at)
+                self._insert_session_search(entry)
+                self._insert_timeline_items(entry)
         return self.list_sessions()
 
     def save_catalog_entry(self, entry: CatalogSessionEntry) -> SessionRecord:
@@ -271,52 +269,6 @@ class SessionRepository:
         items = [_map_timeline_row(row) for row in rows]
         next_offset = normalized_offset + limit if normalized_offset + limit < total else None
         return SessionTimelinePage(items=items, total=total, next_offset=next_offset)
-
-    def list_timeline_tail(
-        self,
-        session_id: str,
-        *,
-        limit: int = 200,
-    ) -> SessionTimelinePage:
-        # Most-recent ``limit`` items in ascending ordinal order. Chat
-        # sessions are read tail-first, so seeding the detail panel with
-        # the tail keeps detail-open cost bounded by ``limit`` regardless
-        # of session size — instead of paying O(N) for the full timeline
-        # to dedup and ferry across the SQLite/Python boundary.
-        normalized_limit = max(1, int(limit))
-        total_row = self._connection.execute(
-            "select count(*) as count from timeline_items where session_id = ?",
-            (session_id,),
-        ).fetchone()
-        total = int(total_row["count"] if total_row else 0)
-        if total <= 0:
-            return SessionTimelinePage(items=[], total=0, next_offset=None)
-        offset = max(0, total - normalized_limit)
-        rows = self._connection.execute(
-            """
-            select item_id, type, timestamp, text, tool_name, summary,
-                   input_text, output_text, status
-            from timeline_items
-            where session_id = ?
-            order by ordinal asc
-            limit ? offset ?
-            """,
-            (session_id, normalized_limit, offset),
-        ).fetchall()
-        items = [_map_timeline_row(row) for row in rows]
-        return SessionTimelinePage(items=items, total=total, next_offset=None)
-
-    def count_timeline_items(self, session_id: str) -> int:
-        # Single-row count used by the detail panel's tab-switch
-        # freshness check: comparing against panel._timeline_total tells
-        # us whether the displayed slice is still consistent with the
-        # repository (rescan may have rewritten timeline_items while
-        # the user was on another tab).
-        row = self._connection.execute(
-            "select count(*) as count from timeline_items where session_id = ?",
-            (session_id,),
-        ).fetchone()
-        return int(row["count"] if row else 0)
 
     def list_audit_entries(self, session_id: str) -> list[AuditEntry]:
         rows = self._connection.execute(
