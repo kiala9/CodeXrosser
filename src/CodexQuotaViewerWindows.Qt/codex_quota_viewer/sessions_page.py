@@ -88,6 +88,7 @@ from .sessions import (
     SessionTimelineItem,
     SessionsManager,
 )
+from .sessions._perf import _perf_timer
 
 
 _SESSION_STATUS_LABELS: dict[str, str] = {
@@ -159,6 +160,8 @@ class SessionsViewState:
     status_filter: str | None
     search_text: str
     selected_session_id: str | None
+
+
 
 
 # --- Native Windows acrylic blur for top-level frameless popups -------------
@@ -557,13 +560,14 @@ class _SessionsTreeModel(QStandardItemModel):
         self._records_by_id: dict[str, SessionRecord] = {}
 
     def set_records(self, records: list[SessionRecord]) -> None:
-        self.beginResetModel()
-        self._records_by_id = {record.id: record for record in records}
-        self.removeRows(0, self.rowCount())
-        groups = _build_workfolder_groups(records)
-        for group in groups:
-            self._append_group(group)
-        self.endResetModel()
+        with _perf_timer("ui.sessions_tree.set_records", count=len(records)):
+            self.beginResetModel()
+            self._records_by_id = {record.id: record for record in records}
+            self.removeRows(0, self.rowCount())
+            groups = _build_workfolder_groups(records)
+            for group in groups:
+                self._append_group(group)
+            self.endResetModel()
 
     def record_for_index(self, index: QModelIndex) -> SessionRecord | None:
         if not index.isValid():
@@ -1188,7 +1192,6 @@ class SessionsPage(QWidget):
         self._detail_token = 0
         self._pending_detail_id: str | None = None
         self._active_session_id: str | None = None
-        self._restore_selection_id: str | None = None
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(220)
@@ -1714,6 +1717,13 @@ class SessionsPage(QWidget):
         self._detail_panel = _SessionDetailPanel(self._translator, self)
         self._detail_panel.setMinimumWidth(320)
         self._detail_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Older-history pagination: when the user scrolls past the loaded
+        # tail page the panel asks for the next-older page through this
+        # signal. We route the fetch through the same task_runner the
+        # detail-load path uses so worker mode still applies.
+        self._detail_panel.older_history_requested.connect(
+            self._request_older_timeline_page
+        )
 
         self._splitter = QSplitter(Qt.Horizontal, self)
         self._splitter.setObjectName("SessionsSplitter")
@@ -2049,6 +2059,53 @@ class SessionsPage(QWidget):
             return
         self._apply_loaded_detail(detail, token=token, session_id=session_id)
 
+    def _request_older_timeline_page(
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+    ) -> None:
+        """Fetch one older page of timeline rows on the panel's behalf.
+
+        Wired from ``_SessionDetailPanel.older_history_requested``. We
+        only deliver the result back to the panel if the user is still
+        viewing the session that requested it; otherwise we cancel the
+        pending state on the panel so a future edge-trigger can fire.
+        """
+        active_target = self._target
+        factory = self._sessions_manager_factory
+
+        def _deliver(page) -> None:
+            if self._active_session_id != session_id:
+                self._detail_panel.cancel_pending_older()
+                return
+            self._detail_panel.prepend_older_items(page.items, offset)
+
+        if self._task_runner is None:
+            try:
+                manager = factory(active_target)
+                page = manager.get_session_timeline_page(
+                    session_id, offset=offset, limit=limit
+                )
+            except Exception:
+                self._detail_panel.cancel_pending_older()
+                return
+            _deliver(page)
+            return
+
+        def action():
+            return factory(active_target).get_session_timeline_page(
+                session_id, offset=offset, limit=limit
+            )
+
+        def on_success(page) -> None:
+            _deliver(page)
+
+        def on_error(_ex: Exception) -> None:
+            self._detail_panel.cancel_pending_older()
+
+        self._task_runner(action, on_success, on_error)
+
     def _apply_loaded_detail(
         self,
         detail: SessionDetail,
@@ -2090,51 +2147,45 @@ class SessionsPage(QWidget):
         return super().eventFilter(obj, event)
 
     def hideEvent(self, event):  # noqa: N802 - Qt naming
-        # When the user navigates to Accounts/Settings the Sessions widget is
-        # cached in memory; leaving thousands of timeline bubbles alive forces
-        # Qt to re-lay them out on the next show. Drop the rendered timeline
-        # so switching pages stays cheap. We remember the selected row id and
-        # re-issue the detail fetch in showEvent.
+        # Tab-switch keep-alive: leave the rendered timeline intact so
+        # coming back is instant. The sliding window already caps live
+        # bubbles at _WINDOW_SIZE (~120) so the memory cost is bounded;
+        # tearing it down on every hide just bought us a re-fetch +
+        # rebuild on every show, which is exactly what the user
+        # complained about as "loses my progress".
+        #
+        # The popup overlays still get hidden — they're top-level
+        # windows that shouldn't outlive the page being visible.
         self._search_popup.hide()
-        current = self._tree.currentIndex()
-        active = self._tree_model.record_for_index(current)
-        self._restore_selection_id = active.id if active is not None else None
-        self._detail_panel.discard_rendered_timeline()
-        # Bumping the detail token also cancels any in-flight worker result.
-        self._detail_token += 1
         super().hideEvent(event)
 
     def showEvent(self, event):  # noqa: N802 - Qt naming
         super().showEvent(event)
-        # Re-issue detail fetch for the previously selected row, if any. The
-        # tree itself stayed populated; only the timeline panel was discarded.
-        target_id = getattr(self, "_restore_selection_id", None)
-        if not target_id:
+        # Lightweight freshness check. The panel's state is preserved
+        # across hide/show, so by default we do nothing — Qt restores
+        # scroll position automatically. The one case where the cached
+        # render is stale is if a rescan rewrote ``timeline_items``
+        # while we were on another tab; ``count_timeline_items`` lets
+        # us detect that with a single SQL count and trigger a refetch.
+        # If no session is loaded yet there's nothing to validate.
+        panel_session_id = self._detail_panel.loaded_session_id()
+        if panel_session_id is None:
             return
-        self._restore_selection_id = None
-        record = self._records_by_id.get(target_id)
+        try:
+            manager = self._sessions_manager_factory(self._target)
+            record = manager.repository.get_session(panel_session_id)
+            current_total = manager.repository.count_timeline_items(
+                panel_session_id
+            )
+        except Exception:
+            return
         if record is None:
+            # Session row vanished while we were away (purged externally).
+            self._set_detail(None)
             return
-        # IMPORTANT: defer the loading-placeholder + detail fetch one tick.
-        # When this showEvent fires, Qt is still in the middle of mapping the
-        # SessionsPage tree to native windows. Showing the timeline loading
-        # overlay synchronously here can race with that mapping: if the
-        # overlay's grand-ancestor scroll viewport hasn't been mapped yet,
-        # Qt creates a transient top-level HWND for the overlay to host its
-        # paint, and Windows draws that HWND with default OS chrome
-        # (titlebar + app icon, white client area) for the frame or two
-        # before the widget is reparented to its real ancestor surface.
-        # That race is the small white popup with the app icon users saw on
-        # every page switch (and even on re-clicking the Sessions nav).
-        # By the time singleShot(0) fires the page is fully mapped, so the
-        # overlay shows without ever needing its own native window.
-        QTimer.singleShot(0, lambda r=record: self._begin_loading(r))
-
-    def _begin_loading(self, record: "SessionRecord") -> None:
-        # Belt-and-braces: if the user has navigated away again before this
-        # deferred slot fires, drop it.
-        if not self.isVisible():
+        if current_total == self._detail_panel.loaded_timeline_total():
             return
+        # Stale: refetch via the same path used by row-change.
         self._detail_panel.show_loading_placeholder(record)
         self._request_detail(record)
 
@@ -2354,6 +2405,18 @@ class _SessionDetailPanel(QFrame):
     # it without disturbing existing chips.)
     _ALL_CHIP_KINDS = ("user", "assistant", "tool_call", "command")
 
+    # Page size used when the panel asks the manager for older timeline
+    # rows after the user scrolls past the loaded edge. Mirrors
+    # DEFAULT_TIMELINE_PAGE_SIZE on the parser side; kept inline so the
+    # panel doesn't need to depend on the parser module.
+    _OLDER_PAGE_SIZE = 200
+
+    # Emitted when the user reaches the loaded edge and there's still
+    # older history in the repository to fetch. SessionsPage routes this
+    # through its task_runner and feeds the result back via
+    # ``prepend_older_items``. Args: (session_id, sql_offset, sql_limit).
+    older_history_requested = Signal(str, int, int)
+
     def __init__(self, translator: Callable[[str], str], parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("SessionsDetailCard")
@@ -2366,6 +2429,29 @@ class _SessionDetailPanel(QFrame):
         self._window_start = 0
         self._window_end = 0
         self._timeline_item_count = 0
+        # Raw timeline items (sorted ascending by ordinal) backing the
+        # coalesced ``_all_blocks``. We keep them so prepended older
+        # pages can be re-coalesced cleanly across the page boundary
+        # without losing the existing tail.
+        self._all_timeline_items: list[SessionTimelineItem] = []
+        # Pre-dedup SQL offset of ``_all_timeline_items[0]`` in the
+        # repository. ``> 0`` means there is older history to page in;
+        # ``== 0`` means we're already at the start of the session.
+        self._loaded_offset: int = 0
+        # Total row count in the repository's timeline_items for the
+        # currently-open session. Used for the status footer and to
+        # let the minimap reason about unloaded ranges later.
+        self._timeline_total: int = 0
+        # Session id we're currently rendering — needed so the older-
+        # page fetch can address the right manager. Cleared by
+        # ``discard_rendered_timeline`` so a stale fetch can't latch on
+        # to the next session.
+        self._loaded_session_id: str | None = None
+        # Single-flight guard. Set when an older-page request is in
+        # flight; cleared when the result lands or the request is
+        # canceled (target switch / session change). Prevents the edge-
+        # slide trigger from spamming the worker.
+        self._loading_older: bool = False
         # The user prompt whose section the viewport currently belongs to.
         # The window stays anchored on this block; the rail puts its dot at
         # the rail's center. Sliding/redraw only happens when this changes.
@@ -3093,22 +3179,33 @@ class _SessionDetailPanel(QFrame):
 
     def set_detail(self, detail: SessionDetail | None, target: CodexHomeTarget) -> None:
         self._render_token += 1
+        # Cancel any in-flight older-page request — its result would
+        # belong to the previous session anyway.
+        self._loading_older = False
         self._clear_timeline()
         if detail is None:
             self._all_blocks = []
+            self._all_timeline_items = []
             self._user_anchor_blocks = []
             self._current_user_block = None
             self._window_start = 0
             self._window_end = 0
             self._timeline_item_count = 0
+            self._loaded_offset = 0
+            self._timeline_total = 0
+            self._loaded_session_id = None
             self._timeline_status.setText("")
             self._set_audit_text("")
             self._clear_minimap()
             self._hide_timeline_overlay()
             self._refresh_count_label()
             return
-        self._all_blocks = _coalesce_timeline_blocks(detail.timeline)
-        self._timeline_item_count = len(detail.timeline)
+        self._all_timeline_items = list(detail.timeline)
+        self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
+        self._timeline_item_count = len(self._all_timeline_items)
+        self._loaded_offset = max(0, getattr(detail, "timeline_loaded_offset", 0))
+        self._timeline_total = max(0, detail.timeline_total)
+        self._loaded_session_id = detail.record.id
         # Keep user anchors for current-section detection; the minimap itself
         # is driven from every materialized block's widget geometry.
         self._user_anchor_blocks = [
@@ -3136,18 +3233,37 @@ class _SessionDetailPanel(QFrame):
         """Drop every bubble widget. Caller is expected to re-fetch and call
         set_detail again on the next show."""
         self._render_token += 1
+        self._loading_older = False
         self._all_blocks = []
+        self._all_timeline_items = []
         self._user_anchor_blocks = []
         self._current_user_block = None
         self._window_start = 0
         self._window_end = 0
         self._timeline_item_count = 0
+        self._loaded_offset = 0
+        self._timeline_total = 0
+        self._loaded_session_id = None
         self._clear_timeline()
         self._timeline_status.setText("")
         self._set_audit_text("")
         self._clear_minimap()
         self._hide_timeline_overlay()
         self._refresh_count_label()
+
+    def loaded_session_id(self) -> str | None:
+        """Session id currently rendered in the panel, or None if empty.
+        Used by SessionsPage on tab show to decide whether the panel
+        already holds the right session and only needs a freshness
+        check (vs. a full re-fetch)."""
+        return self._loaded_session_id
+
+    def loaded_timeline_total(self) -> int:
+        """Repository total at the time the current detail was loaded.
+        SessionsPage compares this against a fresh ``count_timeline_items``
+        on tab-show: if the totals diverge the displayed slice has been
+        invalidated by a rescan and we re-fetch."""
+        return self._timeline_total
 
     def _set_window_centered_on(self, focus_block: int) -> None:
         """Update self._window_start/_end to a window centered on focus_block,
@@ -3181,28 +3297,33 @@ class _SessionDetailPanel(QFrame):
         if start >= end:
             return 0
         added_height = 0
-        if prepend:
-            # Insert in reverse so the original order is preserved at the top.
-            # NOTE: do NOT call widget.adjustSize() here. With a parent already
-            # set by _build_window_widget the widget is owned by the layout —
-            # forcing a sizing pass on a freshly-inserted child can trigger
-            # Qt to promote it to a top-level window for measurement, causing
-            # the brief white-popup flashes the user observed on huge sessions.
-            for block_index in range(end - 1, start - 1, -1):
-                widget = self._build_window_widget(block_index)
-                if widget is None:
-                    continue
-                self._timeline_layout.insertWidget(0, widget)
-                added_height += widget.sizeHint().height() + self._timeline_layout.spacing()
-        else:
-            for block_index in range(start, end):
-                widget = self._build_window_widget(block_index)
-                if widget is None:
-                    continue
-                # Insert before the trailing stretch.
-                self._timeline_layout.insertWidget(
-                    self._timeline_layout.count() - 1, widget
-                )
+        with _perf_timer(
+            "ui.detail_panel.build_window_widgets",
+            count=end - start,
+            prepend=prepend,
+        ):
+            if prepend:
+                # Insert in reverse so the original order is preserved at the top.
+                # NOTE: do NOT call widget.adjustSize() here. With a parent already
+                # set by _build_window_widget the widget is owned by the layout —
+                # forcing a sizing pass on a freshly-inserted child can trigger
+                # Qt to promote it to a top-level window for measurement, causing
+                # the brief white-popup flashes the user observed on huge sessions.
+                for block_index in range(end - 1, start - 1, -1):
+                    widget = self._build_window_widget(block_index)
+                    if widget is None:
+                        continue
+                    self._timeline_layout.insertWidget(0, widget)
+                    added_height += widget.sizeHint().height() + self._timeline_layout.spacing()
+            else:
+                for block_index in range(start, end):
+                    widget = self._build_window_widget(block_index)
+                    if widget is None:
+                        continue
+                    # Insert before the trailing stretch.
+                    self._timeline_layout.insertWidget(
+                        self._timeline_layout.count() - 1, widget
+                    )
         return added_height
 
     def _build_window_widget(self, block_index: int) -> QWidget | None:
@@ -3284,6 +3405,10 @@ class _SessionDetailPanel(QFrame):
 
     def _slide_window_up(self) -> None:
         if self._window_start <= 0:
+            # Reached the loaded edge. Try to page in older history from
+            # the manager; once it lands, prepend_older_items will rebuild
+            # the window and the user can keep scrolling up.
+            self._maybe_request_older()
             return
         new_start = max(0, self._window_start - _WINDOW_HALF)
         new_end = min(len(self._all_blocks), new_start + _WINDOW_SIZE)
@@ -3307,6 +3432,150 @@ class _SessionDetailPanel(QFrame):
         self._window_end = new_end
         self._refresh_status_label()
         self._refresh_minimap()
+
+    # --- older-page pagination ------------------------------------------
+    #
+    # The detail panel only holds a tail page of the session timeline so
+    # that opening a 100k-event session is bounded. When the user
+    # scrolls past the loaded edge (``_window_start <= 0`` AND
+    # ``_loaded_offset > 0``), the panel asks SessionsPage for the
+    # immediately-older page through ``older_history_requested``;
+    # SessionsPage routes the fetch through its task_runner and feeds
+    # the result back via ``prepend_older_items``.
+
+    def _maybe_request_older(self) -> None:
+        if self._loading_older:
+            return
+        if self._loaded_offset <= 0:
+            return
+        if not self._loaded_session_id:
+            return
+        page_size = self._OLDER_PAGE_SIZE
+        new_offset = max(0, self._loaded_offset - page_size)
+        page_limit = self._loaded_offset - new_offset
+        if page_limit <= 0:
+            return
+        self._loading_older = True
+        self.older_history_requested.emit(
+            self._loaded_session_id, new_offset, page_limit
+        )
+
+    def cancel_pending_older(self) -> None:
+        """Drop the in-flight older-page request without applying any
+        result. Called by SessionsPage when the user navigates away or
+        the manager surfaces an error."""
+        self._loading_older = False
+
+    def prepend_older_items(
+        self,
+        items: list[SessionTimelineItem],
+        sql_offset: int,
+    ) -> None:
+        """Merge an older page into the panel ahead of the existing tail.
+
+        The freshly-fetched items are concatenated in front of
+        ``_all_timeline_items`` and the entire combined list is re-
+        coalesced — tool-call groups can only merge correctly when they
+        see all the items in document order, so a partial recoalesce at
+        the page boundary would risk splitting/duplicating groups."""
+        self._loading_older = False
+        if not items:
+            # Nothing to add; mark the offset so we don't re-issue the
+            # same request infinitely if the manager returned empty.
+            self._loaded_offset = max(0, min(self._loaded_offset, sql_offset))
+            return
+        if not self._all_timeline_items:
+            # Defensive: shouldn't happen because set_detail seeds
+            # _all_timeline_items before any older-page fetch. Treat as
+            # initial load if it does.
+            self._all_timeline_items = list(items)
+            self._loaded_offset = max(0, sql_offset)
+            self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
+            self._timeline_item_count = len(self._all_timeline_items)
+            return
+
+        # Anchor by the active user-prompt's id so we can land the user
+        # back on the same content after recoalescing shifts every block
+        # index by some amount.
+        anchor_item_id = self._current_user_anchor_id()
+
+        self._all_timeline_items = list(items) + self._all_timeline_items
+        self._loaded_offset = max(0, sql_offset)
+        self._timeline_item_count = len(self._all_timeline_items)
+        self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
+        self._user_anchor_blocks = [
+            i
+            for i, (kind, payload) in enumerate(self._all_blocks)
+            if kind == "single" and payload.type == "message:user"
+        ]
+
+        new_anchor_block = self._block_for_message_id(anchor_item_id)
+        if new_anchor_block is None and self._user_anchor_blocks:
+            # Fallback: anchor on whatever user prompt now corresponds
+            # to roughly the user's previous section position. Picking
+            # the first newly-loaded user prompt is the worst case but
+            # at least keeps us in-bounds.
+            new_anchor_block = self._user_anchor_blocks[0]
+        if new_anchor_block is None:
+            new_anchor_block = 0 if self._all_blocks else None
+        self._current_user_block = new_anchor_block
+
+        focus = new_anchor_block if new_anchor_block is not None else 0
+        self._set_window_centered_on(focus)
+        self._suppress_edge_slide = True
+        try:
+            self._clear_timeline()
+            self._build_window_widgets(
+                self._window_start, self._window_end, prepend=False
+            )
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+        finally:
+            self._suppress_edge_slide = False
+
+        # Defer the scroll-to-anchor so Qt has propagated geometry —
+        # widget.y() is unreliable in the same tick as the activate().
+        QTimer.singleShot(0, self._scroll_to_anchor_after_prepend)
+        self._refresh_status_label()
+        self._refresh_minimap()
+
+    def _scroll_to_anchor_after_prepend(self) -> None:
+        if self._current_user_block is None:
+            return
+        bar = self._timeline_scroll.verticalScrollBar()
+        target_y: int | None = None
+        for i in range(self._timeline_layout.count() - 1):
+            item = self._timeline_layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is None:
+                continue
+            if widget.property("blockIndex") == self._current_user_block:
+                target_y = widget.y()
+                break
+        if target_y is None:
+            return
+        self._suppress_edge_slide = True
+        try:
+            bar.setValue(min(target_y, bar.maximum()))
+        finally:
+            self._suppress_edge_slide = False
+
+    def _current_user_anchor_id(self) -> str | None:
+        if self._current_user_block is None:
+            return None
+        if 0 <= self._current_user_block < len(self._all_blocks):
+            kind, payload = self._all_blocks[self._current_user_block]
+            if kind == "single":
+                return getattr(payload, "id", None)
+        return None
+
+    def _block_for_message_id(self, message_id: str | None) -> int | None:
+        if not message_id:
+            return None
+        for index, (kind, payload) in enumerate(self._all_blocks):
+            if kind == "single" and getattr(payload, "id", None) == message_id:
+                return index
+        return None
 
     # --------------------------------------------------------- scroll/anchor
 
@@ -3341,7 +3610,14 @@ class _SessionDetailPanel(QFrame):
         max_value = scrollbar.maximum()
         value = scrollbar.value()
         edge_px = max(60, int(viewport_h * _EDGE_TRIGGER_RATIO))
-        if value <= edge_px and self._window_start > 0:
+        # Top edge trigger: either there's headroom inside the loaded
+        # window to slide into, OR there's still older history in the
+        # repository we can page in. _slide_window_up dispatches between
+        # the two internally (slide vs. emit older_history_requested);
+        # the gate just needs to give it a chance to run.
+        if value <= edge_px and (
+            self._window_start > 0 or self._loaded_offset > 0
+        ):
             self._slide_window_up()
         elif (max_value - value) <= edge_px and self._window_end < len(self._all_blocks):
             self._slide_window_down()
