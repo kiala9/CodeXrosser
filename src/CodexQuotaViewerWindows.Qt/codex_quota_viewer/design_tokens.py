@@ -68,11 +68,16 @@ SURFACE_CARD = "rgba(255, 255, 255, 13)"
 # (alpha 64, border). Reserved for non-brand role tints on the same
 # card-style surface language as ``SURFACE_PANEL``.
 
-WARM_GHOST = "rgba(220, 150, 60, 32)"
-"""Warm role accent fill — used by Tool bubbles."""
+TOOL_GHOST = "rgba(196, 200, 208, 28)"
+"""Tool role accent fill — neutral cool gray, used by Tool / Shell
+bubbles. Subtle enough to sit beneath assistant prose without
+competing for attention; replaces the previous amber palette which
+clashed with the rest of the cool/blue surface family."""
 
-WARM_TINT = "rgba(220, 150, 60, 64)"
-"""Warm role accent border — pairs with ``WARM_GHOST``."""
+TOOL_TINT = "rgba(196, 200, 208, 96)"
+"""Tool role accent border — pairs with ``TOOL_GHOST``. Border alpha
+is bumped vs. other role tints (64) so the gray outline still reads
+clearly against the dark app background despite the desaturated hue."""
 
 SLATE_GHOST = "rgba(130, 160, 200, 32)"
 """Slate role accent fill — used by Environment / system bubbles."""
@@ -111,8 +116,8 @@ __all__ = [
     "SURFACE_PANEL",
     "SURFACE_PANEL_BORDER",
     "SURFACE_CARD",
-    "WARM_GHOST",
-    "WARM_TINT",
+    "TOOL_GHOST",
+    "TOOL_TINT",
     "SLATE_GHOST",
     "SLATE_TINT",
     "SURFACE_FROSTED",

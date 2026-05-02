@@ -76,8 +76,8 @@ from .design_tokens import (
     SURFACE_FROSTED_BORDER,
     SURFACE_PANEL,
     SURFACE_PANEL_BORDER,
-    WARM_GHOST,
-    WARM_TINT,
+    TOOL_GHOST,
+    TOOL_TINT,
 )
 from .models import CodexHomeTarget
 from .sessions import (
@@ -4379,12 +4379,18 @@ class _BubbleFrame(QFrame):
 
 
 _BubbleFrame._SURFACES = {
-    "user": (_qcolor_from_token(PRIMARY_GHOST), _qcolor_from_token(PRIMARY_TINT)),
+    # Border bumped from PRIMARY_TINT (alpha 64) → PRIMARY_BAND
+    # (alpha 130) so the user bubble carries the same outline weight
+    # as the "Current Account" card in qt_app.py (PRIMARY_GHOST fill +
+    # PRIMARY_BAND border) and the env-tab :checked state — every
+    # "this is mine / this is highlighted" surface uses the same pair
+    # per CLAUDE.md UI principle 1.
+    "user": (_qcolor_from_token(PRIMARY_GHOST), _qcolor_from_token(PRIMARY_BAND)),
     "assistant": (
         _qcolor_from_token(SURFACE_PANEL),
         _qcolor_from_token(SURFACE_PANEL_BORDER),
     ),
-    "tool": (_qcolor_from_token(WARM_GHOST), _qcolor_from_token(WARM_TINT)),
+    "tool": (_qcolor_from_token(TOOL_GHOST), _qcolor_from_token(TOOL_TINT)),
     "environment": (_qcolor_from_token(SLATE_GHOST), _qcolor_from_token(SLATE_TINT)),
 }
 
@@ -6148,8 +6154,12 @@ QPushButton#SessionsDetailToolbarSegment:hover {{
     background: rgba(255, 255, 255, 28);
 }}
 QPushButton#SessionsDetailToolbarSegment:checked {{
-    background: {PRIMARY_BAND};
-    border-color: {PRIMARY_STRONG};
+    /* Same selected-state pair as ``SessionsEnvTab:checked`` (and
+       NavButton, current-card, selected table row) per CLAUDE.md UI
+       principle 1 — every "this is selected" surface in the app uses
+       PRIMARY_GHOST fill + PRIMARY_BAND border. */
+    background: {PRIMARY_GHOST};
+    border-color: {PRIMARY_BAND};
     color: #ffffff;
 }}
 
@@ -6310,7 +6320,11 @@ QLabel#SessionsBubbleRole[role="assistant"] {{
     background: rgba(255, 255, 255, 40);
 }}
 QLabel#SessionsBubbleRole[role="tool"] {{
-    background: rgba(220, 160, 80, 130);
+    /* Darker gray than TOOL_GHOST/TOOL_TINT (which sit at alpha 28/96
+       for the bubble surface) so the 11px chip reads cleanly with the
+       parent rule's white text — matches the other role chips, which
+       all keep white text on a darker fill. */
+    background: rgba(120, 128, 142, 180);
 }}
 QLabel#SessionsBubbleRole[role="environment"] {{
     background: rgba(130, 160, 200, 110);
