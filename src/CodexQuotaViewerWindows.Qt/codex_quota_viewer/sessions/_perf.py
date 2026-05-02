@@ -33,3 +33,14 @@ def _perf_timer(label: str, **extra: object) -> Iterator[None]:
             f"{k}={v}" for k, v in extra.items() if v is not None
         )
         print(f"[cqv-perf] {label} {elapsed_ms:.1f}ms {kv}".rstrip(), flush=True)
+
+
+def _perf_log(label: str, **extra: object) -> None:
+    """Fire-and-forget perf marker — emits a single line WITHOUT timing.
+    Used to mark progress through a loop where a hang would prevent the
+    enclosing _perf_timer's exit log from ever printing. The last line
+    we see before a freeze is the smoking gun."""
+    if not _PERF_ENABLED:
+        return
+    kv = " ".join(f"{k}={v}" for k, v in extra.items() if v is not None)
+    print(f"[cqv-perf] {label} {kv}".rstrip(), flush=True)

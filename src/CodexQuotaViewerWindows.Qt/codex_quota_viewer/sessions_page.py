@@ -88,7 +88,7 @@ from .sessions import (
     SessionTimelineItem,
     SessionsManager,
 )
-from .sessions._perf import _perf_timer
+from .sessions._perf import _perf_log, _perf_timer
 
 
 _SESSION_STATUS_LABELS: dict[str, str] = {
@@ -119,8 +119,8 @@ _RECORD_COMPACT_ROLE = Qt.UserRole + 8
 _GROUP_COUNT_ROLE = Qt.UserRole + 9
 
 # Status filter options for the list panel popover. Order matters: the
-# popup row buttons render in this order, and ``_sync_status_filter_button_label``
-# resolves the trigger label by lookup. ``None`` is the unfiltered case.
+# popup row buttons render in this order, and ``_sync_status_filter_button_state``
+# resolves the trigger tooltip by lookup. ``None`` is the unfiltered case.
 _STATUS_FILTER_OPTIONS: tuple[tuple[str | None, str], ...] = (
     (None, "All statuses"),
     ("active", "Active"),
@@ -739,17 +739,46 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
     def __init__(self, view: QTreeView):
         super().__init__(view)
         self._view = view
+        # Reserved blank strip at the top of the first top-level row,
+        # used by SessionsPage to host the "N session(s)" overlay
+        # label that scrolls with the tree's content. Zero by default
+        # — set via ``set_first_row_top_reserve``.
+        self._first_row_top_reserve = 0
+
+    def set_first_row_top_reserve(self, height: int) -> None:
+        height = max(0, height)
+        if self._first_row_top_reserve == height:
+            return
+        self._first_row_top_reserve = height
+        if self._view is not None:
+            self._view.scheduleDelayedItemsLayout()
+
+    def _first_row_extra(self, index) -> int:
+        if (
+            self._first_row_top_reserve > 0
+            and index.row() == 0
+            and not index.parent().isValid()
+        ):
+            return self._first_row_top_reserve
+        return 0
 
     def sizeHint(self, option, index):  # noqa: N802 - Qt naming
+        extra = self._first_row_extra(index)
         if index.data(_GROUP_KIND_ROLE) == "workfolder":
-            return QSize(option.rect.width(), self._GROUP_HEIGHT)
+            return QSize(option.rect.width(), self._GROUP_HEIGHT + extra)
         if index.data(_GROUP_KIND_ROLE) == "compaction":
-            return QSize(option.rect.width(), self._COMPACTION_HEIGHT)
+            return QSize(option.rect.width(), self._COMPACTION_HEIGHT + extra)
         if index.data(_RECORD_COMPACT_ROLE):
-            return QSize(option.rect.width(), self._COMPACT_RECORD_HEIGHT)
-        return QSize(option.rect.width(), self._RECORD_HEIGHT)
+            return QSize(option.rect.width(), self._COMPACT_RECORD_HEIGHT + extra)
+        return QSize(option.rect.width(), self._RECORD_HEIGHT + extra)
 
     def paint(self, painter: QPainter, option, index):  # noqa: N802 - Qt naming
+        extra = self._first_row_extra(index)
+        if extra > 0:
+            # Shift the rect down so the existing paint logic uses the
+            # bottom (normal-height) portion of the row. The top
+            # ``extra`` pixels are blank, reserved for the count overlay.
+            option.rect.setTop(option.rect.top() + extra)
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing)
@@ -1198,7 +1227,7 @@ class SessionsPage(QWidget):
         self._search_debounce.timeout.connect(self._refresh)
 
         self._build()
-        self._record_count_label.setText(self._translator("Loading sessions..."))
+        self._set_record_count_text(self._translator("Loading sessions..."))
 
     @property
     def target(self) -> CodexHomeTarget:
@@ -1265,7 +1294,7 @@ class SessionsPage(QWidget):
         target = self._target
         filters = self._current_filters()
         factory = self._sessions_manager_factory
-        self._record_count_label.setText(self._translator("Loading sessions..."))
+        self._set_record_count_text(self._translator("Loading sessions..."))
         self._show_list_overlay(True)
 
         def action() -> list[SessionRecord]:
@@ -1306,7 +1335,7 @@ class SessionsPage(QWidget):
 
         # Just the count — the env tabs above already show the active corpus,
         # so the previous "in Sandbox/Real" suffix was redundant.
-        self._record_count_label.setText(
+        self._set_record_count_text(
             self._translator("{count} session(s)").format(count=len(records))
         )
         self._has_loaded = True
@@ -1314,7 +1343,7 @@ class SessionsPage(QWidget):
         self._show_list_overlay(False)
 
     def _show_list_error(self, ex: Exception) -> None:
-        self._record_count_label.setText(
+        self._set_record_count_text(
             self._translator("Sessions list failed: {error}").format(error=str(ex))
         )
         self._tree_model.set_records([])
@@ -1380,6 +1409,17 @@ class SessionsPage(QWidget):
         self._real_tab_btn.setCursor(Qt.PointingHandCursor)
         self._real_tab_btn.setToolTip(self._translator("Sessions target tooltip"))
         self._real_tab_btn.setAccessibleName(self._translator("Real"))
+        # Equal fixed footprint for both pills: width chosen to fit a
+        # 4-char Chinese label at the styled padding, height matches the
+        # 36x36 search/filter chips on the same row. Setting Fixed size
+        # in Python (rather than QSS ``min-width``) is what QHBoxLayout
+        # actually respects — QSS ``min-width`` is a paint hint and
+        # caused the two tabs to render past their layout cell on
+        # narrow panels.
+        for tab_btn in (self._sandbox_tab_btn, self._real_tab_btn):
+            tab_btn.setFixedSize(88, 36)
+            tab_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
         self._env_tab_group.addButton(self._sandbox_tab_btn, 0)
         self._env_tab_group.addButton(self._real_tab_btn, 1)
         self._sandbox_tab_btn.toggled.connect(
@@ -1389,23 +1429,24 @@ class SessionsPage(QWidget):
             lambda checked: self._on_env_tab_toggled(CodexHomeTarget.REAL, checked)
         )
 
-        # Status filter — a popover trigger that telegraphs current
-        # selection inline ("All statuses ▾" / "Active ▾" / ...). The
-        # popup itself is built later in this method (after the search
-        # popup, so it can share the same chrome-install pattern).
+        # Status filter — icon-only popover trigger, sized as a peer of
+        # the search button (40x40 funnel icon). Currently-applied filter
+        # is exposed externally via the ``hasActiveFilter`` property
+        # (PRIMARY_GHOST tint when not "All statuses") and the tooltip,
+        # which always carries the current selection name. The popup
+        # itself is built later in this method (after the search popup,
+        # so it can share the same chrome-install pattern).
         # ``_STATUS_FILTER_OPTIONS`` is the canonical (key, label-key)
-        # ordering used both to populate the popup and to look up the
-        # trigger label.
+        # ordering used both to populate the popup and to format the
+        # trigger tooltip.
         self._status_filter_key: str | None = None
         self._status_filter_button = QPushButton(self)
         self._status_filter_button.setObjectName("SessionsListFilterButton")
+        self._status_filter_button.setIcon(_filter_icon())
+        self._status_filter_button.setIconSize(QSize(20, 20))
+        self._status_filter_button.setFixedSize(36, 36)
         self._status_filter_button.setCursor(Qt.PointingHandCursor)
-        self._status_filter_button.setMinimumHeight(40)
-        self._status_filter_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self._status_filter_button.setProperty("hasActiveFilter", False)
-        self._status_filter_button.setToolTip(
-            self._translator("Sessions status filter tooltip")
-        )
         self._status_filter_button.setToolTipDuration(12_000)
         self._status_filter_button.setAccessibleName(
             self._translator("Sessions status filter tooltip")
@@ -1415,14 +1456,14 @@ class SessionsPage(QWidget):
         self._search_button = QToolButton(self)
         self._search_button.setObjectName("SessionsSearchButton")
         self._search_button.setIcon(_search_session_icon())
-        self._search_button.setIconSize(QSize(22, 22))
+        self._search_button.setIconSize(QSize(20, 20))
         self._search_button.setToolTip(self._translator("Sessions search popup tooltip"))
         self._search_button.setToolTipDuration(12_000)
         self._search_button.setAccessibleName(
             self._translator("Sessions search popup tooltip")
         )
         self._search_button.setProperty("hasQuery", False)
-        self._search_button.setFixedSize(40, 40)
+        self._search_button.setFixedSize(36, 36)
         self._search_button.clicked.connect(self._toggle_search_popup)
 
         self._locate_button = QToolButton(self)
@@ -1521,7 +1562,7 @@ class SessionsPage(QWidget):
             )
             status_popup_layout.addWidget(row_btn)
         self._status_filter_popup.hide()
-        self._sync_status_filter_button_label()
+        self._sync_status_filter_button_state()
 
         # Environment tabs at the very top of the list card — they read
         # like the section title for the list ("which corpus am I looking
@@ -1545,12 +1586,18 @@ class SessionsPage(QWidget):
         env_tab_row.addWidget(self._status_filter_button, 0)
         list_layout.addLayout(env_tab_row)
 
-        # Record count sits as a standalone label just above the tree —
-        # a small left-aligned readout of "N session(s)" that doesn't
-        # compete with the toolbar above it.
+        # Record count is rendered as an overlay parented to the tree's
+        # viewport (configured below, after the tree exists). It scrolls
+        # with the tree's content — visible at the top when scrolled to
+        # the top, and translates off-screen as the user scrolls down,
+        # freeing the visual real estate for actual list content. The
+        # delegate reserves a blank strip at the top of the first row so
+        # the overlay never overlaps the first group's icon or label.
         self._record_count_label = QLabel("")
         self._record_count_label.setObjectName("SessionsRecordCount")
-        list_layout.addWidget(self._record_count_label)
+        # Initial reserve height; refined in _reposition_record_count_label
+        # once the label has real text and a measurable sizeHint.
+        self._record_count_top_reserve = 28
 
         self._tree_model = _SessionsTreeModel(self)
         self._tree = QTreeView(self)
@@ -1577,8 +1624,20 @@ class SessionsPage(QWidget):
         self._tree.setProperty("activeSessionId", "")
         self._tree.hideColumn(1)
         self._tree.hideColumn(2)
-        self._tree.setItemDelegateForColumn(0, _SessionsTreeDelegate(self._tree))
+        self._tree_delegate = _SessionsTreeDelegate(self._tree)
+        self._tree_delegate.set_first_row_top_reserve(self._record_count_top_reserve)
+        self._tree.setItemDelegateForColumn(0, self._tree_delegate)
         self._tree.setStyleSheet(_TREE_QSS)
+
+        # Mount the record-count overlay inside the tree's viewport so
+        # it scrolls with content. The first row's reserve (above) keeps
+        # it from overlapping the first session group at scroll=0.
+        self._record_count_label.setParent(self._tree.viewport())
+        self._record_count_label.move(12, 4)
+        self._record_count_label.raise_()
+        self._tree.verticalScrollBar().valueChanged.connect(
+            self._reposition_record_count_label
+        )
 
         header = self._tree.header()
         header.hide()
@@ -1676,9 +1735,9 @@ class SessionsPage(QWidget):
         floating_layout.addWidget(self._locate_button, 0)
 
         # Lucide icons paired with each batch action. Archive / Trash2 /
-        # ArchiveRestore / Flame map naturally to the action semantics; the
-        # Flame on Purge reinforces the existing ``danger=True`` red styling
-        # to make it clear this one is irreversible.
+        # ArchiveRestore / X map naturally to the action semantics; the
+        # Purge button keeps the existing ``danger=True`` red styling to make
+        # it clear this one is irreversible.
         action_icons = {
             "archive": _archive_icon,
             "trash": _trash_icon,
@@ -1881,15 +1940,29 @@ class SessionsPage(QWidget):
             row_btn.setProperty("active", row_key == key)
             row_btn.style().unpolish(row_btn)
             row_btn.style().polish(row_btn)
-        self._sync_status_filter_button_label()
+        self._sync_status_filter_button_state()
         self._refresh()
 
-    def _sync_status_filter_button_label(self) -> None:
+    def _sync_status_filter_button_state(self) -> None:
+        """Refresh the icon-only filter trigger's external affordances.
+
+        The button has no inline text (it's an icon chip), so the
+        currently-applied filter is communicated via:
+
+        * ``hasActiveFilter`` QSS property — switches to the
+          PRIMARY_GHOST + PRIMARY_BAND tinted state when the filter is
+          anything other than "All statuses".
+        * Tooltip — always names the current selection so the user
+          can read filter status by hovering.
+        """
         label_key = next(
             (label for k, label in _STATUS_FILTER_OPTIONS if k == self._status_filter_key),
             "All statuses",
         )
-        self._status_filter_button.setText(f"{self._translator(label_key)} ▾")
+        self._status_filter_button.setToolTip(
+            f"{self._translator('Sessions status filter tooltip')} — "
+            f"{self._translator(label_key)}"
+        )
         active = self._status_filter_key is not None
         if self._status_filter_button.property("hasActiveFilter") == active:
             return
@@ -2196,6 +2269,34 @@ class SessionsPage(QWidget):
         viewport = self._tree.viewport()
         overlay.setFixedSize(viewport.size())
         overlay.move(0, 0)
+
+    def _reposition_record_count_label(self, *_args) -> None:
+        """Re-anchor the record-count overlay to the top of the tree
+        viewport, translated upward by the current scroll value so it
+        scrolls with the list content. The first-row delegate reserve
+        keeps it from overlapping the first session group at scroll=0.
+
+        Connected to ``verticalScrollBar().valueChanged`` and called
+        manually after layout changes (resize, model reset).
+        """
+        label = getattr(self, "_record_count_label", None)
+        tree = getattr(self, "_tree", None)
+        if label is None or tree is None:
+            return
+        scroll_value = tree.verticalScrollBar().value()
+        label.adjustSize()
+        label.move(12, 4 - scroll_value)
+        label.raise_()
+
+    def _set_record_count_text(self, text: str) -> None:
+        """Single entry point for updating the count overlay text.
+
+        Wraps ``setText`` so the overlay always re-fits its size and
+        re-anchors immediately after the text changes (instead of
+        waiting for the next scroll event to fix a stale bounding box).
+        """
+        self._record_count_label.setText(text)
+        self._reposition_record_count_label()
 
     def _extend_tree_scroll_range(self) -> None:
         """Bump the tree's vertical scrollbar maximum by ``_scroll_past_end_extra``.
@@ -3336,29 +3437,41 @@ class _SessionDetailPanel(QFrame):
         # visual density changes.
         if not self._block_passes_filter(block):
             return None
+        # Pre-marker so a hang inside bubble construction is visible in
+        # the perf log — _perf_timer's exit line never prints if Qt
+        # never returns from the constructor.
+        _perf_log(
+            "ui.detail_panel.build_one",
+            block=block_index,
+            kind=_describe_block_for_perf(block),
+        )
         # Pass the timeline container as parent through every step of the
         # bubble construction chain so no QWidget is ever briefly parentless.
         # Qt promotes parentless widgets to top-level windows during sizing,
         # producing brief white popups on huge sessions.
-        bubble = _build_block_widget(block, parent=self._timeline_container)
-        wrapped = _wrap_bubble(bubble, parent=self._timeline_container)
-        wrapped.setProperty("blockIndex", block_index)
+        with _perf_timer("ui.detail_panel.build_one.done", block=block_index):
+            bubble = _build_block_widget(block, parent=self._timeline_container)
+            wrapped = _wrap_bubble(bubble, parent=self._timeline_container)
+            wrapped.setProperty("blockIndex", block_index)
         return wrapped
 
     def _drop_widgets_at(self, layout_indexes: list[int]) -> int:
         """Delete the widgets at the given layout indexes (descending order
         recommended). Returns the total removed height for scroll compensation."""
         removed_height = 0
-        for layout_index in layout_indexes:
-            if layout_index < 0 or layout_index >= self._timeline_layout.count() - 1:
-                continue
-            item = self._timeline_layout.takeAt(layout_index)
-            widget = item.widget() if item is not None else None
-            if widget is None:
-                continue
-            removed_height += widget.sizeHint().height() + self._timeline_layout.spacing()
-            widget.hide()
-            widget.deleteLater()
+        with _perf_timer(
+            "ui.detail_panel.drop_widgets_at", count=len(layout_indexes)
+        ):
+            for layout_index in layout_indexes:
+                if layout_index < 0 or layout_index >= self._timeline_layout.count() - 1:
+                    continue
+                item = self._timeline_layout.takeAt(layout_index)
+                widget = item.widget() if item is not None else None
+                if widget is None:
+                    continue
+                removed_height += widget.sizeHint().height() + self._timeline_layout.spacing()
+                widget.hide()
+                widget.deleteLater()
         return removed_height
 
     def _recenter_window(self, focus_block: int) -> None:
@@ -3831,6 +3944,10 @@ class _SessionDetailPanel(QFrame):
         instead of reading child widgets during paint; that avoids stale
         zero-y geometry while Qt is still settling complex QTextEdit bubbles.
         """
+        with _perf_timer("ui.detail_panel.refresh_minimap"):
+            self._refresh_minimap_impl()
+
+    def _refresh_minimap_impl(self) -> None:
         layout = self._timeline_container.layout()
         if layout is not None:
             layout.activate()
@@ -3885,8 +4002,13 @@ class _SessionDetailPanel(QFrame):
             names = ", ".join(_uniq_tool_names(payload, limit=2))
             return f"Tool: {names}" if names else self._translator("Tool calls")
         if payload.type == "message:user":
-            text = (payload.text or "").strip()
-            return text[:80] if text else self._translator("User prompt")
+            # Slice the head BEFORE strip(): on sessions with multi-MB pasted
+            # user messages, ``payload.text.strip()`` allocates the full text
+            # per call, and _refresh_minimap calls this for every block in the
+            # current window on every scroll throttle — turning a single
+            # window slide into hundreds of MB of churn and a UI hang.
+            head = (payload.text or "")[:256].strip()
+            return head[:80] if head else self._translator("User prompt")
         if payload.type == "message:assistant":
             return self._translator("Assistant message")
         return f"Tool: {payload.tool_name or 'unknown_tool'}"
@@ -4314,6 +4436,11 @@ def _parse_environment_context(text: str) -> dict[str, str] | None:
     """
     if not text:
         return None
+    # Probe the head before any full-string copy. The wrapper is always at
+    # the very start; a multi-MB pasted user message that doesn't open with
+    # the wrapper bails out without allocating a multi-MB copy via strip().
+    if not text[:256].lstrip().startswith(_ENVIRONMENT_CONTEXT_OPEN):
+        return None
     stripped = text.strip()
     if not (
         stripped.startswith(_ENVIRONMENT_CONTEXT_OPEN)
@@ -4648,6 +4775,27 @@ def _uniq_tool_names(items: list[SessionTimelineItem], *, limit: int) -> list[st
     return seen
 
 
+def _describe_block_for_perf(block: Any) -> str:
+    """Compact one-line description of a block for perf logs. Used by the
+    pre-construction marker so a hang inside a single bubble is pinpointable
+    by the size of its content."""
+    kind, payload = block
+    if kind == "tool_group":
+        total = 0
+        for it in payload:
+            total += len(getattr(it, "input", "") or "")
+            total += len(getattr(it, "output", "") or "")
+        return f"tool_group/n={len(payload)}/chars={total}"
+    item_type = getattr(payload, "type", "")
+    if item_type in ("message:user", "message:assistant"):
+        return f"{item_type}/chars={len(getattr(payload, 'text', '') or '')}"
+    if item_type == "tool_call":
+        in_n = len(getattr(payload, "input", "") or "")
+        out_n = len(getattr(payload, "output", "") or "")
+        return f"tool_call/{getattr(payload, 'tool_name', '?')}/in={in_n}/out={out_n}"
+    return item_type or "?"
+
+
 def _coalesce_timeline_blocks(items: list[SessionTimelineItem]) -> list[Any]:
     """Group consecutive tool_call items into ('tool_group', [items]) blocks.
     Single tool calls (and isolated runs shorter than _TOOL_GROUP_MIN) stay
@@ -4901,19 +5049,22 @@ def _restore_icon() -> QIcon:
 
 
 def _purge_icon() -> QIcon:
-    """Lucide Flame — permanent / irreversible delete.
+    """Lucide X — permanent / irreversible delete.
 
     Stroke is the danger-red ``#FF6961`` (matching ``QPushButton[danger="true"]``
     in qt_app.py's stylesheet) instead of the icon library's default
     ``#c6d3e1``. This icon is purpose-built for the Purge button, where
-    light-grey strokes would clash with the red button text.
+    light-grey strokes would clash with the red button text. The X is drawn
+    with a slightly larger inner box than Lucide's default so its visual
+    footprint aligns with the neighboring toolbar icons.
     """
     return _icon_from_svg(
         """
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
           <g fill="none" stroke="#FF6961" stroke-width="2.25"
              stroke-linecap="round" stroke-linejoin="round">
-            <path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>
+            <path d="M20 4 4 20"/>
+            <path d="M4 4 20 20"/>
           </g>
         </svg>
         """
@@ -5379,6 +5530,15 @@ def _icon_from_svg(svg: str, *, logical_size: int = 22) -> QIcon:
     return icon
 
 
+# Hard cap on text passed to the QTextDocument. Beyond ~100KB of unbroken
+# text Qt's word-wrap / markdown engines go quadratic and the UI thread
+# hangs on a single bubble — observed on sessions containing multi-MB
+# pasted file contents (e.g. a 14MB single-line message). 64K chars
+# keeps prose messages intact and forces obvious dumps to be truncated
+# with a visible marker.
+_MAX_RICH_BODY_CHARS = 64 * 1024
+
+
 class _RichBody(QTextEdit):
     """Read-only QTextEdit configured to render bubble bodies inline:
     transparent background, no frame, no scrollbars, content-tight height,
@@ -5419,10 +5579,32 @@ class _RichBody(QTextEdit):
         # add a closing block during HTML normalisation even on stripped
         # input).
         text = (text or "").rstrip()
-        if _looks_like_markdown(text):
-            self.setMarkdown(text)
-        else:
+        # Cap pathological message sizes BEFORE any per-character work.
+        # Codex sessions occasionally contain multi-megabyte messages
+        # (pasted file dumps, screenshot base64). _looks_like_markdown's
+        # `any(marker in text)` scan and Qt's setMarkdown / setPlainText
+        # both go quadratic on multi-MB single-line text and hang the UI
+        # thread. 64K chars is generous for legitimate prose while keeping
+        # the text engine interactive.
+        if len(text) > _MAX_RICH_BODY_CHARS:
+            original_len = len(text)
+            text = (
+                text[:_MAX_RICH_BODY_CHARS]
+                + f"\n\n... [truncated for display: showing first "
+                f"{_MAX_RICH_BODY_CHARS:,} of {original_len:,} chars] ..."
+            )
+        # Force plain text when the source has a truncation marker. Codex's
+        # response_item messages are clamped to 180 chars by the parser
+        # (``_truncate_message``), and the cut routinely falls inside a
+        # markdown table or an unclosed `` ``` `` fence. Qt's setMarkdown on
+        # such malformed input goes pathological — observed as a UI hang on
+        # a 180-char assistant bubble. The trailing "..." that the truncator
+        # appends is the unambiguous signal that we cannot trust the markdown
+        # structure to be balanced.
+        if text.endswith("...") or not _looks_like_markdown(text):
             self.setPlainText(text)
+        else:
+            self.setMarkdown(text)
         self._trim_trailing_empty_blocks()
         cursor = QTextCursor(self.document())
         cursor.select(QTextCursor.Document)
@@ -5607,19 +5789,17 @@ QFrame#SessionsSearchPopup {{
     border: 1px solid {SURFACE_FROSTED_BORDER};
     border-radius: 12px;
 }}
-/* Status filter trigger — peer of the search button on the list-header
-   strip. Cloned from QPushButton#SessionsDetailFilterButton; we use a
-   distinct objectName because that rule is scoped to the detail-panel
-   surface (per CLAUDE.md note about per-surface objectName scoping).
-   Padding sized so the trigger lines up with the 40x40 search button. */
+/* Status filter trigger — icon-only chip, peer of the search button on
+   the list-header strip. Distinct objectName from the detail-panel
+   ``SessionsDetailFilterButton`` because that rule is scoped to the
+   detail-panel surface (per CLAUDE.md note about per-surface objectName
+   scoping). Geometry mirrors ``SessionsSearchButton`` so the two
+   toolbar chips render as one family. */
 QPushButton#SessionsListFilterButton {{
     background: rgba(255, 255, 255, 18);
     border: 1px solid rgba(255, 255, 255, 30);
     border-radius: 8px;
-    color: rgba(235, 235, 245, 220);
-    padding: 8px 14px;
-    font-size: 12px;
-    text-align: left;
+    padding: 0;
 }}
 QPushButton#SessionsListFilterButton:hover {{
     background: rgba(255, 255, 255, 32);
@@ -5632,7 +5812,6 @@ QPushButton#SessionsListFilterButton:pressed {{
 QPushButton#SessionsListFilterButton[hasActiveFilter="true"] {{
     background: {PRIMARY_GHOST};
     border-color: {PRIMARY_BAND};
-    color: #ffffff;
 }}
 /* Status filter popover row buttons — one per status. ``[active="true"]``
    marks the currently-applied filter with the same PRIMARY_GHOST +
@@ -5755,10 +5934,18 @@ QPushButton#SessionsEnvTab {{
     background: rgba(255, 255, 255, 14);
     border: 1px solid rgba(255, 255, 255, 28);
     color: rgba(220, 226, 236, 200);
-    padding: 9px 18px;
+    /* Sized as a peer of the 36x36 search/filter chips. Height is fixed
+       via min/max-height; width comes from the natural text + padding
+       (Sandbox/Real are both 4-char labels, so they balance naturally).
+       Equal-width is enforced from Python via setMinimumWidth on each
+       button — QSS min-width is a paint-time hint, not honored by
+       QHBoxLayout, and using it caused the two tabs to overlap when
+       the panel was narrow. */
+    padding: 0 14px;
     font-size: 13px;
     font-weight: 600;
-    min-height: 32px;
+    min-height: 36px;
+    max-height: 36px;
 }}
 QPushButton#SessionsEnvTab[position="first"] {{
     border-top-left-radius: 8px;

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import sys
 from pathlib import Path
@@ -16,7 +18,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLab
 
 from codex_quota_viewer.qt_app import ConfirmPhraseDialog, MainWindow, StatusBanner, StatusPopupFrame  # noqa: E402
 from codex_quota_viewer.models import AccountMetadata, AccountRecord, AuthMode, CodexHomeTarget, UiLanguage, now_utc  # noqa: E402
-from codex_quota_viewer.task_worker import serialize  # noqa: E402
+from codex_quota_viewer.task_worker import emit, serialize  # noqa: E402
 
 
 def test_button_wrapper_ignores_qt_checked_argument() -> None:
@@ -239,6 +241,19 @@ def test_task_worker_serialize_handles_enums_and_preview() -> None:
     data = serialize(WritePreview("Preview", CodexHomeTarget.REAL, "home", 1, 2, 3, 4))
 
     assert data["target"] == "Real"
+
+
+def test_task_worker_emit_is_ascii_safe_for_gbk_stdout(monkeypatch) -> None:
+    raw = io.BytesIO()
+    gbk_stdout = io.TextIOWrapper(raw, encoding="gbk", errors="strict", newline="")
+    monkeypatch.setattr(sys, "stdout", gbk_stdout)
+
+    emit("result", message="contains warning ⚠")
+    gbk_stdout.flush()
+
+    line = raw.getvalue().decode("gbk")
+    assert "\\u26a0" in line
+    assert json.loads(line)["message"] == "contains warning ⚠"
 
 
 def test_button_uses_current_ui_language() -> None:
