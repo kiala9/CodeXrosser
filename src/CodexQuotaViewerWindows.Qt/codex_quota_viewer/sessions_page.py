@@ -2196,11 +2196,17 @@ class SessionsPage(QWidget):
         y = max(margin, container.height() - bar_size.height() - margin)
         bar.move(x, y)
         bar.raise_()
-        # Reserve a minimal scroll-past-end allowance — just enough that the
-        # last row peeks above the floating bar instead of being half-hidden
-        # by it. Anything larger leaves a visible empty band at the bottom of
-        # the list when scrolled all the way down.
-        self._scroll_past_end_extra = 24
+        # Scroll-past-end allowance — sized so the last row lands just above
+        # the floating bar instead of being covered by it. The bar overlaps
+        # the bottom of the tree viewport by roughly
+        # ``bar.height() + (margin - list_layout_bottom_padding)`` pixels;
+        # adding a small visual gap on top means the last row gets a
+        # comfortable strip of breathing room above the bar.
+        list_bottom_padding = 14  # mirrors list_layout.setContentsMargins(..., 14)
+        gap = 8
+        self._scroll_past_end_extra = (
+            bar_size.height() + (margin - list_bottom_padding) + gap
+        )
         # Re-apply scroll-past-end immediately in case the bar's size grew
         # (e.g. translator-driven tooltip pass changed nothing here, but the
         # very first reposition after construction needs the extension).
