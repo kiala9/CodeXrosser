@@ -235,8 +235,10 @@ def test_sessions_page_target_and_status_controls_match_visual_hierarchy() -> No
     assert page._rescan_button.objectName() == "SessionsFloatingActionButton"
     assert page._rescan_button.property("actionKey") == "sessions-rescan"
     assert not page._rescan_button.icon().isNull()
-    assert page._status_combo.objectName() == "SessionsStatusFilter"
-    assert page._status_combo.parentWidget() is not None
+    assert page._status_filter_button.objectName() == "SessionsListFilterButton"
+    assert page._status_filter_button.property("hasActiveFilter") is False
+    assert page._status_filter_popup.parentWidget() is not None
+    assert page._status_filter_popup.isHidden()
     assert page._search_button.objectName() == "SessionsSearchButton"
     assert not page._search_button.icon().isNull()
     assert page._search_popup.parentWidget() is not None

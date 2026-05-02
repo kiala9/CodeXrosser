@@ -38,7 +38,6 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
-    QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -117,6 +116,17 @@ _RECORD_EVENT_COUNT_ROLE = Qt.UserRole + 6
 _RECORD_TOOL_COUNT_ROLE = Qt.UserRole + 7
 _RECORD_COMPACT_ROLE = Qt.UserRole + 8
 _GROUP_COUNT_ROLE = Qt.UserRole + 9
+
+# Status filter options for the list panel popover. Order matters: the
+# popup row buttons render in this order, and ``_sync_status_filter_button_label``
+# resolves the trigger label by lookup. ``None`` is the unfiltered case.
+_STATUS_FILTER_OPTIONS: tuple[tuple[str | None, str], ...] = (
+    (None, "All statuses"),
+    ("active", "Active"),
+    ("archived", "Archived"),
+    ("deleted_pending_purge", "In trash"),
+    ("restorable", "Restorable"),
+)
 
 # Codex auto-compaction sessions all start with this exact safety preface.
 # We collapse them under a "Context compaction" subgroup per workfolder so
@@ -1376,20 +1386,28 @@ class SessionsPage(QWidget):
             lambda checked: self._on_env_tab_toggled(CodexHomeTarget.REAL, checked)
         )
 
-        self._status_combo = QComboBox(self)
-        self._status_combo.setObjectName("SessionsStatusFilter")
-        self._status_combo.addItem(self._translator("All statuses"), None)
-        self._status_combo.addItem(self._translator("Active"), "active")
-        self._status_combo.addItem(self._translator("Archived"), "archived")
-        self._status_combo.addItem(self._translator("In trash"), "deleted_pending_purge")
-        self._status_combo.addItem(self._translator("Restorable"), "restorable")
-        self._status_combo.setToolTip(self._translator("Sessions status filter tooltip"))
-        self._status_combo.setToolTipDuration(12_000)
-        self._status_combo.setAccessibleName(self._translator("Sessions status filter tooltip"))
-        self._status_combo.setMinimumWidth(136)
-        self._status_combo.setMinimumHeight(40)
-        self._status_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self._status_combo.currentIndexChanged.connect(self._refresh)
+        # Status filter — a popover trigger that telegraphs current
+        # selection inline ("All statuses ▾" / "Active ▾" / ...). The
+        # popup itself is built later in this method (after the search
+        # popup, so it can share the same chrome-install pattern).
+        # ``_STATUS_FILTER_OPTIONS`` is the canonical (key, label-key)
+        # ordering used both to populate the popup and to look up the
+        # trigger label.
+        self._status_filter_key: str | None = None
+        self._status_filter_button = QPushButton(self)
+        self._status_filter_button.setObjectName("SessionsListFilterButton")
+        self._status_filter_button.setCursor(Qt.PointingHandCursor)
+        self._status_filter_button.setMinimumHeight(40)
+        self._status_filter_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._status_filter_button.setProperty("hasActiveFilter", False)
+        self._status_filter_button.setToolTip(
+            self._translator("Sessions status filter tooltip")
+        )
+        self._status_filter_button.setToolTipDuration(12_000)
+        self._status_filter_button.setAccessibleName(
+            self._translator("Sessions status filter tooltip")
+        )
+        self._status_filter_button.clicked.connect(self._toggle_status_filter_popup)
 
         self._search_button = QToolButton(self)
         self._search_button.setObjectName("SessionsSearchButton")
@@ -1466,31 +1484,70 @@ class SessionsPage(QWidget):
         popup_layout.addWidget(self._search_submit, 0)
         self._search_popup.hide()
 
+        # Status filter popover — same frosted-glass primitive as the
+        # search popup (``_SessionsFilterPopup`` is a thin subclass of
+        # ``_SessionsSearchPopup`` already used by the detail panel
+        # timeline filter). Five mutually-exclusive row buttons, one
+        # per status. Selecting a row applies the filter and dismisses
+        # the popover.
+        self._status_filter_popup = _SessionsFilterPopup(self)
+        self._status_filter_popup.setStyleSheet(_LIST_CARD_QSS)
+        self._status_filter_popup.dismiss_requested.connect(
+            self._dismiss_status_filter_popup
+        )
+        self._status_filter_popup_chrome_installed = False
+        status_popup_layout = QVBoxLayout(self._status_filter_popup)
+        status_popup_layout.setContentsMargins(8, 8, 8, 8)
+        status_popup_layout.setSpacing(2)
+
+        self._status_filter_group = QButtonGroup(self)
+        self._status_filter_group.setExclusive(True)
+        self._status_filter_row_buttons: dict[str | None, QPushButton] = {}
+        for idx, (key, label_key) in enumerate(_STATUS_FILTER_OPTIONS):
+            row_btn = QPushButton(
+                self._translator(label_key), self._status_filter_popup
+            )
+            row_btn.setObjectName("SessionsListFilterRow")
+            row_btn.setCheckable(True)
+            row_btn.setCursor(Qt.PointingHandCursor)
+            row_btn.setProperty("active", key == self._status_filter_key)
+            self._status_filter_group.addButton(row_btn, idx)
+            self._status_filter_row_buttons[key] = row_btn
+            row_btn.clicked.connect(
+                lambda _checked=False, k=key: self._on_status_filter_row_clicked(k)
+            )
+            status_popup_layout.addWidget(row_btn)
+        self._status_filter_popup.hide()
+        self._sync_status_filter_button_label()
+
         # Environment tabs at the very top of the list card — they read
         # like the section title for the list ("which corpus am I looking
         # at: Sandbox or Real?"). The two pill buttons sit flush against
-        # each other (zero spacing) so they form a single segmented
-        # control, and the row stretches on the right so neither tab
-        # claims more horizontal space than its label needs.
+        # each other (zero spacing inside a nested sub-layout) so they
+        # still read as a single segmented control. Search trigger sits
+        # on the far left of the row, status filter trigger on the far
+        # right, with stretches keeping the segmented pair centered.
         env_tab_row = QHBoxLayout()
         env_tab_row.setContentsMargins(0, 0, 0, 0)
-        env_tab_row.setSpacing(0)
-        env_tab_row.addWidget(self._sandbox_tab_btn)
-        env_tab_row.addWidget(self._real_tab_btn)
+        env_tab_row.setSpacing(8)
+        env_tab_row.addWidget(self._search_button, 0)
         env_tab_row.addStretch(1)
+        env_tab_segment = QHBoxLayout()
+        env_tab_segment.setContentsMargins(0, 0, 0, 0)
+        env_tab_segment.setSpacing(0)
+        env_tab_segment.addWidget(self._sandbox_tab_btn)
+        env_tab_segment.addWidget(self._real_tab_btn)
+        env_tab_row.addLayout(env_tab_segment)
+        env_tab_row.addStretch(1)
+        env_tab_row.addWidget(self._status_filter_button, 0)
         list_layout.addLayout(env_tab_row)
 
+        # Record count sits as a standalone label just above the tree —
+        # a small left-aligned readout of "N session(s)" that doesn't
+        # compete with the toolbar above it.
         self._record_count_label = QLabel("")
         self._record_count_label.setObjectName("SessionsRecordCount")
         list_layout.addWidget(self._record_count_label)
-
-        search_row = QHBoxLayout()
-        search_row.setContentsMargins(0, 0, 0, 0)
-        search_row.setSpacing(8)
-        search_row.addWidget(self._search_button, 0)
-        search_row.addStretch(1)
-        search_row.addWidget(self._status_combo, 0)
-        list_layout.addLayout(search_row)
 
         self._tree_model = _SessionsTreeModel(self)
         self._tree = QTreeView(self)
@@ -1743,6 +1800,94 @@ class SessionsPage(QWidget):
         self._search_button.style().polish(self._search_button)
         self._search_button.update()
 
+    # ---- status filter popover ------------------------------------------
+
+    def _toggle_status_filter_popup(self) -> None:
+        if self._status_filter_popup.isVisible():
+            self._status_filter_popup.hide()
+            return
+        self._show_status_filter_popup()
+
+    def _show_status_filter_popup(self) -> None:
+        # Mirror ``_show_search_popup``: position before show so the popup
+        # paints in the right place on the very first frame.
+        self._position_status_filter_popup()
+        self._status_filter_popup.show()
+        self._status_filter_popup.raise_()
+        if not self._status_filter_popup_chrome_installed:
+            _install_dialog_chrome_for_popup(self._status_filter_popup)
+            if _install_acrylic_blur_for_popup(
+                self._status_filter_popup, tint_alpha=58
+            ):
+                self._status_filter_popup.set_native_acrylic(True)
+            self._status_filter_popup_chrome_installed = True
+        self._status_filter_popup.activateWindow()
+        active_btn = self._status_filter_row_buttons.get(self._status_filter_key)
+        if active_btn is not None:
+            active_btn.setFocus(Qt.PopupFocusReason)
+
+    def _position_status_filter_popup(self) -> None:
+        # Anchored under the trigger button, clamped to ``_list_container``
+        # width so the popover never paints outside the list card. Width
+        # is tuned to fit the row buttons comfortably (narrower than the
+        # search popup since these are short status labels).
+        container = self._list_container
+        width = min(220, max(180, container.width() - 24))
+        height = max(64, self._status_filter_popup.sizeHint().height())
+        button_bottom_global = self._status_filter_button.mapToGlobal(
+            QPoint(
+                self._status_filter_button.width() - width,
+                self._status_filter_button.height() + 8,
+            )
+        )
+        container_top_global = container.mapToGlobal(QPoint(0, 0))
+        x_local = button_bottom_global.x() - container_top_global.x()
+        x_local = min(
+            max(12, x_local),
+            max(12, container.width() - width - 12),
+        )
+        y_local = button_bottom_global.y() - container_top_global.y()
+        y_local = min(
+            y_local,
+            max(12, container.height() - height - 12),
+        )
+        target = QPoint(
+            container_top_global.x() + x_local,
+            container_top_global.y() + y_local,
+        )
+        self._status_filter_popup.setFixedSize(width, height)
+        self._status_filter_popup.move(target)
+
+    def _dismiss_status_filter_popup(self) -> None:
+        if self._status_filter_popup.isVisible():
+            self._status_filter_popup.hide()
+
+    def _on_status_filter_row_clicked(self, key: str | None) -> None:
+        self._status_filter_popup.hide()
+        if self._status_filter_key == key:
+            return
+        self._status_filter_key = key
+        for row_key, row_btn in self._status_filter_row_buttons.items():
+            row_btn.setProperty("active", row_key == key)
+            row_btn.style().unpolish(row_btn)
+            row_btn.style().polish(row_btn)
+        self._sync_status_filter_button_label()
+        self._refresh()
+
+    def _sync_status_filter_button_label(self) -> None:
+        label_key = next(
+            (label for k, label in _STATUS_FILTER_OPTIONS if k == self._status_filter_key),
+            "All statuses",
+        )
+        self._status_filter_button.setText(f"{self._translator(label_key)} ▾")
+        active = self._status_filter_key is not None
+        if self._status_filter_button.property("hasActiveFilter") == active:
+            return
+        self._status_filter_button.setProperty("hasActiveFilter", active)
+        self._status_filter_button.style().unpolish(self._status_filter_button)
+        self._status_filter_button.style().polish(self._status_filter_button)
+        self._status_filter_button.update()
+
     def _on_env_tab_toggled(self, target: CodexHomeTarget, checked: bool) -> None:
         """Switch the active session corpus when an env tab toggles on.
 
@@ -1770,8 +1915,7 @@ class SessionsPage(QWidget):
         self._search_debounce.start()
 
     def _status_filter_value(self) -> str | None:
-        index = self._status_combo.currentIndex()
-        return self._status_combo.itemData(index) if index >= 0 else None
+        return self._status_filter_key
 
     def _on_tree_clicked(self, index: QModelIndex) -> None:
         if not index.isValid() or not self._tree_model.is_group_index(index):
@@ -5052,7 +5196,7 @@ QFrame#SessionsListCard {{
 QLabel#SessionsRecordCount {{
     color: rgba(235, 235, 245, 150);
     font-size: 11px;
-    padding: 2px 10px 0 10px;
+    padding: 4px 0 2px 0;
 }}
 QLineEdit#SessionsListSearch {{
     background: rgba(0, 0, 0, 92);
@@ -5075,30 +5219,73 @@ QFrame#SessionsSearchPopup {{
     border: 1px solid {SURFACE_FROSTED_BORDER};
     border-radius: 12px;
 }}
-QComboBox#SessionsStatusFilter {{
-    background: rgba(0, 0, 0, 92);
-    border: 1px solid rgba(255, 255, 255, 24);
+/* Status filter trigger — peer of the search button on the list-header
+   strip. Cloned from QPushButton#SessionsDetailFilterButton; we use a
+   distinct objectName because that rule is scoped to the detail-panel
+   surface (per CLAUDE.md note about per-surface objectName scoping).
+   Padding sized so the trigger lines up with the 40x40 search button. */
+QPushButton#SessionsListFilterButton {{
+    background: rgba(255, 255, 255, 18);
+    border: 1px solid rgba(255, 255, 255, 30);
     border-radius: 8px;
-    color: rgba(245, 248, 252, 220);
-    padding: 8px 10px;
+    color: rgba(235, 235, 245, 220);
+    padding: 8px 14px;
     font-size: 12px;
+    text-align: left;
 }}
-QComboBox#SessionsStatusFilter:hover {{
-    border-color: {PRIMARY_TINT};
+QPushButton#SessionsListFilterButton:hover {{
+    background: rgba(255, 255, 255, 32);
+    border-color: rgba(255, 255, 255, 60);
 }}
-QComboBox#SessionsStatusFilter:focus {{
+QPushButton#SessionsListFilterButton:pressed {{
+    background: {PRIMARY_SOFT};
     border-color: {PRIMARY_BAND};
-    background: rgba(0, 0, 0, 130);
 }}
+QPushButton#SessionsListFilterButton[hasActiveFilter="true"] {{
+    background: {PRIMARY_GHOST};
+    border-color: {PRIMARY_BAND};
+    color: #ffffff;
+}}
+/* Status filter popover row buttons — one per status. ``[active="true"]``
+   marks the currently-applied filter with the same PRIMARY_GHOST +
+   PRIMARY_BAND highlight family used by env tabs and Settings'
+   ``QFrame[current="true"]``. */
+QPushButton#SessionsListFilterRow {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: rgba(235, 235, 245, 220);
+    padding: 8px 12px;
+    font-size: 12px;
+    text-align: left;
+}}
+QPushButton#SessionsListFilterRow:hover {{
+    background: rgba(255, 255, 255, 18);
+    border-color: rgba(255, 255, 255, 36);
+}}
+QPushButton#SessionsListFilterRow:pressed {{
+    background: {PRIMARY_SOFT};
+    border-color: {PRIMARY_BAND};
+}}
+QPushButton#SessionsListFilterRow[active="true"] {{
+    background: {PRIMARY_GHOST};
+    border-color: {PRIMARY_BAND};
+    color: #ffffff;
+}}
+/* Search trigger — peer of the status filter trigger. Same neutral
+   light surface as ``SessionsListFilterButton`` so the two flanking
+   toolbar buttons read as one family; ``[hasQuery="true"]`` shifts
+   to the same tinted active state used by every other selected
+   surface in the panel (PRIMARY_GHOST + PRIMARY_BAND). */
 QToolButton#SessionsSearchButton {{
-    background: rgba(0, 0, 0, 70);
-    border: 1px solid rgba(255, 255, 255, 22);
+    background: rgba(255, 255, 255, 18);
+    border: 1px solid rgba(255, 255, 255, 30);
     border-radius: 8px;
     padding: 0;
 }}
 QToolButton#SessionsSearchButton:hover {{
-    background: {PRIMARY_GHOST};
-    border-color: {PRIMARY_TINT};
+    background: rgba(255, 255, 255, 32);
+    border-color: rgba(255, 255, 255, 60);
 }}
 QToolButton#SessionsSearchButton:pressed {{
     background: {PRIMARY_SOFT};
