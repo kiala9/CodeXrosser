@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import (
@@ -11,6 +13,7 @@ from PySide6.QtCore import (
     QItemSelectionModel,
     QModelIndex,
     QPoint,
+    QPointF,
     QRectF,
     QSize,
     QSignalBlocker,
@@ -117,6 +120,11 @@ _RECORD_EVENT_COUNT_ROLE = Qt.UserRole + 6
 _RECORD_TOOL_COUNT_ROLE = Qt.UserRole + 7
 _RECORD_COMPACT_ROLE = Qt.UserRole + 8
 _GROUP_COUNT_ROLE = Qt.UserRole + 9
+# Pending expansion direction set by ``_queue_expansion_toggle`` so the
+# chevron flips visually the instant the click is accepted, before the
+# (potentially heavy) ``setExpanded`` paint pass runs on the next tick.
+# ``True``/``False`` = will be expanded/collapsed; absent = no pending.
+_PENDING_EXPANSION_ROLE = Qt.UserRole + 10
 
 # Status filter options for the list panel popover. Order matters: the
 # popup row buttons render in this order, and ``_sync_status_filter_button_state``
@@ -729,12 +737,42 @@ class _SessionsTreeModel(QStandardItemModel):
 
 
 class _SessionsTreeDelegate(QStyledItemDelegate):
-    """Custom single-column painting for the Sessions workfolder navigator."""
+    """Custom single-column painting for the Sessions workfolder navigator.
+
+    Each top-level workfolder group renders as a bordered "card" mirroring
+    the Accounts page's current-account card visual:
+
+      * collapsed groups → standalone card with all four corners rounded
+      * expanded groups → header card with rounded top corners only;
+        their visible children paint as the body of the SAME card
+        (continuing side borders, with rounded bottom corners on the
+        last visible descendant)
+      * the workfolder whose subtree contains the focused session takes
+        the PRIMARY_GHOST + PRIMARY_BAND treatment; others get a neutral
+        SURFACE_PANEL card so only one card is "active" at a time
+        (matches Accounts: only the current account is blue)
+    """
 
     _GROUP_HEIGHT = 56
     _COMPACTION_HEIGHT = 46
     _RECORD_HEIGHT = 84
     _COMPACT_RECORD_HEIGHT = 66
+
+    # Card chrome — values track design_tokens.py. Inlined as QColor here
+    # rather than parsed from token strings on every paint to keep the
+    # hot path allocation-free.
+    _CARD_FILL_ACTIVE = QColor(10, 132, 255, 32)     # PRIMARY_GHOST
+    _CARD_BORDER_ACTIVE = QColor(10, 132, 255, 130)  # PRIMARY_BAND
+    _CARD_FILL_HOVER = QColor(255, 255, 255, 18)
+    _CARD_BORDER_HOVER = QColor(255, 255, 255, 48)
+    _CARD_FILL_IDLE = QColor(255, 255, 255, 12)      # SURFACE_PANEL
+    _CARD_BORDER_IDLE = QColor(255, 255, 255, 28)    # SURFACE_PANEL_BORDER
+    _CARD_RADIUS = 12.0
+    # Top + bottom inset of the painted card within ``option.rect`` —
+    # creates a vertical gap between consecutive top-level cards.
+    _CARD_VGAP = 4.0
+    # Horizontal inset so the painted border isn't clipped at viewport edges.
+    _CARD_HINSET = 2.0
 
     def __init__(self, view: QTreeView):
         super().__init__(view)
@@ -744,6 +782,108 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         # label that scrolls with the tree's content. Zero by default
         # — set via ``set_first_row_top_reserve``.
         self._first_row_top_reserve = 0
+
+        # ---- paint-time caches ------------------------------------------
+        # These eliminate the per-row tree walks that previously made
+        # every expand/collapse feel sluggish on long lists. Each cache
+        # is invalidated on the *minimal* set of signals that can change
+        # its answer — see _invalidate_* hooks below.
+        #
+        # _last_path_cache: top-level row -> tuple encoding the row chain
+        # (top_row, child_row, ...) to that card's rightmost visible
+        # descendant. Used by _is_last_in_card so a row only checks
+        # equality against a precomputed tuple instead of re-walking the
+        # DFS path on every paint.
+        self._last_path_cache: dict[int, tuple[int, ...]] = {}
+        # _active_top_row: row of the top-level workfolder that owns the
+        # focused selection (active card), or None. Recomputed only when
+        # selection changes, so paint-time becomes a single int compare.
+        self._active_top_row: int | None = None
+        self._active_top_row_dirty = True
+        # _svg_cache: (color_hex, path_data) -> QSvgRenderer. Building a
+        # renderer parses XML; without this cache, every record row
+        # re-parses the same tiny SVG on every repaint of the viewport.
+        self._svg_cache: dict[tuple[str, str], QSvgRenderer] = {}
+
+        # ---- cache invalidation hooks -----------------------------------
+        view.expanded.connect(self._on_view_expansion_changed)
+        view.collapsed.connect(self._on_view_expansion_changed)
+        model = view.model()
+        if model is not None:
+            model.modelReset.connect(self._invalidate_all_caches)
+            model.layoutChanged.connect(self._invalidate_all_caches)
+            model.rowsInserted.connect(self._invalidate_path_cache)
+            model.rowsRemoved.connect(self._invalidate_path_cache)
+        sel_model = view.selectionModel()
+        if sel_model is not None:
+            sel_model.currentChanged.connect(self._invalidate_active_cache)
+            sel_model.selectionChanged.connect(self._invalidate_active_cache)
+
+    # ---- cache helpers --------------------------------------------------
+
+    def _on_view_expansion_changed(self, _index) -> None:
+        # Expand/collapse only affects which row caps each card, not which
+        # workfolder is active.
+        self._last_path_cache.clear()
+
+    def _invalidate_path_cache(self, *_args) -> None:
+        self._last_path_cache.clear()
+
+    def _invalidate_active_cache(self, *_args) -> None:
+        self._active_top_row_dirty = True
+
+    def _invalidate_all_caches(self, *_args) -> None:
+        self._last_path_cache.clear()
+        self._active_top_row_dirty = True
+
+    def _last_path_for_top(self, top_row: int) -> tuple[int, ...]:
+        """Encoded row chain to the rightmost visible leaf under the
+        top-level row ``top_row``. Cached; rebuilt on expand/collapse or
+        model change."""
+        cached = self._last_path_cache.get(top_row)
+        if cached is not None:
+            return cached
+        model = self._view.model()
+        if model is None:
+            return ()
+        cur = model.index(top_row, 0)
+        if not cur.isValid():
+            return ()
+        chain: list[int] = [top_row]
+        while True:
+            if not self._view.isExpanded(cur):
+                break
+            n = model.rowCount(cur)
+            if n == 0:
+                break
+            cur = model.index(n - 1, 0, cur)
+            chain.append(cur.row())
+        result = tuple(chain)
+        self._last_path_cache[top_row] = result
+        return result
+
+    def _resolve_active_top_row(self) -> int | None:
+        if not self._active_top_row_dirty:
+            return self._active_top_row
+        result: int | None = None
+        sel_model = self._view.selectionModel()
+        if sel_model is not None:
+            selected_rows = sel_model.selectedRows(0)
+            if selected_rows:
+                top = selected_rows[0]
+                while top.parent().isValid():
+                    top = top.parent()
+                result = top.row()
+            else:
+                current = sel_model.currentIndex()
+                if current.isValid():
+                    top = current
+                    while top.parent().isValid():
+                        top = top.parent()
+                    result = top.row()
+        self._active_top_row = result
+        self._active_top_row_dirty = False
+        return result
 
     def set_first_row_top_reserve(self, height: int) -> None:
         height = max(0, height)
@@ -764,6 +904,10 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
 
     def sizeHint(self, option, index):  # noqa: N802 - Qt naming
         extra = self._first_row_extra(index)
+        if self._is_last_in_card(index):
+            # Reserve a 4px gap below the last visible row of each
+            # top-level card so the next card has breathing room.
+            extra += int(self._CARD_VGAP)
         if index.data(_GROUP_KIND_ROLE) == "workfolder":
             return QSize(option.rect.width(), self._GROUP_HEIGHT + extra)
         if index.data(_GROUP_KIND_ROLE) == "compaction":
@@ -772,6 +916,149 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             return QSize(option.rect.width(), self._COMPACT_RECORD_HEIGHT + extra)
         return QSize(option.rect.width(), self._RECORD_HEIGHT + extra)
 
+    # ---- card chrome helpers --------------------------------------------
+
+    def _top_level_ancestor(self, index):
+        if not index.isValid():
+            return index
+        cur = index
+        while cur.parent().isValid():
+            cur = cur.parent()
+        return cur
+
+    def _is_active_workfolder(self, index) -> bool:
+        """A top-level workfolder is "active" (blue card chrome) when the
+        user is currently focused on its subtree — either it's selected
+        directly, or the focused row's ancestor walk lands on it. Mirrors
+        the Accounts page's "current account" semantics: only one card
+        is blue at a time. Expansion alone does NOT make it active."""
+        if not index.isValid() or index.parent().isValid():
+            return False
+        return self._resolve_active_top_row() == index.row()
+
+    def _parent_card_active(self, index) -> bool:
+        if not index.isValid():
+            return False
+        cur = index
+        while cur.parent().isValid():
+            cur = cur.parent()
+        return self._resolve_active_top_row() == cur.row()
+
+    def _is_last_in_card(self, index) -> bool:
+        """Return True if `index` is the last visible row of its top-level
+        card's expanded subtree — i.e. the row that should close the
+        card with rounded bottom corners + a bottom border. Backed by
+        ``_last_path_cache`` so a viewport-wide repaint after expand/
+        collapse is O(visible_rows) lookups rather than O(visible_rows ×
+        depth) walks."""
+        if not index.isValid():
+            return False
+        # Walk up to encode this index's path as a tuple of row numbers,
+        # then compare against the cached rightmost-leaf path for its
+        # top-level card. The walk-up is O(depth) and short — comparison
+        # is the hot operation, and tuple-eq is C-level fast.
+        cur = index
+        chain: list[int] = []
+        while cur.isValid():
+            chain.append(cur.row())
+            cur = cur.parent()
+        if not chain:
+            return False
+        chain.reverse()
+        return tuple(chain) == self._last_path_for_top(chain[0])
+
+    def _card_colors(self, *, active: bool, hover: bool) -> tuple[QColor, QColor]:
+        if active:
+            return self._CARD_FILL_ACTIVE, self._CARD_BORDER_ACTIVE
+        if hover:
+            return self._CARD_FILL_HOVER, self._CARD_BORDER_HOVER
+        return self._CARD_FILL_IDLE, self._CARD_BORDER_IDLE
+
+    def _paint_card_segment(
+        self,
+        painter: QPainter,
+        rect: QRectF,
+        fill: QColor,
+        border: QColor,
+        *,
+        has_top: bool,
+        has_bottom: bool,
+    ) -> None:
+        """Paint one segment of a connected card.
+
+        ``has_top`` / ``has_bottom`` flag whether the row caps the card
+        at that edge (rounded corners + edge stroke). Side borders are
+        always drawn. Combinations:
+          * (T, T) → standalone card (collapsed group)
+          * (T, F) → card header (expanded group); body continues below
+          * (F, F) → middle row (child of expanded group, not last)
+          * (F, T) → card footer (last visible child of expanded group)
+        """
+        r = self._CARD_RADIUS
+        x, y = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+
+        # ---- fill (closed path so corners are rounded properly) ----
+        if fill is not None and fill.alpha() > 0:
+            fill_path = QPainterPath()
+            fill_path.moveTo(x + (r if has_top else 0), y)
+            fill_path.lineTo(x + w - (r if has_top else 0), y)
+            if has_top:
+                fill_path.arcTo(x + w - 2 * r, y, 2 * r, 2 * r, 90, -90)
+            fill_path.lineTo(x + w, y + h - (r if has_bottom else 0))
+            if has_bottom:
+                fill_path.arcTo(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0, -90)
+            fill_path.lineTo(x + (r if has_bottom else 0), y + h)
+            if has_bottom:
+                fill_path.arcTo(x, y + h - 2 * r, 2 * r, 2 * r, 270, -90)
+            fill_path.lineTo(x, y + (r if has_top else 0))
+            if has_top:
+                fill_path.arcTo(x, y, 2 * r, 2 * r, 180, -90)
+            fill_path.closeSubpath()
+            painter.fillPath(fill_path, fill)
+
+        if border is None or border.alpha() <= 0:
+            return
+
+        # ---- border (open paths drawing only the visible edges) ----
+        # 0.5px offset for crisp 1px strokes at integer DPR.
+        bx = x + 0.5
+        by = y + 0.5
+        bw = w - 1.0
+        bh = h - 1.0
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(Qt.NoBrush)
+
+        # Side borders (always drawn). At capped edges, shrink the span
+        # to leave room for the rounded corner arcs (which are drawn at
+        # the same 0.5-offset rect). At OPEN edges (no cap), let the
+        # line run to the row boundary at integer y so the adjacent
+        # row's side line touches it flush — the +0.5 inset is
+        # deliberately NOT applied there, otherwise a 1px gap would
+        # appear at every row boundary in the connected card.
+        side_top = (by + r) if has_top else y
+        side_bot = (by + bh - r) if has_bottom else (y + h)
+        painter.drawLine(QPointF(bx, side_top), QPointF(bx, side_bot))
+        painter.drawLine(QPointF(bx + bw, side_top), QPointF(bx + bw, side_bot))
+
+        if has_top:
+            top_path = QPainterPath()
+            top_path.moveTo(bx, by + r)
+            top_path.arcTo(bx, by, 2 * r, 2 * r, 180, -90)
+            top_path.lineTo(bx + bw - r, by)
+            top_path.arcTo(bx + bw - 2 * r, by, 2 * r, 2 * r, 90, -90)
+            painter.drawPath(top_path)
+
+        if has_bottom:
+            bot_path = QPainterPath()
+            bot_path.moveTo(bx + bw, by + bh - r)
+            bot_path.arcTo(bx + bw - 2 * r, by + bh - 2 * r, 2 * r, 2 * r, 0, -90)
+            bot_path.lineTo(bx + r, by + bh)
+            bot_path.arcTo(bx, by + bh - 2 * r, 2 * r, 2 * r, 270, -90)
+            painter.drawPath(bot_path)
+
+    # ---- paint dispatch -------------------------------------------------
+
     def paint(self, painter: QPainter, option, index):  # noqa: N802 - Qt naming
         extra = self._first_row_extra(index)
         if extra > 0:
@@ -779,6 +1066,12 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             # bottom (normal-height) portion of the row. The top
             # ``extra`` pixels are blank, reserved for the count overlay.
             option.rect.setTop(option.rect.top() + extra)
+        # If this row is the last in its card, the +CARD_VGAP we added
+        # in sizeHint sits as empty space at the BOTTOM of the rect; the
+        # card chrome should paint inside the rect minus that gap.
+        bottom_gap = int(self._CARD_VGAP) if self._is_last_in_card(index) else 0
+        if bottom_gap > 0:
+            option.rect.setBottom(option.rect.bottom() - bottom_gap)
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing)
@@ -791,33 +1084,87 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             painter.restore()
 
     def _paint_group(self, painter: QPainter, option, index, kind: str) -> None:
-        rect = QRectF(option.rect).adjusted(0.0, 3.0, -2.0, -3.0)
-        selected = bool(option.state & QStyle.State_Selected)
         hover = bool(option.state & QStyle.State_MouseOver)
+        # Distinguish "what Qt actually shows right now" from "what the
+        # user just clicked toward but the actual setExpanded hasn't
+        # run yet". The card chrome (has_bottom) keys off the actual
+        # state, since children visibility hasn't changed; the chevron
+        # keys off the visual (pending if set) so the click registers
+        # immediately even when setExpanded's paint pass is heavy.
         expanded = self._view.isExpanded(index)
+        pending = index.data(_PENDING_EXPANSION_ROLE)
+        chevron_expanded = pending if isinstance(pending, bool) else expanded
+        is_top_level = not index.parent().isValid()
 
-        if selected or expanded:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(10, 132, 255, 34 if kind == "workfolder" else 18))
-            painter.drawRoundedRect(rect, 8, 8)
-            if kind == "workfolder":
-                painter.setBrush(QColor("#4ba6ff"))
-                painter.drawRoundedRect(QRectF(rect.left(), rect.top(), 3.0, rect.height()), 2, 2)
-        elif hover:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(255, 255, 255, 18))
-            painter.drawRoundedRect(rect, 8, 8)
+        if kind == "workfolder" and is_top_level:
+            # Top-level workfolder group — owns its card. Card chrome
+            # rounds top corners always; bottom corners only when the
+            # card has no expanded children (collapsed standalone).
+            active = self._is_active_workfolder(index)
+            fill, border = self._card_colors(active=active, hover=hover)
+            # Bottom inset is always 0 here: paint() has already
+            # shrunk option.rect by CARD_VGAP for collapsed standalone
+            # groups (via _is_last_in_card → True), so card.bottom()
+            # naturally lands above the gap. Expanded groups keep
+            # card.bottom() at row.bottom() so the side borders flow
+            # flush into the first child row below.
+            card_rect = QRectF(option.rect).adjusted(
+                self._CARD_HINSET,
+                self._CARD_VGAP,
+                -self._CARD_HINSET,
+                0.0,
+            )
+            self._paint_card_segment(
+                painter,
+                card_rect,
+                fill,
+                border,
+                has_top=True,
+                has_bottom=not expanded,
+            )
+        else:
+            # Compaction subgroup — sits inside its parent workfolder's
+            # card body. No own card chrome beyond continuing the parent
+            # card's side borders (and bottom if last in card).
+            parent_active = self._parent_card_active(index)
+            fill, border = self._card_colors(active=parent_active, hover=False)
+            is_last = self._is_last_in_card(index)
+            card_rect = QRectF(option.rect).adjusted(
+                self._CARD_HINSET, 0.0,
+                -self._CARD_HINSET, 0.0,
+            )
+            self._paint_card_segment(
+                painter,
+                card_rect,
+                fill,
+                border,
+                has_top=False,
+                has_bottom=is_last,
+            )
+            # Hover overlay for compaction rows.
+            if hover and not parent_active:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(self._CARD_FILL_HOVER)
+                painter.drawRect(card_rect)
+
+        # ---- inner content (chevron + folder + title + count pill) ----
+        # "Highlighted" content style now follows the active rule for
+        # workfolders and parent_active for compaction subgroups.
+        if kind == "workfolder" and is_top_level:
+            highlighted = self._is_active_workfolder(index)
+        else:
+            highlighted = self._parent_card_active(index)
 
         left = option.rect.left() + (8 if kind == "workfolder" else 30)
         center_y = option.rect.center().y()
-        accent = QColor("#55adff") if selected or expanded else QColor(165, 178, 195)
-        text_color = QColor("#56adff") if kind == "workfolder" and (selected or expanded) else QColor(220, 227, 238)
+        accent = QColor("#55adff") if highlighted else QColor(165, 178, 195)
+        text_color = QColor("#56adff") if kind == "workfolder" and highlighted else QColor(220, 227, 238)
         if kind == "compaction":
             text_color = QColor(145, 152, 165)
             accent = QColor(130, 138, 150)
 
-        self._draw_chevron(painter, left + 9, center_y, expanded, accent)
-        self._draw_folder(painter, left + 31, center_y - 16, accent, selected or expanded)
+        self._draw_chevron(painter, left + 9, center_y, chevron_expanded, accent)
+        self._draw_folder(painter, left + 31, center_y - 16, accent, highlighted)
 
         font = QFont(option.font)
         font.setPointSizeF(font.pointSizeF() + (1.0 if kind == "workfolder" else -0.5))
@@ -841,16 +1188,15 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         if count is not None:
             pill = QRectF(option.rect.right() - pill_w - 10, center_y - 13, pill_w, 26)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(55, 121, 190, 80) if selected or expanded else QColor(255, 255, 255, 14))
+            painter.setBrush(QColor(55, 121, 190, 80) if highlighted else QColor(255, 255, 255, 14))
             painter.drawRoundedRect(pill, 7, 7)
-            painter.setPen(QColor("#74bdff") if selected or expanded else QColor(160, 170, 185))
+            painter.setPen(QColor("#74bdff") if highlighted else QColor(160, 170, 185))
             count_font = QFont(option.font)
             count_font.setPointSizeF(max(count_font.pointSizeF() - 0.5, 8.5))
             painter.setFont(count_font)
             painter.drawText(pill, Qt.AlignCenter, str(count))
 
     def _paint_record(self, painter: QPainter, option, index) -> None:
-        rect = QRectF(option.rect).adjusted(32.0, 4.0, -8.0, -4.0)
         active_session_id = self._view.property("activeSessionId")
         selected = bool(option.state & QStyle.State_Selected) or (
             isinstance(active_session_id, str)
@@ -859,19 +1205,40 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         )
         hover = bool(option.state & QStyle.State_MouseOver)
         compact = bool(index.data(_RECORD_COMPACT_ROLE))
+        parent_active = self._parent_card_active(index)
+        is_last = self._is_last_in_card(index)
 
+        # Continue the parent card's chrome through this row.
+        card_fill, card_border = self._card_colors(active=parent_active, hover=False)
+        card_rect = QRectF(option.rect).adjusted(
+            self._CARD_HINSET, 0.0,
+            -self._CARD_HINSET, 0.0,
+        )
+        self._paint_card_segment(
+            painter,
+            card_rect,
+            card_fill,
+            card_border,
+            has_top=False,
+            has_bottom=is_last,
+        )
+
+        # Inner overlays. Selected row mirrors the Accounts page's
+        # "current account" card recipe — PRIMARY_GHOST fill + 1px
+        # PRIMARY_BAND border — so the focused session reads the same
+        # way the focused account does, even though it's nested inside
+        # an already-active parent card. Hover is just a faint white
+        # tint (selected wins when both apply).
         if selected:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(10, 132, 255, 46))
-            painter.drawRoundedRect(rect, 8, 8)
+            inner = card_rect.adjusted(8.0, 4.0, -8.0, -4.0 if is_last else 0.0)
+            painter.setPen(QPen(self._CARD_BORDER_ACTIVE, 1))
+            painter.setBrush(self._CARD_FILL_ACTIVE)
+            painter.drawRoundedRect(inner, 8, 8)
         elif hover:
+            inner = card_rect.adjusted(8.0, 2.0, -8.0, -2.0 if is_last else 0.0)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(255, 255, 255, 16))
-            painter.drawRoundedRect(rect, 8, 8)
-
-        guide_x = option.rect.left() + 20
-        painter.setPen(QPen(QColor(75, 140, 210, 80), 1))
-        painter.drawLine(guide_x, option.rect.top(), guide_x, option.rect.bottom())
+            painter.drawRoundedRect(inner, 8, 8)
 
         icon_x = option.rect.left() + 38
         icon_y = option.rect.top() + 13
@@ -1011,6 +1378,19 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(255, 255, 255, 18) if not active else QColor(10, 132, 255, 68))
         painter.drawRoundedRect(QRectF(x, y, 30, 30), 7, 7)
+        # 18×18 glyph centred in the 30×30 backdrop (6px inset on each side).
+        renderer = self._glyph_renderer(color, path_data)
+        renderer.render(painter, QRectF(x + 6, y + 6, 18, 18))
+
+    def _glyph_renderer(self, color: QColor, path_data: str) -> QSvgRenderer:
+        """Return a cached ``QSvgRenderer`` for the given stroke colour and
+        Lucide path. Building a renderer parses XML, which is too costly
+        to repeat per record per repaint — caching makes the cost O(1)
+        per unique colour instead."""
+        key = (color.name(QColor.HexArgb), path_data)
+        cached = self._svg_cache.get(key)
+        if cached is not None:
+            return cached
         svg = (
             f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
             f'<g fill="none" stroke="{color.name()}" stroke-width="2.25" '
@@ -1019,8 +1399,8 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             f'</g></svg>'
         )
         renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
-        # 18×18 glyph centred in the 30×30 backdrop (6px inset on each side).
-        renderer.render(painter, QRectF(x + 6, y + 6, 18, 18))
+        self._svg_cache[key] = renderer
+        return renderer
 
     def _draw_message_icon(
         self,
@@ -1225,6 +1605,15 @@ class SessionsPage(QWidget):
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(220)
         self._search_debounce.timeout.connect(self._refresh)
+
+        # ---- expansion input buffer -------------------------------------
+        # Toggles requested via tree clicks queue here and flush on the
+        # next event-loop tick (see _queue_expansion_toggle). The queue
+        # also coalesces repeats on the same row so an "expand → collapse
+        # → expand" burst pays the relayout/repaint cost once, not three
+        # times.
+        self._pending_expansion_toggles: dict[tuple[int, ...], bool] = {}
+        self._expansion_flush_scheduled = False
 
         self._build()
         self._set_record_count_text(self._translator("Loading sessions..."))
@@ -1613,7 +2002,14 @@ class SessionsPage(QWidget):
         self._tree.setIndentation(0)
         self._tree.setExpandsOnDoubleClick(False)
         self._tree.setAllColumnsShowFocus(False)
-        self._tree.setAnimated(True)
+        # Qt's built-in row-slide animation fights the connected-card
+        # delegate: child rows tween independently while the card's
+        # bottom-corner state migrates row-by-row, producing a "stitched"
+        # transition where neighbors visibly shift at different rates.
+        # Most navigator UIs (file explorers, IDE sidebars, mailbox
+        # lists) collapse instantly anyway — that's the cleaner default
+        # for a card-based tree.
+        self._tree.setAnimated(False)
         self._tree.setHeaderHidden(True)
         # Per-pixel scrolling so the scroll-past-end bump used by the floating
         # action bar is measured in pixels, not rows. With the default
@@ -2003,7 +2399,84 @@ class SessionsPage(QWidget):
     def _on_tree_clicked(self, index: QModelIndex) -> None:
         if not index.isValid() or not self._tree_model.is_group_index(index):
             return
-        self._tree.setExpanded(index, not self._tree.isExpanded(index))
+        self._queue_expansion_toggle(index)
+
+    def _queue_expansion_toggle(self, index: QModelIndex) -> None:
+        """Buffer expansion toggles and apply them on the next event-loop
+        tick. Three reasons:
+
+        * Responsiveness — ``setExpanded`` triggers an immediate
+          viewport relayout + repaint that, on a long list, is heavy
+          enough that the click handler can feel unresponsive even
+          though Qt's event queue accepted the click. Returning right
+          away lets any other queued events (a follow-up click, hover
+          updates, scroll events) drain before the paint pass starts.
+        * Coalescing — rapid expand→collapse→expand bursts on the same
+          row collapse to a single net toggle, so the user only pays
+          for the final state. Without this, a double-click on a
+          workfolder paints both intermediate states.
+        * Pre-flip feedback — the chevron is flipped via
+          ``_PENDING_EXPANSION_ROLE`` *before* ``setExpanded`` runs, so
+          the user sees an immediate visual response to the click even
+          if Qt's relayout/paint pass is about to block the event loop
+          for a moment. Without this, a click during a busy frame
+          looks ignored until the relayout completes.
+        """
+        chain = self._encode_group_index_path(index)
+        pending = self._pending_expansion_toggles.get(chain)
+        if pending is None:
+            new_target = not self._tree.isExpanded(index)
+        else:
+            new_target = not pending
+        self._pending_expansion_toggles[chain] = new_target
+        item = self._tree_model.itemFromIndex(index)
+        if item is not None:
+            item.setData(new_target, _PENDING_EXPANSION_ROLE)
+        if not self._expansion_flush_scheduled:
+            self._expansion_flush_scheduled = True
+            # 16ms ≈ one 60Hz frame: enough for Qt to dispatch the
+            # dataChanged-driven repaint of the chevron before the
+            # heavy setExpanded pass starts. With singleShot(0), the
+            # timer often beats the paint event and the user sees the
+            # chevron flip and the children appear in the same frame
+            # — which defeats the point of pre-flipping.
+            QTimer.singleShot(16, self._flush_pending_expansions)
+
+    @staticmethod
+    def _encode_group_index_path(index: QModelIndex) -> tuple[int, ...]:
+        """Encode a group index as a tuple of row numbers from top down.
+        Used as a stable cross-tick key for ``_pending_expansion_toggles``
+        so we don't have to hold QModelIndex references across event-loop
+        boundaries (where the model could in principle reset)."""
+        chain: list[int] = []
+        cur = index
+        while cur.isValid():
+            chain.append(cur.row())
+            cur = cur.parent()
+        chain.reverse()
+        return tuple(chain)
+
+    def _flush_pending_expansions(self) -> None:
+        self._expansion_flush_scheduled = False
+        queue = self._pending_expansion_toggles
+        self._pending_expansion_toggles = {}
+        model = self._tree_model
+        for chain, target in queue.items():
+            index = QModelIndex()
+            for row in chain:
+                index = model.index(row, 0, index)
+                if not index.isValid():
+                    break
+            else:
+                # Drop the pending hint *before* setExpanded so the
+                # post-expand paint pass keys off the actual state
+                # (which now matches what was pending). Carrying the
+                # role through would just be redundant data.
+                item = model.itemFromIndex(index)
+                if item is not None:
+                    item.setData(None, _PENDING_EXPANSION_ROLE)
+                if self._tree.isExpanded(index) != target:
+                    self._tree.setExpanded(index, target)
 
     def _on_row_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
         if not current.isValid():
@@ -4493,9 +4966,7 @@ class _EnvironmentContextBubble(_BubbleFrame):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        # Shell icon ties the chip directly to the content (cwd + shell are
-        # what the env block is about — terminal state).
-        role_icon = _make_chip_icon(_shell_icon())
+        role_icon = _make_chip_icon(_environment_icon())
         role_label = QLabel("Environment")
         role_label.setObjectName("SessionsBubbleRole")
         role_label.setProperty("role", "environment")
@@ -4934,6 +5405,21 @@ def _copy_to_clipboard(text: str) -> None:
         clipboard.setText(text)
 
 
+def _asset_path(name: str) -> Path:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    candidates: list[Path] = []
+    if bundle_root:
+        root = Path(bundle_root)
+        candidates.extend([root / "codex_quota_viewer" / "assets" / name, root / "assets" / name])
+    candidates.append(Path(__file__).resolve().parent / "assets" / name)
+    return next((path for path in candidates if path.exists()), candidates[-1])
+
+
+def _asset_icon(name: str) -> QIcon:
+    path = _asset_path(name)
+    return QIcon(str(path)) if path.exists() else QIcon()
+
+
 def _search_session_icon() -> QIcon:
     return _icon_from_svg(
         """
@@ -5111,6 +5597,26 @@ def _shell_icon() -> QIcon:
             <rect x="3" y="3" width="18" height="18" rx="2"/>
             <path d="m7 11 2-2-2-2"/>
             <path d="M11 13h4"/>
+          </g>
+        </svg>
+        """
+    )
+
+
+def _environment_icon() -> QIcon:
+    """Environment context icon loaded from assets/environment.svg."""
+    icon = _asset_icon("environment.svg")
+    if not icon.isNull():
+        return icon
+    return _icon_from_svg(
+        """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 29.999834 26">
+          <g fill="none" stroke="#ffffff" stroke-width="4"
+             stroke-linecap="round" stroke-linejoin="round"
+             transform="translate(-1.0000828,-3)">
+            <polyline points="10 9 3 16 10 23"/>
+            <line x1="14" y1="27" x2="18" y2="5"/>
+            <polyline points="22 9 29 16 22 23"/>
           </g>
         </svg>
         """
