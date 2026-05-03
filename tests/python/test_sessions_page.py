@@ -16,7 +16,8 @@ import pytest  # noqa: E402
 from PySide6.QtCore import QModelIndex, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from codex_quota_viewer.models import CodexHomeTarget  # noqa: E402
+from codex_quota_viewer.localization import translate  # noqa: E402
+from codex_quota_viewer.models import CodexHomeTarget, UiLanguage  # noqa: E402
 from codex_quota_viewer.sessions.models import (  # noqa: E402
     SessionDetail,
     SessionRecord,
@@ -27,6 +28,7 @@ from codex_quota_viewer.sessions_page import (  # noqa: E402
     _build_workfolder_groups,
     _format_size,
     _format_started_at,
+    _index_matches_viewport_position,
     _looks_like_markdown,
 )
 
@@ -246,6 +248,81 @@ def test_sessions_page_target_and_status_controls_match_visual_hierarchy() -> No
     assert page._locate_button.objectName() == "SessionsLocateButton"
     assert not page._locate_button.icon().isNull()
     assert "105, 102, 255" not in page._tree.styleSheet()
+    assert page._tree.hasMouseTracking()
+    assert page._tree.viewport().hasMouseTracking()
+
+
+def test_detail_filter_quick_buttons_select_single_role() -> None:
+    from codex_quota_viewer.sessions_page import _DETAIL_PANEL_QSS, _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+
+    assert set(panel._quick_filter_buttons) == {"user", "assistant"}
+    assert panel._quick_filter_buttons["user"].text() == "Only User"
+    assert panel._quick_filter_buttons["assistant"].text() == "Only Assistant"
+    assert "QPushButton#SessionsDetailQuickFilterButton" in _DETAIL_PANEL_QSS
+    assert "QPushButton#SessionsDetailFilterChip:checked" in _DETAIL_PANEL_QSS
+    assert "QPushButton#SessionsDetailFilterChip:checked {\n    background: rgba(10, 132, 255, 32)" in _DETAIL_PANEL_QSS
+    assert "QPushButton#SessionsDetailQuickFilterButton[active=\"true\"] {\n    background: rgba(10, 132, 255, 32)" in _DETAIL_PANEL_QSS
+
+    panel._quick_filter_buttons["user"].click()
+    assert panel._active_chip_kinds == {"user"}
+    assert panel._chip_buttons["user"].isChecked()
+    assert not panel._chip_buttons["assistant"].isChecked()
+    assert panel._quick_filter_buttons["user"].property("active") is True
+
+    panel._quick_filter_buttons["assistant"].click()
+    assert panel._active_chip_kinds == {"assistant"}
+    assert panel._chip_buttons["assistant"].isChecked()
+    assert not panel._chip_buttons["user"].isChecked()
+    assert panel._quick_filter_buttons["assistant"].property("active") is True
+
+    panel.close()
+
+
+def test_detail_filter_quick_buttons_translate_to_chinese() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(
+        translator=lambda key: translate(UiLanguage.CHINESE, key)
+    )
+
+    assert panel._quick_filter_buttons["user"].text() == "仅 User"
+    assert panel._quick_filter_buttons["assistant"].text() == "仅 Assistant"
+
+    panel.close()
+
+
+def test_sessions_tree_hover_tracks_current_viewport_position() -> None:
+    from PySide6.QtWidgets import QTreeView
+
+    app = QApplication.instance() or QApplication([])
+    model = _SessionsTreeModel()
+    model.set_records(
+        [
+            _record("first", started_at="2026-01-01T10:00:00Z"),
+            _record("second", started_at="2026-01-01T09:00:00Z"),
+        ]
+    )
+    tree = QTreeView()
+    tree.setModel(model)
+    tree.setHeaderHidden(True)
+    tree.resize(520, 240)
+    group_index = model.index(0, 0)
+    tree.expand(group_index)
+    tree.show()
+    app.processEvents()
+
+    first_index = model.index(0, 0, group_index)
+    second_index = model.index(1, 0, group_index)
+    second_pos = tree.visualRect(second_index).center()
+
+    assert _index_matches_viewport_position(tree, second_index, second_pos)
+    assert not _index_matches_viewport_position(tree, first_index, second_pos)
+
+    tree.close()
 
 
 def test_clicking_workfolder_keeps_open_session_detail() -> None:
@@ -1452,3 +1529,518 @@ def test_clearing_search_restores_unfiltered_view() -> None:
     rendered = panel._timeline_layout.count() - 1
     assert rendered == _WINDOW_SIZE
     panel.close()
+
+
+# ---------------------------------------------------------------------------
+# Time Travel popup
+# ---------------------------------------------------------------------------
+
+
+def _make_time_travel_detail(
+    record_id: str,
+    *,
+    user_count: int = 4,
+    asst_per_user: int = 1,
+    tool_per_user: int = 0,
+    tool_group_size: int = 0,
+) -> Any:
+    """Build a SessionDetail with a known shape for Time Travel tests.
+
+    Each "turn" is: 1 user message + ``asst_per_user`` assistant messages
+    + ``tool_per_user`` isolated tool calls + (if tool_group_size > 1)
+    a coalesced tool_group of that size. Returns the SessionDetail.
+    """
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+
+    items: list[SessionTimelineItem] = []
+    counter = 0
+    for u in range(user_count):
+        items.append(
+            SessionTimelineItem(
+                id=f"u-{u}",
+                type="message:user",
+                timestamp=f"2026-01-01T0{u}:00:00Z",
+                text=f"user prompt {u}",
+            )
+        )
+        for a in range(asst_per_user):
+            items.append(
+                SessionTimelineItem(
+                    id=f"a-{u}-{a}",
+                    type="message:assistant",
+                    timestamp=f"2026-01-01T0{u}:00:30Z",
+                    text=f"assistant reply {u}-{a}",
+                )
+            )
+        for t in range(tool_per_user):
+            counter += 1
+            items.append(
+                SessionTimelineItem(
+                    id=f"t-{u}-{t}",
+                    type="tool_call",
+                    timestamp=f"2026-01-01T0{u}:01:00Z",
+                    tool_name=f"tool_{counter % 3}",
+                    summary=f"call {counter}",
+                    status="completed",
+                )
+            )
+        if tool_group_size > 1:
+            for g in range(tool_group_size):
+                items.append(
+                    SessionTimelineItem(
+                        id=f"g-{u}-{g}",
+                        type="tool_call",
+                        timestamp=f"2026-01-01T0{u}:02:00Z",
+                        tool_name=f"grouped_{g}",
+                        summary=f"grouped call {g}",
+                        status="completed",
+                    )
+                )
+    return SessionDetail(
+        record=_record(record_id),
+        audit_entries=[],
+        timeline=items,
+        timeline_total=len(items),
+        timeline_next_offset=None,
+    )
+
+
+def _open_time_travel_for_test(panel: Any) -> Any:
+    """Test helper: stand up a Time Travel popup attached to ``panel``
+    without going through the click path's ``show()`` /
+    ``install_dwm_chrome()`` / ``activateWindow()`` calls. Those calls
+    are fine in production but unsafe in offscreen pytest mode after
+    many prior tests have left orphaned top-level widgets behind —
+    activating a focus-accepting Tool window then walks stale window
+    pointers and crashes with an access violation. The popup itself
+    plus all wiring is identical to the live path."""
+    from codex_quota_viewer.sessions_page import _TimeTravelPopup
+
+    if panel._time_travel_popup is not None:
+        return panel._time_travel_popup
+    host = panel.window() or panel
+    popup = _TimeTravelPopup(panel._translator, host)
+    popup.dismiss_requested.connect(panel._dismiss_time_travel_popup)
+    popup.blockJumpRequested.connect(panel._on_time_travel_jump)
+    panel._time_travel_popup = popup
+    panel._push_time_travel_data()
+    return popup
+
+
+def test_time_travel_button_click_invokes_handler() -> None:
+    """The clock button is wired to ``_on_time_travel_clicked`` — verify
+    the connection without triggering the Qt show pipeline (offscreen
+    pytest cannot survive show + activate of a focus-accepting Tool
+    window after many prior tests). Lifecycle behaviour is exercised
+    in the dedicated lifecycle tests below using ``_open_time_travel_for_test``."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-click"), CodexHomeTarget.SANDBOX)
+
+    fired: list[bool] = []
+    panel._on_time_travel_clicked = (  # type: ignore[method-assign]
+        lambda: fired.append(True)
+    )
+    panel._time_travel_button.clicked.emit()
+    assert fired == [True]
+    panel.close()
+
+
+def test_time_travel_popup_is_a_frosted_surface() -> None:
+    """The popup must subclass ``_FrostedSurface`` so it inherits the
+    ESC + click-outside dismissal contract and the acrylic chrome path
+    — the rest of the system relies on this."""
+    from codex_quota_viewer.frosted_surface import _FrostedSurface
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel, _TimeTravelPopup
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-frosted"), CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    assert isinstance(popup, _TimeTravelPopup)
+    assert isinstance(popup, _FrostedSurface)
+    assert popup.ACCEPT_FOCUS is True
+    assert popup.DISMISS_ON_ESCAPE is True
+    assert popup.DISMISS_ON_DEACTIVATE is True
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_row_click_jumps_without_closing_popup() -> None:
+    """A row click routes through _on_time_travel_jump, which calls
+    _recenter_async with the picked block index. Popup must NOT close —
+    rapid-browse semantics requires the user to be able to keep picking
+    targets after a jump."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-jump", user_count=10, asst_per_user=2),
+        CodexHomeTarget.SANDBOX,
+    )
+    _open_time_travel_for_test(panel)
+
+    captured: list[int] = []
+    panel._recenter_async = (  # type: ignore[method-assign]
+        lambda focus_block, *, on_anchor: captured.append(focus_block)
+    )
+
+    target = 7
+    panel._on_time_travel_jump(target)
+
+    assert captured == [target]
+    assert panel._time_travel_popup is not None
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_jump_clamps_to_block_range() -> None:
+    """Out-of-range block indices are dropped — the vertical view emits
+    a block index per row and we cannot trust the source widget to
+    never emit a stale index."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-clamp"), CodexHomeTarget.SANDBOX)
+
+    captured: list[int] = []
+    panel._recenter_async = (  # type: ignore[method-assign]
+        lambda focus_block, *, on_anchor: captured.append(focus_block)
+    )
+
+    panel._on_time_travel_jump(-1)
+    panel._on_time_travel_jump(99999)
+    assert captured == []
+    panel.close()
+
+
+def test_time_travel_vertical_model_one_row_per_tool_group() -> None:
+    """A coalesced tool_group block contributes exactly one row to the
+    vertical view — the inner tool calls collapse into a single
+    ``Tool calls · N`` summary row, mirroring how the minimap segments
+    treat them."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelVerticalModel,
+        _coalesce_timeline_blocks,
+        _TT_PREVIEW_ROLE,
+        _TT_ROLE_ROLE,
+    )
+
+    QApplication.instance() or QApplication([])
+    # 1 user + 4-call tool group + 1 assistant = 3 blocks total.
+    detail = _make_time_travel_detail(
+        "tt-group", user_count=1, asst_per_user=1, tool_group_size=4
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+    group_idx = next(i for i, (k, _p) in enumerate(blocks) if k == "tool_group")
+
+    model = _TimeTravelVerticalModel()
+    model.set_translator(lambda s: s)
+    model.refresh(blocks, None)
+
+    assert model.rowCount() == len(blocks)
+    group_row = model.index(group_idx, 0)
+    assert group_row.data(_TT_ROLE_ROLE) == "tool_group"
+    preview = group_row.data(_TT_PREVIEW_ROLE)
+    assert isinstance(preview, str)
+    assert "Tool calls" in preview and "4" in preview
+
+
+def test_time_travel_filter_proxy_matches_text_and_tool_name() -> None:
+    """The popup's own search filters rows by both preview text and tool
+    name. Independent from the panel filter — that one drives the
+    ``IsFilteredOutRole`` dim, this one hides rows entirely."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelFilterProxy,
+        _TimeTravelVerticalModel,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail(
+        "tt-proxy", user_count=2, asst_per_user=1, tool_per_user=2
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+    model = _TimeTravelVerticalModel()
+    model.set_translator(lambda s: s)
+    model.refresh(blocks, None)
+
+    proxy = _TimeTravelFilterProxy()
+    proxy.setSourceModel(model)
+    assert proxy.rowCount() == len(blocks)
+
+    # ``invalidate()`` is synchronous in QSortFilterProxyModel — no need
+    # to pump events between set_filter_text and rowCount.
+    proxy.set_filter_text("tool_1")  # matches a tool_name → tool_call rows
+    assert 0 < proxy.rowCount() < len(blocks)
+
+    proxy.set_filter_text("user prompt")  # matches preview text → user msgs
+    assert 0 < proxy.rowCount() < len(blocks)
+
+    proxy.set_filter_text("")
+    assert proxy.rowCount() == len(blocks)
+
+
+def test_time_travel_vertical_model_marks_filtered_rows() -> None:
+    """When a panel-level filter is active, the vertical model marks
+    excluded rows with ``IsFilteredOutRole=True`` so the delegate dims
+    them — the rows still exist (Time Travel always shows the full
+    session)."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelVerticalModel,
+        _coalesce_timeline_blocks,
+        _TT_FILTERED_OUT_ROLE,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail("tt-dim", user_count=3, asst_per_user=1)
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+    allowed = [0, 2]
+
+    model = _TimeTravelVerticalModel()
+    model.set_translator(lambda s: s)
+    model.refresh(blocks, allowed)
+
+    assert model.rowCount() == len(blocks)
+    in_rows = [
+        i for i in range(model.rowCount())
+        if not model.index(i, 0).data(_TT_FILTERED_OUT_ROLE)
+    ]
+    assert in_rows == allowed
+
+
+def test_time_travel_popup_disposed_on_session_switch() -> None:
+    """Switching sessions while the popup is open must dispose it — its
+    block list / window indices belong to the previous session and would
+    point at stale data after set_detail rewires _all_blocks."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-first"), CodexHomeTarget.SANDBOX)
+    _open_time_travel_for_test(panel)
+    assert panel._time_travel_popup is not None
+
+    panel.set_detail(_make_time_travel_detail("tt-second"), CodexHomeTarget.SANDBOX)
+    assert panel._time_travel_popup is None
+    panel.close()
+
+
+def test_time_travel_popup_disposed_on_dismiss_signal() -> None:
+    """ESC and click-outside both flow through ``dismiss_requested``,
+    which the panel hooks to its dispose path."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-dismiss"), CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    popup.dismiss_requested.emit()
+    assert panel._time_travel_popup is None
+    panel.close()
+
+
+def test_time_travel_popup_handles_empty_session() -> None:
+    """An empty timeline — set_detail with detail=None then opening the
+    popup — must not crash. The model has zero rows."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(None, CodexHomeTarget.SANDBOX)
+
+    popup = _open_time_travel_for_test(panel)
+    assert popup._vertical._model.rowCount() == 0
+
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_vertical_list_pins_dark_viewport() -> None:
+    """The vertical QListView must not inherit a light Windows theme's
+    white viewport / black text palette."""
+    from codex_quota_viewer.sessions_page import (
+        _DETAIL_PANEL_QSS,
+        _TimeTravelVerticalView,
+    )
+
+    QApplication.instance() or QApplication([])
+    view = _TimeTravelVerticalView(translator=lambda s: s)
+
+    assert view._list.objectName() == "TimeTravelVerticalList"
+    assert view._list.viewport().styleSheet() == "background: transparent;"
+    assert view._kind_chips["user"].objectName() == "SessionsDetailFilterChip"
+    assert "QListView#TimeTravelVerticalList" in _DETAIL_PANEL_QSS
+    assert "selection-color: #ffffff" in _DETAIL_PANEL_QSS
+
+    view.close()
+
+
+def test_time_travel_row_background_path_respects_rounded_edges() -> None:
+    """First/last selected rows should not paint square blue corners
+    outside the list container's rounded border."""
+    from PySide6.QtCore import QRect
+
+    from codex_quota_viewer.sessions_page import _time_travel_row_background_path
+
+    rect = QRect(0, 0, 200, 36)
+
+    first = _time_travel_row_background_path(rect, row=0, row_count=3).boundingRect()
+    middle = _time_travel_row_background_path(rect, row=1, row_count=3).boundingRect()
+    last = _time_travel_row_background_path(rect, row=2, row_count=3).boundingRect()
+    only = _time_travel_row_background_path(rect, row=0, row_count=1).boundingRect()
+
+    assert first.left() >= 1.0
+    assert first.top() >= 1.0
+    assert middle.top() == 0.0
+    assert last.left() >= 1.0
+    assert last.bottom() <= rect.y() + rect.height() - 1.0
+    assert only.top() >= 1.0
+    assert only.bottom() <= rect.y() + rect.height() - 1.0
+
+
+def test_time_travel_viewport_clip_path_rounds_scrolled_edges() -> None:
+    """A middle row scrolled against the viewport edge is still clipped
+    by the list's rounded viewport, not just by its own row rect."""
+    from PySide6.QtCore import QPointF, QRect
+
+    from codex_quota_viewer.sessions_page import _time_travel_viewport_clip_path
+
+    path = _time_travel_viewport_clip_path(QRect(0, 0, 200, 100))
+
+    assert not path.contains(QPointF(1.0, 1.0))
+    assert not path.contains(QPointF(199.0, 1.0))
+    assert not path.contains(QPointF(1.0, 99.0))
+    assert not path.contains(QPointF(199.0, 99.0))
+    assert path.contains(QPointF(8.0, 1.5))
+    assert path.contains(QPointF(100.0, 1.5))
+    assert path.contains(QPointF(100.0, 98.5))
+
+
+def test_time_travel_role_for_block_classifies_all_kinds() -> None:
+    """``_role_for_block`` is the single source of truth for the
+    vertical-view's role-dot colouring — guard the four cases together
+    so a rename or new TimelineKind doesn't silently shift one surface
+    relative to the other."""
+    from codex_quota_viewer.sessions.models import SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _role_for_block
+
+    user = SessionTimelineItem(id="u", type="message:user", timestamp="t", text="x")
+    asst = SessionTimelineItem(id="a", type="message:assistant", timestamp="t", text="x")
+    tool = SessionTimelineItem(id="c", type="tool_call", timestamp="t", tool_name="bash")
+
+    assert _role_for_block(("single", user)) == "user"
+    assert _role_for_block(("single", asst)) == "assistant"
+    assert _role_for_block(("single", tool)) == "tool"
+    assert _role_for_block(("tool_group", [tool, tool])) == "tool_group"
+
+
+def test_time_travel_vertical_view_chip_toggles_filter_rows() -> None:
+    """Toggling a kind chip in the vertical view hides every row whose
+    role matches that kind. Combined with the text search via AND."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelVerticalView,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail(
+        "tt-chip-filter", user_count=3, asst_per_user=2, tool_per_user=1
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+
+    view = _TimeTravelVerticalView(translator=lambda s: s)
+    view.refresh(blocks, None, None)
+    total = view._proxy.rowCount()
+    assert total == len(blocks)
+
+    # Untoggle "Assistant" → only user + tool rows remain.
+    view._kind_chips["assistant"].setChecked(False)
+    after_no_assistant = view._proxy.rowCount()
+    assert 0 < after_no_assistant < total
+
+    # Untoggle "User" too → only tool/tool_group rows remain.
+    view._kind_chips["user"].setChecked(False)
+    after_only_tools = view._proxy.rowCount()
+    assert 0 < after_only_tools < after_no_assistant
+
+    # Untoggle "Tool" → empty list.
+    view._kind_chips["tool"].setChecked(False)
+    assert view._proxy.rowCount() == 0
+
+    # Re-check everything → all rows back.
+    for chip in view._kind_chips.values():
+        chip.setChecked(True)
+    assert view._proxy.rowCount() == total
+
+
+def test_time_travel_vertical_view_tool_chip_covers_tool_group_too() -> None:
+    """The "Tool" chip is a single user-facing toggle that controls
+    both single tool_call AND coalesced tool_group blocks — coalescing
+    is internal rendering, not a category the user thinks about."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelVerticalView,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail(
+        "tt-tool-chip",
+        user_count=1,
+        asst_per_user=0,
+        tool_per_user=0,
+        tool_group_size=4,
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+    # Sanity: the test data has a tool_group block.
+    assert any(kind == "tool_group" for kind, _p in blocks)
+
+    view = _TimeTravelVerticalView(translator=lambda s: s)
+    view.refresh(blocks, None, None)
+    total = view._proxy.rowCount()
+    assert total == len(blocks)
+
+    # Untoggle Tool — both single tool calls and tool_group rows
+    # should disappear, leaving only the user prompt.
+    view._kind_chips["tool"].setChecked(False)
+    remaining_kinds: list[str] = []
+    for r in range(view._proxy.rowCount()):
+        proxy_idx = view._proxy.index(r, 0)
+        source_idx = view._proxy.mapToSource(proxy_idx)
+        from codex_quota_viewer.sessions_page import _TT_ROLE_ROLE
+        remaining_kinds.append(source_idx.data(_TT_ROLE_ROLE))
+    assert "tool" not in remaining_kinds
+    assert "tool_group" not in remaining_kinds
+
+
+def test_time_travel_vertical_view_chip_and_text_filters_compose() -> None:
+    """Chip and text filters AND together — a row passes only when its
+    kind is enabled AND its preview/tool name matches the needle."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelVerticalView,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail(
+        "tt-and", user_count=3, asst_per_user=2, tool_per_user=1
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+
+    view = _TimeTravelVerticalView(translator=lambda s: s)
+    view.refresh(blocks, None, None)
+
+    # Just the search "tool_" → matches tool rows only.
+    view._proxy.set_filter_text("tool_")
+    text_only = view._proxy.rowCount()
+    assert text_only > 0
+
+    # Now also disable Tool chip — combined filter must drop to zero.
+    view._kind_chips["tool"].setChecked(False)
+    assert view._proxy.rowCount() == 0

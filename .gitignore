@@ -30,6 +30,7 @@ Microsoft/
 artifacts/
 publish/
 installer/Output/
+src/CodexQuotaViewerWindows.Qt/codex_quota_viewer/assets/legacy
 src/CodexQuotaViewerWindows.Qt/codex_quota_viewer/assets/cqv-app-icon*.png
 vendor/CodexMM/node_modules/
 vendor/CodexMM/dist/

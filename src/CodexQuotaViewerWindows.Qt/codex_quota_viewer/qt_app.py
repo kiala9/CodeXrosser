@@ -36,6 +36,7 @@ from PySide6.QtGui import (
     QIcon,
     QMouseEvent,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
 )
@@ -168,6 +169,61 @@ def _asset_pixmap(name: str) -> QPixmap | None:
 def _asset_icon(name: str) -> QIcon:
     path = _asset_path(name)
     return QIcon(str(path)) if path.exists() else QIcon()
+
+
+def _apply_dark_palette(app: QApplication) -> None:
+    """Pin native Qt controls to the app's dark visual language.
+
+    The window is dark and mostly custom-painted, but native widgets still
+    consult QApplication.palette() for viewports, placeholder text, disabled
+    text, menus, item selections, and tooltips. On a light Windows theme those
+    roles default to white surfaces and black text, which leaks through in
+    QListView/QTextEdit/QMenu surfaces that QSS does not fully cover.
+    """
+    app.setStyle("Fusion")
+    palette = QPalette()
+    colors: dict[QPalette.ColorRole, QColor] = {
+        QPalette.Window: QColor(22, 25, 29),
+        QPalette.WindowText: QColor(255, 255, 255),
+        QPalette.Base: QColor(20, 22, 26),
+        QPalette.AlternateBase: QColor(30, 34, 40),
+        QPalette.ToolTipBase: QColor(32, 37, 43),
+        QPalette.ToolTipText: QColor(255, 255, 255),
+        QPalette.Text: QColor(255, 255, 255),
+        QPalette.Button: QColor(34, 39, 46),
+        QPalette.ButtonText: QColor(255, 255, 255),
+        QPalette.BrightText: QColor(255, 255, 255),
+        QPalette.Highlight: QColor(10, 132, 255),
+        QPalette.HighlightedText: QColor(255, 255, 255),
+        QPalette.Link: QColor(64, 156, 255),
+        QPalette.LinkVisited: QColor(120, 168, 235),
+        QPalette.Light: QColor(72, 78, 88),
+        QPalette.Midlight: QColor(54, 60, 68),
+        QPalette.Mid: QColor(42, 48, 56),
+        QPalette.Dark: QColor(14, 17, 21),
+        QPalette.Shadow: QColor(0, 0, 0),
+    }
+    disabled_colors: dict[QPalette.ColorRole, QColor] = {
+        QPalette.WindowText: QColor(235, 235, 245, 86),
+        QPalette.Text: QColor(235, 235, 245, 86),
+        QPalette.ButtonText: QColor(235, 235, 245, 86),
+        QPalette.Highlight: QColor(10, 132, 255, 80),
+        QPalette.HighlightedText: QColor(235, 235, 245, 110),
+    }
+    if hasattr(QPalette, "PlaceholderText"):
+        colors[QPalette.PlaceholderText] = QColor(235, 235, 245, 115)
+        disabled_colors[QPalette.PlaceholderText] = QColor(235, 235, 245, 70)
+
+    for group in (
+        QPalette.Active,
+        QPalette.Inactive,
+        QPalette.Disabled,
+    ):
+        for role, color in colors.items():
+            palette.setColor(group, role, color)
+    for role, color in disabled_colors.items():
+        palette.setColor(QPalette.Disabled, role, color)
+    app.setPalette(palette)
 
 
 def _globe_icon() -> QIcon:
@@ -3393,6 +3449,7 @@ def _install_acrylic_blur(window: QWidget, enabled: bool = True, tint_alpha: int
 
 def run_app() -> int:
     app = QApplication(sys.argv)
+    _apply_dark_palette(app)
     app.setQuitOnLastWindowClosed(False)
     app_icon = _asset_icon(APP_ICON_ASSET)
     if not app_icon.isNull():

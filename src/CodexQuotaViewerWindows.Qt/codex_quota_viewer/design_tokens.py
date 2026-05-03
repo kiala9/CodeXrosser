@@ -86,13 +86,51 @@ SLATE_TINT = "rgba(130, 160, 200, 64)"
 """Slate role accent border — pairs with ``SLATE_GHOST``."""
 
 
+# ---- Role accent solids (Time Travel vertical view) --------------------
+# Solid hex colours for the role-dot indicator in the Time Travel
+# vertical view's row delegate. Translucent role tokens (PRIMARY_GHOST
+# etc.) don't read at dot size against the dark frosted backdrop, so
+# this scale gives solid colours hand-tuned for legibility. Hue family
+# aligns with the bubble role palette but saturations are bumped.
+
+ROLE_DOT_USER = "#0A84FF"
+"""Row-dot colour for user blocks — vivid PRIMARY blue."""
+
+ROLE_DOT_ASSISTANT = "#E0E4EC"
+"""Row-dot colour for assistant blocks — light cool white-gray that
+reads clearly on the dark frosted base."""
+
+ROLE_DOT_TOOL = "#7E8696"
+"""Row-dot colour for single tool_call blocks — mid cool gray, echoes
+the TOOL_GHOST palette in solid form."""
+
+ROLE_DOT_TOOL_GROUP = "#5A6273"
+"""Row-dot colour for coalesced tool_group blocks — one step darker
+than ``ROLE_DOT_TOOL`` so multi-call sections read as denser than
+isolated tool calls."""
+
+ROLE_FILTERED_OUT_ALPHA = 0.35
+"""Opacity multiplier applied to vertical-view rows whose blocks are
+filtered out by the panel-level filter. The list keeps showing them so
+the global session shape stays intact."""
+
+
 # ---- Frosted-glass surface ----------------------------------------------
 
-SURFACE_FROSTED = "rgba(18, 39, 54, 222)"
-"""Frosted-glass popup base (search popup, status banner)."""
+SURFACE_FROSTED = "rgba(48, 48, 50, 200)"
+"""Frosted-glass popup base (search popup, status banner).
+Light neutral warm-grey — replaces the previous blue-grey that
+pooled with the brand-blue border into a visually dirty mix. This
+token stays in sync with ``frosted_surface._FrostedSurface.BASE_COLOR``."""
 
-SURFACE_FROSTED_BORDER = PRIMARY_STRONG
-"""Border on frosted-glass surfaces — reuses ``PRIMARY_STRONG``."""
+SURFACE_FROSTED_BORDER = "rgba(255, 255, 255, 45)"
+"""Neutral white glass edge on frosted-glass surfaces. Replaces the
+previous ``PRIMARY_TINT`` blue border which pooled with the dark blue
+base to create a visually "dirty" mix on dark backgrounds. The white
+edge reads as a crisp frosted rim while staying subtle enough not to
+compete with content. Severity-driven surfaces (status pill per
+``StatusPopupFrame._SURFACES``) keep their own per-severity border
+colours."""
 
 
 # ---- Semantic accents ---------------------------------------------------
@@ -120,6 +158,11 @@ __all__ = [
     "TOOL_TINT",
     "SLATE_GHOST",
     "SLATE_TINT",
+    "ROLE_DOT_USER",
+    "ROLE_DOT_ASSISTANT",
+    "ROLE_DOT_TOOL",
+    "ROLE_DOT_TOOL_GROUP",
+    "ROLE_FILTERED_OUT_ALPHA",
     "SURFACE_FROSTED",
     "SURFACE_FROSTED_BORDER",
     "SUCCESS",

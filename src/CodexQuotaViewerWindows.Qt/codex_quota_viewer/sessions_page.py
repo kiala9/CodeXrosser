@@ -8,15 +8,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import (
+    QAbstractListModel,
     QByteArray,
     QEvent,
     QItemSelectionModel,
     QModelIndex,
     QPoint,
     QPointF,
+    QRect,
     QRectF,
+    QRegularExpression,
     QSize,
     QSignalBlocker,
+    QSortFilterProxyModel,
     Qt,
     QTimer,
     Signal,
@@ -25,7 +29,9 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QFont,
+    QFontMetrics,
     QGuiApplication,
     QIcon,
     QPainter,
@@ -39,6 +45,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QButtonGroup,
     QFrame,
     QGridLayout,
@@ -46,6 +53,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -72,6 +80,11 @@ from .design_tokens import (
     PRIMARY_SOLID_TINT,
     PRIMARY_STRONG,
     PRIMARY_TINT,
+    ROLE_DOT_ASSISTANT,
+    ROLE_DOT_TOOL,
+    ROLE_DOT_TOOL_GROUP,
+    ROLE_DOT_USER,
+    ROLE_FILTERED_OUT_ALPHA,
     SLATE_GHOST,
     SLATE_TINT,
     SURFACE_FROSTED,
@@ -421,9 +434,744 @@ class _SessionsFloatingActionBar(_FrostedSurface):
     BORDER_RADIUS = 7.5
     INNER_RADIUS = 6.5
 
+    # Lighter palette so the bar reads as frosted glass rather than a
+    # solid dark strip when acrylic blur is active underneath it.
+    # The key is keeping the painted RGB high enough that even after
+    # the acrylic alpha drop the blended colour stays well above the
+    # dark card background beneath it.
+    BASE_COLOR = QColor(72, 72, 76, 200)
+    INNER_COLOR = QColor(255, 255, 255, 45)
+    NATIVE_ACRYLIC_BASE_ALPHA = 65
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent, as_window=True)
         self.setObjectName("SessionsFloatingActions")
+
+
+# ---------------------------------------------------------------------------
+# Time Travel — full-session navigator popup
+#
+# A Qt.Tool frosted popup that opens upward from the detail toolbar's clock
+# button and spans the SessionsPage width. Hosts a virtualized vertical
+# list of every block in _all_blocks with debounced text search and
+# role-chip filters; each row shows ``#index · role-dot · optional tool
+# icon · preview · timestamp``. Click row → jump main timeline.
+#
+# The popup keeps itself open after a jump (rapid-browse) and dismisses on
+# ESC or click-outside via the inherited _FrostedSurface flags.
+#
+# Coexistence with _TimelineNavigatorRail: the rail keeps doing local
+# user-prompt jumps within the materialized window; this popup handles the
+# global cross-session navigation use case the rail can't.
+# ---------------------------------------------------------------------------
+
+
+_ROLE_DOT_COLORS: dict[str, str] = {
+    "user": ROLE_DOT_USER,
+    "assistant": ROLE_DOT_ASSISTANT,
+    "tool": ROLE_DOT_TOOL,
+    "tool_group": ROLE_DOT_TOOL_GROUP,
+}
+
+
+def _role_for_block(block: Any) -> str:
+    """Classify a coalesced timeline block into one of the four role
+    categories used by the Time Travel vertical view's row colouring and
+    chip filter. Mirrors ``_SessionDetailPanel._minimap_kind_for_block``
+    but as a free function so the popup widgets can call it without a
+    back-reference to the panel."""
+    kind, payload = block
+    if kind == "tool_group":
+        return "tool_group"
+    item_type = getattr(payload, "type", "")
+    if item_type == "message:user":
+        return "user"
+    if item_type == "message:assistant":
+        return "assistant"
+    return "tool"
+
+
+def _format_block_timestamp(item: SessionTimelineItem) -> str:
+    """Parse the ISO timestamp string into a ``HH:MM`` display. Defensive
+    against malformed timestamps — falls back to a substring slice and then
+    to an empty string so the vertical view never crashes on dirty data."""
+    raw = (getattr(item, "timestamp", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.strftime("%H:%M")
+    except (ValueError, TypeError):
+        # ISO format usually puts HH:MM at offset 11..16; if even that
+        # slice doesn't hold valid digits, give up silently.
+        slice_ = raw[11:16] if len(raw) >= 16 else ""
+        return slice_ if (len(slice_) == 5 and slice_[2] == ":") else ""
+
+
+def _block_preview_text(block: Any, *, translator: Callable[[str], str], max_chars: int = 120) -> str:
+    """Short preview string used by the Time Travel vertical-view rows.
+    Slices the head BEFORE strip() — same anti-allocation trick as
+    ``_minimap_label_for_block`` (multi-MB user messages would otherwise
+    eat seconds of CPU per refresh)."""
+    kind, payload = block
+    if kind == "tool_group":
+        names = ", ".join(_uniq_tool_names(payload, limit=4))
+        suffix = translator("Tool calls · {n}").format(n=len(payload))
+        return f"{suffix}  —  {names}" if names else suffix
+    item_type = getattr(payload, "type", "")
+    if item_type in ("message:user", "message:assistant"):
+        head = (getattr(payload, "text", "") or "")[: max_chars * 2].strip()
+        return head[:max_chars]
+    if item_type == "tool_call":
+        name = getattr(payload, "tool_name", None) or "unknown_tool"
+        summary = (getattr(payload, "summary", "") or "").strip()
+        if summary and summary != name:
+            return f"{name}  —  {summary[:max_chars]}"
+        return name
+    return ""
+
+
+@dataclass(frozen=True)
+class _TimeTravelRow:
+    """Precomputed row payload for the vertical view — built once per
+    ``model.refresh()`` so ``data()`` reads are O(1) during scroll."""
+
+    block_index: int
+    role: str
+    preview: str
+    timestamp: str
+    tool_name: str | None
+    is_filtered_out: bool
+
+
+# ---- Vertical view -------------------------------------------------------
+
+
+_TT_BLOCK_INDEX_ROLE = Qt.UserRole + 100
+_TT_ROLE_ROLE = Qt.UserRole + 101
+_TT_PREVIEW_ROLE = Qt.UserRole + 102
+_TT_TIMESTAMP_ROLE = Qt.UserRole + 103
+_TT_TOOL_NAME_ROLE = Qt.UserRole + 104
+_TT_FILTERED_OUT_ROLE = Qt.UserRole + 105
+
+
+def _time_travel_row_background_path(
+    rect: QRect,
+    row: int,
+    row_count: int,
+    *,
+    inset: float = 1.0,
+    radius: float = 7.0,
+) -> QPainterPath:
+    """Selection/hover fill clipped to the list's rounded outer edges."""
+    row_count = max(1, int(row_count))
+    first_row = row <= 0
+    last_row = row >= row_count - 1
+    fill_rect = QRectF(rect).adjusted(
+        inset,
+        inset if first_row else 0.0,
+        -inset,
+        -inset if last_row else 0.0,
+    )
+    if fill_rect.isEmpty():
+        return QPainterPath()
+
+    if not first_row and not last_row:
+        path = QPainterPath()
+        path.addRect(fill_rect)
+        return path
+
+    left = fill_rect.left()
+    right = fill_rect.right()
+    top = fill_rect.top()
+    bottom = fill_rect.bottom()
+    r = min(radius, fill_rect.width() / 2.0, fill_rect.height() / 2.0)
+
+    path = QPainterPath()
+    path.moveTo(left + (r if first_row else 0.0), top)
+    path.lineTo(right - (r if first_row else 0.0), top)
+    if first_row:
+        path.quadTo(right, top, right, top + r)
+    else:
+        path.lineTo(right, top)
+    path.lineTo(right, bottom - (r if last_row else 0.0))
+    if last_row:
+        path.quadTo(right, bottom, right - r, bottom)
+    else:
+        path.lineTo(right, bottom)
+    path.lineTo(left + (r if last_row else 0.0), bottom)
+    if last_row:
+        path.quadTo(left, bottom, left, bottom - r)
+    else:
+        path.lineTo(left, bottom)
+    path.lineTo(left, top + (r if first_row else 0.0))
+    if first_row:
+        path.quadTo(left, top, left + r, top)
+    else:
+        path.lineTo(left, top)
+    path.closeSubpath()
+    return path
+
+
+def _time_travel_viewport_clip_path(
+    rect: QRect,
+    *,
+    inset: float = 1.0,
+    radius: float = 7.0,
+) -> QPainterPath:
+    """Rounded clip matching the visible Time Travel list viewport."""
+    clip_rect = QRectF(rect).adjusted(inset, inset, -inset, -inset)
+    path = QPainterPath()
+    if not clip_rect.isEmpty():
+        path.addRoundedRect(clip_rect, radius, radius)
+    return path
+
+
+def _index_matches_viewport_position(
+    view: QAbstractItemView | None,
+    index: QModelIndex,
+    viewport_pos: QPoint,
+) -> bool:
+    """Return whether ``viewport_pos`` currently resolves to ``index``."""
+    if view is None or not index.isValid():
+        return False
+    viewport = view.viewport()
+    if viewport is None or not viewport.rect().contains(viewport_pos):
+        return False
+    return view.indexAt(viewport_pos) == index
+
+
+def _index_under_cursor(view: QAbstractItemView | None, index: QModelIndex) -> bool:
+    if view is None:
+        return False
+    viewport = view.viewport()
+    if viewport is None:
+        return False
+    return _index_matches_viewport_position(
+        view,
+        index,
+        viewport.mapFromGlobal(QCursor.pos()),
+    )
+
+
+def _item_view_from_option(option) -> QAbstractItemView | None:
+    widget = getattr(option, "widget", None)
+    if isinstance(widget, QAbstractItemView):
+        return widget
+    if isinstance(widget, QWidget):
+        parent = widget.parentWidget()
+        if isinstance(parent, QAbstractItemView):
+            return parent
+    return None
+
+
+class _TimeTravelVerticalModel(QAbstractListModel):
+    """Backs the vertical view's QListView. Holds a precomputed row list
+    so ``data()`` reads stay O(1) — Qt fires ``data()`` heavily during
+    scrolling and per-cell layout. ``refresh()`` resets the model and
+    rebuilds ``_rows`` from the current blocks/filtered-indices."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._rows: list[_TimeTravelRow] = []
+        self._translator: Callable[[str], str] = lambda text: text
+
+    def set_translator(self, translator: Callable[[str], str]) -> None:
+        self._translator = translator
+
+    def refresh(
+        self,
+        blocks: list[Any],
+        filtered_indices: list[int] | None,
+    ) -> None:
+        self.beginResetModel()
+        try:
+            self._rows = []
+            allowed = set(filtered_indices) if filtered_indices is not None else None
+            for i, block in enumerate(blocks):
+                kind, payload = block
+                if kind == "tool_group":
+                    ts_item: SessionTimelineItem | None = payload[0] if payload else None
+                    tool_name = (
+                        ", ".join(_uniq_tool_names(payload, limit=2)) if payload else None
+                    )
+                else:
+                    ts_item = payload
+                    tool_name = getattr(payload, "tool_name", None)
+                self._rows.append(
+                    _TimeTravelRow(
+                        block_index=i,
+                        role=_role_for_block(block),
+                        preview=_block_preview_text(
+                            block, translator=self._translator, max_chars=120
+                        ),
+                        timestamp=_format_block_timestamp(ts_item) if ts_item else "",
+                        tool_name=tool_name,
+                        is_filtered_out=(allowed is not None and i not in allowed),
+                    )
+                )
+        finally:
+            self.endResetModel()
+
+    # ----------------------------------------------------------- Qt API
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
+        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
+            return None
+        row = self._rows[index.row()]
+        if role == _TT_BLOCK_INDEX_ROLE:
+            return row.block_index
+        if role == _TT_ROLE_ROLE:
+            return row.role
+        if role == _TT_PREVIEW_ROLE or role == Qt.DisplayRole:
+            return row.preview
+        if role == _TT_TIMESTAMP_ROLE:
+            return row.timestamp
+        if role == _TT_TOOL_NAME_ROLE:
+            return row.tool_name or ""
+        if role == _TT_FILTERED_OUT_ROLE:
+            return row.is_filtered_out
+        return None
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlags:
+        if not index.isValid():
+            return Qt.NoItemFlags
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+
+
+class _TimeTravelRowDelegate(QStyledItemDelegate):
+    """Renders one row of the vertical view as:
+    ``[gutter #idx] [role-dot] [tool-icon?] [preview elided] [HH:MM]``.
+
+    Mostly a layout exercise — the only "smart" bit is the
+    ``filtered_out`` opacity dim and the role color reused from the
+    minimap palette so the two views read as one design.
+    """
+
+    ROW_HEIGHT = 36
+    GUTTER_WIDTH = 44
+    ROLE_DOT_WIDTH = 18
+    TIMESTAMP_WIDTH = 48
+    LEFT_PAD = 12
+    RIGHT_PAD = 12
+    GAP = 8
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt naming
+        del option, index
+        return QSize(0, self.ROW_HEIGHT)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        painter.save()
+        try:
+            rect: QRect = option.rect
+            selected = bool(option.state & QStyle.State_Selected)
+            view = _item_view_from_option(option)
+            hovered = _index_under_cursor(view, index)
+            row_role = index.data(_TT_ROLE_ROLE) or "tool"
+            preview = index.data(_TT_PREVIEW_ROLE) or ""
+            timestamp = index.data(_TT_TIMESTAMP_ROLE) or ""
+            block_idx = index.data(_TT_BLOCK_INDEX_ROLE)
+            filtered_out = bool(index.data(_TT_FILTERED_OUT_ROLE))
+
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            # Background: subtle PRIMARY tint on hover/selected so it
+            # echoes the rest of the detail-card row affordances. Draw
+            # through an edge-aware path and a viewport clip because
+            # QListView's QSS border radius does not clip delegate painting.
+            bg: QColor | None = None
+            if selected:
+                bg = QColor(10, 132, 255, 96)
+            elif hovered:
+                bg = QColor(10, 132, 255, 28)
+            if bg is not None:
+                model = index.model()
+                row_count = (
+                    model.rowCount(index.parent())
+                    if model is not None
+                    else index.row() + 1
+                )
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(bg)
+                painter.save()
+                widget = getattr(option, "widget", None)
+                if widget is not None:
+                    painter.setClipPath(
+                        _time_travel_viewport_clip_path(widget.rect()),
+                        Qt.IntersectClip,
+                    )
+                painter.drawPath(
+                    _time_travel_row_background_path(rect, index.row(), row_count)
+                )
+                painter.restore()
+
+            if filtered_out:
+                painter.setOpacity(ROLE_FILTERED_OUT_ALPHA)
+
+            # Layout cursor (left → right).
+            x = rect.left() + self.LEFT_PAD
+            y_center = rect.center().y()
+
+            # Index gutter.
+            gutter_rect = QRect(x, rect.top(), self.GUTTER_WIDTH, rect.height())
+            painter.setPen(QColor(255, 255, 255, 130))
+            font = painter.font()
+            font.setPointSizeF(font.pointSizeF() - 0.5)
+            painter.setFont(font)
+            painter.drawText(
+                gutter_rect, Qt.AlignVCenter | Qt.AlignRight, f"#{(block_idx or 0) + 1}"
+            )
+            x += self.GUTTER_WIDTH + self.GAP
+
+            # Role dot.
+            dot_color = QColor(_ROLE_DOT_COLORS.get(row_role, ROLE_DOT_TOOL))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(dot_color)
+            dot_radius = 4.5
+            painter.drawEllipse(
+                QPointF(x + self.ROLE_DOT_WIDTH / 2.0, float(y_center)),
+                dot_radius,
+                dot_radius,
+            )
+            x += self.ROLE_DOT_WIDTH + self.GAP
+
+            # Preview text (elided to fit).
+            preview_right = rect.right() - self.RIGHT_PAD - self.TIMESTAMP_WIDTH - self.GAP
+            preview_rect = QRect(
+                x, rect.top(), max(0, preview_right - x), rect.height()
+            )
+            painter.setPen(QColor(230, 235, 240, 230))
+            font_preview = painter.font()
+            font_preview.setPointSizeF(font_preview.pointSizeF() + 0.5)
+            painter.setFont(font_preview)
+            metrics = QFontMetrics(painter.font())
+            elided = metrics.elidedText(
+                preview, Qt.ElideRight, max(0, preview_rect.width())
+            )
+            painter.drawText(preview_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
+
+            # Timestamp.
+            ts_rect = QRect(
+                rect.right() - self.RIGHT_PAD - self.TIMESTAMP_WIDTH,
+                rect.top(),
+                self.TIMESTAMP_WIDTH,
+                rect.height(),
+            )
+            painter.setPen(QColor(255, 255, 255, 140))
+            font_ts = painter.font()
+            font_ts.setPointSizeF(font_ts.pointSizeF() - 1.0)
+            painter.setFont(font_ts)
+            painter.drawText(ts_rect, Qt.AlignVCenter | Qt.AlignRight, timestamp)
+        finally:
+            painter.restore()
+
+
+class _TimeTravelVerticalView(QWidget):
+    """The Time Travel popup's content: kind-chip filter row + debounced
+    text search + virtualized ``QListView`` of every block in
+    ``_all_blocks``. Owns its model and proxy; the popup rebuilds the
+    model on every ``refresh()`` so it stays in sync with panel state.
+    """
+
+    blockClicked = Signal(int)
+
+    def __init__(
+        self,
+        translator: Callable[[str], str],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("TimeTravelVerticalView")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._translator = translator
+        # Active kind set drives the chip filter. The "tool" chip toggles
+        # both single tool_call AND coalesced tool_group blocks because
+        # that distinction is internal coalescing — to the user they're
+        # the same conceptual category.
+        self._active_kinds: set[str] = set(_TT_ALL_KINDS)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(8)
+
+        # Toolbar row: kind chips · search.
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(8)
+
+        # Kind chips. Three buttons (User / Assistant / Tool) using the
+        # same QSS hook as the detail panel's filter chips so they pick
+        # up identical styling once _DETAIL_PANEL_QSS is re-applied to
+        # the popup. Default: all checked → no rows filtered out by kind.
+        self._kind_chips: dict[str, QPushButton] = {}
+        chip_specs: list[tuple[str, str, QIcon]] = [
+            ("user", translator("User"), _user_icon()),
+            ("assistant", translator("Assistant"), _bot_icon()),
+            ("tool", translator("Tool"), _tool_call_icon()),
+        ]
+        for kind, label, icon in chip_specs:
+            chip = QPushButton(label)
+            chip.setObjectName("SessionsDetailFilterChip")
+            chip.setIcon(icon)
+            chip.setIconSize(QSize(14, 14))
+            chip.setCheckable(True)
+            chip.setChecked(True)
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.setProperty("kind", kind)
+            chip.toggled.connect(
+                lambda checked, k=kind: self._on_kind_chip_toggled(k, checked)
+            )
+            self._kind_chips[kind] = chip
+            bar.addWidget(chip)
+
+        # Vertical separator between chips and the search input — same
+        # 1px QFrame.VLine pattern the floating action bar uses to split
+        # selection-scoped vs global actions.
+        sep = QFrame(self)
+        sep.setObjectName("TimeTravelToolbarSeparator")
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Plain)
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("color: rgba(255, 255, 255, 30);")
+        bar.addWidget(sep)
+
+        self._search_input = QLineEdit()
+        self._search_input.setObjectName("TimeTravelVerticalSearch")
+        self._search_input.setPlaceholderText(translator("Filter messages..."))
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.setMinimumHeight(28)
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(180)
+        self._search_debounce.timeout.connect(self._on_search_committed)
+        self._search_input.textChanged.connect(lambda _t: self._search_debounce.start())
+        bar.addWidget(self._search_input, 1)
+
+        layout.addLayout(bar)
+
+        # Model + proxy + view.
+        self._model = _TimeTravelVerticalModel(self)
+        self._model.set_translator(translator)
+        self._proxy = _TimeTravelFilterProxy(self)
+        self._proxy.setSourceModel(self._model)
+        self._delegate = _TimeTravelRowDelegate(self)
+
+        self._list = QListView(self)
+        self._list.setObjectName("TimeTravelVerticalList")
+        self._list.setAttribute(Qt.WA_StyledBackground, True)
+        self._list.viewport().setAutoFillBackground(False)
+        self._list.viewport().setAttribute(Qt.WA_StyledBackground, True)
+        self._list.viewport().setStyleSheet("background: transparent;")
+        self._list.setModel(self._proxy)
+        self._list.setItemDelegate(self._delegate)
+        self._list.setUniformItemSizes(True)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._list.setMouseTracking(True)
+        self._list.viewport().setMouseTracking(True)
+        self._list.viewport().setAttribute(Qt.WA_Hover, True)
+        self._list.activated.connect(self._on_row_activated)
+        self._list.clicked.connect(self._on_row_activated)
+        layout.addWidget(self._list, 1)
+
+    # ----------------------------------------------------------- public API
+
+    def refresh(
+        self,
+        blocks: list[Any],
+        filtered_indices: list[int] | None,
+        current_block: int | None,
+    ) -> None:
+        self._model.refresh(blocks, filtered_indices)
+        if current_block is not None:
+            # Map the physical block index → proxy row → scroll it into view
+            # so the user opens the list right at "where they are".
+            source_index = self._model.index(current_block, 0)
+            proxy_index = self._proxy.mapFromSource(source_index)
+            if proxy_index.isValid():
+                self._list.setCurrentIndex(proxy_index)
+                self._list.scrollTo(proxy_index, QAbstractItemView.PositionAtCenter)
+
+    def focus_search(self) -> None:
+        self._search_input.setFocus()
+        self._search_input.selectAll()
+
+    # --------------------------------------------------------------- input
+
+    def _on_search_committed(self) -> None:
+        text = self._search_input.text().strip()
+        if not text:
+            self._proxy.set_filter_text("")
+            return
+        self._proxy.set_filter_text(text)
+
+    def _on_kind_chip_toggled(self, kind: str, checked: bool) -> None:
+        # The "Tool" chip controls both the single tool_call kind and
+        # the coalesced tool_group kind — coalescing is an internal
+        # rendering decision, not a user-facing taxonomy.
+        members = ("tool", "tool_group") if kind == "tool" else (kind,)
+        if checked:
+            self._active_kinds.update(members)
+        else:
+            self._active_kinds.difference_update(members)
+        self._proxy.set_active_kinds(self._active_kinds)
+
+    def _on_row_activated(self, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        source_index = self._proxy.mapToSource(index)
+        block_index = source_index.data(_TT_BLOCK_INDEX_ROLE)
+        if isinstance(block_index, int):
+            self.blockClicked.emit(block_index)
+
+
+_TT_ALL_KINDS: frozenset[str] = frozenset({"user", "assistant", "tool", "tool_group"})
+
+
+class _TimeTravelFilterProxy(QSortFilterProxyModel):
+    """Proxy that combines two independent filters:
+
+    * **Text needle** — matched against both the preview text and the
+      tool name field; neither alone covers the search intent (a user
+      looking for "Bash" wants tool calls, a user looking for
+      "compile error" wants prose).
+    * **Kind chips** — set of role kinds (``user``, ``assistant``,
+      ``tool``, ``tool_group``) the user has toggled on in the
+      vertical view's chip row. Both filters AND together: a row
+      survives only if it passes both.
+
+    Independent from the panel's filtered-out flag (which the model
+    surfaces via ``IsFilteredOutRole``); that one drives delegate
+    dimming, not row visibility.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._needle: str = ""
+        self._active_kinds: set[str] = set(_TT_ALL_KINDS)
+
+    def set_filter_text(self, text: str) -> None:
+        normalized = text.strip().lower()
+        if normalized == self._needle:
+            return
+        self._needle = normalized
+        # ``invalidate()`` is the non-deprecated entry point in PySide6
+        # 6.10 — both ``invalidateFilter`` and ``invalidateRowsFilter``
+        # carry deprecation warnings on this binding. There is no sort
+        # active so the broader invalidation has no extra cost.
+        self.invalidate()
+
+    def set_active_kinds(self, kinds: set[str]) -> None:
+        normalized = set(kinds)
+        if normalized == self._active_kinds:
+            return
+        self._active_kinds = normalized
+        self.invalidate()
+
+    def filterAcceptsRow(  # noqa: N802 - Qt naming
+        self, source_row: int, source_parent: QModelIndex
+    ) -> bool:
+        model = self.sourceModel()
+        if model is None:
+            return True
+        idx = model.index(source_row, 0, source_parent)
+        # Kind filter (cheaper, evaluate first).
+        row_kind = idx.data(_TT_ROLE_ROLE) or "tool"
+        if row_kind not in self._active_kinds:
+            return False
+        # Text filter — only when a needle is set; default state lets
+        # everything through after the kind check.
+        if not self._needle:
+            return True
+        preview = (idx.data(_TT_PREVIEW_ROLE) or "").lower()
+        if self._needle in preview:
+            return True
+        tool_name = (idx.data(_TT_TOOL_NAME_ROLE) or "").lower()
+        return self._needle in tool_name
+
+
+class _TimeTravelPopup(_FrostedSurface):
+    """Frosted Qt.Tool popup hosting the Time Travel vertical view —
+    a virtualized list of every block in the session, with role-chip
+    filters and debounced text search. Reuses ``_FrostedSurface``'s
+    ESC + click-outside dismissal and DWM acrylic chrome; the host
+    (``_SessionDetailPanel``) owns the geometry computation + show/hide
+    lifecycle.
+
+    Design choices:
+      * ``ACCEPT_FOCUS=True`` — needed for the search input and
+        arrow-key navigation through the list.
+      * Painted radius 14 to match ``_SessionsSearchPopup`` — the popup
+        is tall enough that the painted curve hides the DWM ring
+        artifact (vs. the floating action bar's flatter 8px).
+    """
+
+    RADIUS = 14.0
+    BORDER_RADIUS = 13.5
+    INNER_RADIUS = 12.5
+    ACCEPT_FOCUS = True
+    DISMISS_ON_ESCAPE = True
+    DISMISS_ON_DEACTIVATE = True
+
+    blockJumpRequested = Signal(int)
+    """Emitted with a physical block index when the user picks a row in
+    the vertical view. The host wires this to ``_recenter_async`` and
+    keeps the popup open."""
+
+    # Height bounds — the popup picks ``min(MAX, max(MIN, host * 0.7))``
+    # so it stays usable on small windows but doesn't dominate large
+    # ones. Width is owned by the host (page-spanning).
+    _MIN_HEIGHT = 320
+    _MAX_HEIGHT = 540
+
+    def __init__(
+        self,
+        translator: Callable[[str], str],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent, as_window=True)
+        self.setObjectName("TimeTravelPopup")
+        self._translator = translator
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._vertical = _TimeTravelVerticalView(translator, self)
+        self._vertical.blockClicked.connect(self.blockJumpRequested.emit)
+        outer.addWidget(self._vertical, 1)
+
+        # Focus the search input on the next tick so the user can type
+        # immediately after the popup appears. ``QTimer.singleShot(0,
+        # ...)`` defers until after the show event so focus actually
+        # sticks (immediate ``setFocus`` before the popup is mapped is a
+        # no-op on Windows).
+        QTimer.singleShot(0, self._vertical.focus_search)
+
+    # ----------------------------------------------------------- public API
+
+    def set_data(
+        self,
+        blocks: list[Any],
+        filtered_indices: list[int] | None,
+        window_start: int,
+        window_end: int,
+        current_block: int | None,
+    ) -> None:
+        del window_start, window_end  # accepted for API stability with the host
+        self._vertical.refresh(blocks, filtered_indices, current_block)
+
+    def preferred_height(self, host_height: int) -> int:
+        """Recommended popup height for a given host SessionsPage height.
+        Targets ~70% of the host so the user sees plenty of context but
+        the popup never crowds out the underlying timeline."""
+        return max(self._MIN_HEIGHT, min(self._MAX_HEIGHT, int(host_height * 0.7)))
 
 
 class _SessionsTreeModel(QStandardItemModel):
@@ -961,7 +1709,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             painter.restore()
 
     def _paint_group(self, painter: QPainter, option, index, kind: str) -> None:
-        hover = bool(option.state & QStyle.State_MouseOver)
+        hover = _index_under_cursor(self._view, index)
         # Distinguish "what Qt actually shows right now" from "what the
         # user just clicked toward but the actual setExpanded hasn't
         # run yet". The card chrome (has_bottom) keys off the actual
@@ -1026,14 +1774,21 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
                 self._CARD_HINSET, 0.0,
                 -right_inset, 0.0,
             )
-            # Hover overlay for compaction rows.
+            # Hover overlay for compaction rows is a full-width stripe
+            # over this row segment: no border, no top rounding, and
+            # bottom rounding only when this row closes the parent card.
+            # Keep a tiny top gap so the previous selected record's
+            # anti-aliased bottom edge does not visually merge into it.
             if hover:
-                inner = content_rect.adjusted(
-                    8.0, 4.0, -8.0, -4.0 if is_last else 0.0
+                stripe_rect = card_rect.adjusted(0.0, 4.0, 0.0, 0.0)
+                self._paint_card_segment(
+                    painter,
+                    stripe_rect,
+                    self._CARD_FILL_HOVER,
+                    QColor(0, 0, 0, 0),
+                    has_top=False,
+                    has_bottom=is_last,
                 )
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(self._CARD_FILL_HOVER)
-                painter.drawRoundedRect(inner, 8, 8)
 
         # ---- inner content (chevron + folder + title + count pill) ----
         # "Highlighted" content style now follows the active rule for
@@ -1057,6 +1812,9 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         if kind == "compaction":
             text_color = QColor(145, 152, 165)
             accent = QColor(130, 138, 150)
+            if hover:
+                text_color = QColor(190, 202, 218)
+                accent = QColor(165, 178, 195)
 
         self._draw_chevron(painter, left + 9, center_y, chevron_expanded, accent)
         self._draw_folder(painter, left + 31, center_y - 14, accent, highlighted)
@@ -1099,7 +1857,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             and active_session_id
             and index.data(_RECORD_ID_ROLE) == active_session_id
         )
-        hover = bool(option.state & QStyle.State_MouseOver)
+        hover = _index_under_cursor(self._view, index)
         compact = bool(index.data(_RECORD_COMPACT_ROLE))
         parent_active = self._parent_card_active(index)
         is_last = self._is_last_in_card(index)
@@ -1948,6 +2706,9 @@ class SessionsPage(QWidget):
         # for a card-based tree.
         self._tree.setAnimated(False)
         self._tree.setHeaderHidden(True)
+        self._tree.setMouseTracking(True)
+        self._tree.viewport().setMouseTracking(True)
+        self._tree.viewport().setAttribute(Qt.WA_Hover, True)
         # Per-pixel scrolling so the scroll-past-end bump used by the floating
         # action bar is measured in pixels, not rows. With the default
         # ``ScrollPerItem`` mode, a +24 bump on ``scrollbar.maximum()`` would
@@ -2625,6 +3386,13 @@ class SessionsPage(QWidget):
         ):
             self._reposition_list_overlay()
             self._reposition_floating_actions()
+        if (
+            tree is not None
+            and obj is tree.viewport()
+            and event.type()
+            in (QEvent.MouseMove, QEvent.HoverMove, QEvent.Leave, QEvent.Wheel)
+        ):
+            tree.viewport().update()
         # Drive the deferred floating-bar show off the tree viewport's
         # first paintEvent after a page show — see ``showEvent`` for
         # the rationale.
@@ -3145,9 +3913,14 @@ class _SessionDetailPanel(QFrame):
         # All filter mutations route through _apply_filters which rebuilds
         # the timeline window in place.
         self._chip_buttons: dict[str, QPushButton] = {}
+        self._quick_filter_buttons: dict[str, QPushButton] = {}
         self._active_chip_kinds: set[str] = set(self._ALL_CHIP_KINDS)
         self._search_target: str = "content"  # "content" | "tool_id"
         self._search_query: str = ""
+        # Time Travel popup: lazy-created on first clock-button click. Held
+        # as Optional so the panel can dispose it on session-switch without
+        # leaking a stale top-level window into the next session.
+        self._time_travel_popup: _TimeTravelPopup | None = None
         self._filter_popup = _SessionsFilterPopup(self)
         # The popup is a top-level window so it does NOT inherit the
         # detail card's QSS via the widget tree. Re-apply the same
@@ -3255,17 +4028,17 @@ class _SessionDetailPanel(QFrame):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
-        # Clock button — placeholder for Time-travel. Identifiable, not yet
-        # wired to a destination; tooltip telegraphs the future intent so
-        # accidentally clicking doesn't feel like a missing feature, just
-        # a not-yet-built one.
+        # Clock button — opens the Time Travel popup, a frosted overlay that
+        # spans the page width and provides global navigation across the
+        # entire session (vs. the in-window rail navigator on the right).
         self._time_travel_button = QPushButton()
         self._time_travel_button.setObjectName("SessionsDetailToolbarButton")
         self._time_travel_button.setIcon(_clock_icon())
         self._time_travel_button.setIconSize(QSize(18, 18))
         self._time_travel_button.setFixedSize(32, 32)
         self._time_travel_button.setCursor(Qt.PointingHandCursor)
-        self._time_travel_button.setToolTip(self._translator("Time travel (coming soon)"))
+        self._time_travel_button.setToolTip(self._translator("Time travel"))
+        self._time_travel_button.clicked.connect(self._on_time_travel_clicked)
         row.addWidget(self._time_travel_button)
 
         # Search-target toggle: 内容 vs 工具ID. Two checkable buttons in a
@@ -3381,6 +4154,31 @@ class _SessionDetailPanel(QFrame):
         count_row.addWidget(self._count_icon_label, 0, Qt.AlignVCenter)
         count_row.addWidget(self._count_label, 0, Qt.AlignVCenter)
         count_row.addStretch(1)
+        quick_specs = (
+            ("user", self._translator("Only User"), self._translator("User"), _user_icon()),
+            (
+                "assistant",
+                self._translator("Only Assistant"),
+                self._translator("Assistant"),
+                _bot_icon(),
+            ),
+        )
+        for kind, label, role_label, icon in quick_specs:
+            quick = QPushButton(label)
+            quick.setObjectName("SessionsDetailQuickFilterButton")
+            quick.setIcon(icon)
+            quick.setIconSize(QSize(13, 13))
+            quick.setMinimumHeight(22)
+            quick.setCursor(Qt.PointingHandCursor)
+            quick.setProperty("active", False)
+            quick.setToolTip(
+                self._translator("Show only {kind} bubbles").format(kind=role_label)
+            )
+            quick.clicked.connect(
+                lambda _checked=False, k=kind: self._set_only_filter_kind(k)
+            )
+            self._quick_filter_buttons[kind] = quick
+            count_row.addWidget(quick, 0, Qt.AlignVCenter)
         self._reset_button = QPushButton()
         self._reset_button.setObjectName("SessionsDetailResetButton")
         self._reset_button.setIcon(_reset_icon())
@@ -3432,6 +4230,15 @@ class _SessionDetailPanel(QFrame):
             self._active_chip_kinds.add(kind)
         else:
             self._active_chip_kinds.discard(kind)
+        self._apply_filters()
+
+    def _set_only_filter_kind(self, kind: str) -> None:
+        if kind not in self._ALL_CHIP_KINDS:
+            return
+        for chip_kind, chip in self._chip_buttons.items():
+            with QSignalBlocker(chip):
+                chip.setChecked(chip_kind == kind)
+        self._active_chip_kinds = {kind}
         self._apply_filters()
 
     def _on_search_target_changed(self, target: str) -> None:
@@ -3495,6 +4302,13 @@ class _SessionDetailPanel(QFrame):
             self._filter_button.style().unpolish(self._filter_button)
             self._filter_button.style().polish(self._filter_button)
             self._filter_button.update()
+        for kind, button in self._quick_filter_buttons.items():
+            quick_active = self._active_chip_kinds == {kind}
+            if button.property("active") != quick_active:
+                button.setProperty("active", quick_active)
+                button.style().unpolish(button)
+                button.style().polish(button)
+                button.update()
         base_tip = self._translator("Filter bubbles")
         count_text = self._count_label.text()
         if active and count_text:
@@ -3564,6 +4378,117 @@ class _SessionDetailPanel(QFrame):
     def _dismiss_filter_popup(self) -> None:
         if self._filter_popup.isVisible():
             self._filter_popup.hide()
+
+    # ---- Time Travel popup lifecycle ------------------------------------
+
+    def _on_time_travel_clicked(self) -> None:
+        """Toggle the Time Travel popup. Lazy-creates the instance so the
+        cost (frosted surface, model, list view) is only paid the first
+        time a user opens it for this panel."""
+        if self._time_travel_popup is not None and self._time_travel_popup.isVisible():
+            self._dismiss_time_travel_popup()
+            return
+        if self._time_travel_popup is None:
+            host_window = self.window() or self
+            self._time_travel_popup = _TimeTravelPopup(self._translator, host_window)
+            # Re-apply the detail-card QSS so QLineEdit, QPushButton and
+            # other inner widgets pick up the same theming as the rest of
+            # the panel — top-level windows don't inherit QSS via the
+            # widget tree (mirrors _filter_popup at line 3158-ish).
+            self._time_travel_popup.setStyleSheet(_DETAIL_PANEL_QSS)
+            self._time_travel_popup.dismiss_requested.connect(
+                self._dismiss_time_travel_popup
+            )
+            self._time_travel_popup.blockJumpRequested.connect(
+                self._on_time_travel_jump
+            )
+        self._push_time_travel_data()
+        self._position_time_travel_popup()
+        self._time_travel_popup.show()
+        self._time_travel_popup.raise_()
+        self._time_travel_popup.install_dwm_chrome()
+        self._time_travel_popup.activateWindow()
+
+    def _on_time_travel_jump(self, block_index: int) -> None:
+        """Jump the main timeline to ``block_index`` — uses ``_recenter_async``
+        so the heavy widget rebuild defers to the next tick (the spinner
+        overlay covers the swap). Popup stays open by design — user keeps
+        rapid-browsing until they ESC or click outside."""
+        if not (0 <= block_index < len(self._all_blocks)):
+            return
+        self._recenter_async(
+            block_index,
+            on_anchor=lambda b=block_index: self._scroll_to_block_center(b),
+        )
+        # The async rebuild's overlay spinner can briefly steal focus from
+        # the popup, which would trigger DISMISS_ON_DEACTIVATE — re-arm
+        # the popup as the active window so it stays put.
+        if self._time_travel_popup is not None and self._time_travel_popup.isVisible():
+            QTimer.singleShot(0, self._time_travel_popup.activateWindow)
+
+    def _push_time_travel_data(self) -> None:
+        """Snapshot the current panel state into the popup. Invoked on
+        open and after every ``_refresh_minimap_impl`` so the rendered
+        window indicator stays in sync."""
+        if self._time_travel_popup is None:
+            return
+        self._time_travel_popup.set_data(
+            self._all_blocks,
+            self._filtered_block_indices,
+            self._window_start,
+            self._window_end,
+            self._current_user_block,
+        )
+
+    def _position_time_travel_popup(self) -> None:
+        """Compute the popup geometry. Anchors above the clock button and
+        spans the SessionsPage horizontally with a 12px margin per side.
+        Falls back to detail-panel width when the SessionsPage is
+        narrower than the popup minimum so we don't render a 50px popup
+        on heavily-resized windows.
+        """
+        if self._time_travel_popup is None:
+            return
+        popup = self._time_travel_popup
+        host_page = self._find_sessions_page() or self
+        target_h = popup.preferred_height(host_page.height())
+        margin = 12
+        host_top_global = host_page.mapToGlobal(QPoint(0, 0))
+        target_w = max(320, host_page.width() - margin * 2)
+        # Y: just above the clock button, with an 8px gap.
+        button_top_global = self._time_travel_button.mapToGlobal(
+            QPoint(0, -target_h - 8)
+        )
+        target_y = button_top_global.y()
+        # Clamp to page top so the popup never drifts off the top edge of
+        # the host window — if there isn't enough space above the button,
+        # pin to the page top (rare on normal layouts).
+        target_y = max(host_top_global.y() + margin, target_y)
+        target_x = host_top_global.x() + margin
+        popup.setFixedSize(target_w, target_h)
+        popup.move(target_x, target_y)
+
+    def _find_sessions_page(self) -> QWidget | None:
+        """Walk up the parent chain to find the SessionsPage host.
+        Used by ``_position_time_travel_popup`` to get a page-wide
+        anchor — the detail panel alone is too narrow for the popup."""
+        widget: QWidget | None = self.parentWidget()
+        while widget is not None:
+            if isinstance(widget, SessionsPage):
+                return widget
+            widget = widget.parentWidget()
+        return None
+
+    def _dismiss_time_travel_popup(self) -> None:
+        """Hide and dispose the popup. The next click rebuilds it — cheaper
+        than keeping a hidden Qt.Tool window around when the user has
+        switched contexts (different session, app minimised, etc.)."""
+        if self._time_travel_popup is None:
+            return
+        popup = self._time_travel_popup
+        self._time_travel_popup = None
+        popup.hide()
+        popup.deleteLater()
 
     # ---- filter predicate + count update --------------------------------
 
@@ -3743,8 +4668,14 @@ class _SessionDetailPanel(QFrame):
         # The jump buttons are top-level windows in *global* screen
         # coordinates, so they don't follow the host window automatically —
         # we have to reposition them whenever the host moves or resizes.
+        # Same applies to the Time Travel popup if it's open.
         if obj is self.window() and et in (QEvent.Move, QEvent.Resize):
             self._reposition_scroll_jump_buttons()
+            if (
+                self._time_travel_popup is not None
+                and self._time_travel_popup.isVisible()
+            ):
+                self._position_time_travel_popup()
         return super().eventFilter(obj, event)
 
     # -- showEvent/hideEvent: top-level jump buttons need explicit lifecycle.
@@ -3901,6 +4832,11 @@ class _SessionDetailPanel(QFrame):
         # Cancel any in-flight older-page request — its result would
         # belong to the previous session anyway.
         self._loading_older = False
+        # Dispose the Time Travel popup if it's open — its block list /
+        # window indices belong to the *previous* session and re-pushing
+        # against the new (briefly empty) state can show stale data
+        # before the new session lands.
+        self._dismiss_time_travel_popup()
         self._clear_timeline()
         if detail is None:
             self._all_blocks = []
@@ -3959,6 +4895,9 @@ class _SessionDetailPanel(QFrame):
         set_detail again on the next show."""
         self._render_token += 1
         self._loading_older = False
+        # Same reason as set_detail: don't leak the popup pointing at the
+        # previous session's blocks across a panel reset.
+        self._dismiss_time_travel_popup()
         self._all_blocks = []
         self._all_timeline_items = []
         self._user_anchor_blocks = []
@@ -4668,6 +5607,11 @@ class _SessionDetailPanel(QFrame):
             viewport_height=self._timeline_scroll.viewport().height(),
             scroll_maximum=scrollbar.maximum(),
         )
+        # Time Travel popup mirrors panel state — only push when it's
+        # actually visible to avoid touching a hidden top-level window
+        # on every scroll throttle.
+        if self._time_travel_popup is not None and self._time_travel_popup.isVisible():
+            self._push_time_travel_data()
 
     def _minimap_kind_for_block(self, block_index: int) -> str:
         kind, payload = self._all_blocks[block_index]
@@ -6520,8 +7464,8 @@ QLabel#SessionsRecordCount {{
     padding: 4px 0 2px 0;
 }}
 QLineEdit#SessionsListSearch {{
-    background: rgba(0, 0, 0, 92);
-    border: 1px solid rgba(255, 255, 255, 24);
+    background: rgba(255, 255, 255, 14);
+    border: 1px solid rgba(255, 255, 255, 30);
     border-radius: 8px;
     color: rgba(245, 248, 252, 230);
     padding: 8px 12px;
@@ -6533,7 +7477,7 @@ QLineEdit#SessionsListSearch:hover {{
 }}
 QLineEdit#SessionsListSearch:focus {{
     border-color: {PRIMARY_BAND};
-    background: rgba(0, 0, 0, 130);
+    background: rgba(0, 0, 0, 60);
 }}
 QFrame#SessionsSearchPopup {{
     background: {SURFACE_FROSTED};
@@ -6547,14 +7491,14 @@ QFrame#SessionsSearchPopup {{
    scoping). Geometry mirrors ``SessionsSearchButton`` so the two
    toolbar chips render as one family. */
 QPushButton#SessionsListFilterButton {{
-    background: rgba(255, 255, 255, 18);
-    border: 1px solid rgba(255, 255, 255, 30);
+    background: rgba(255, 255, 255, 22);
+    border: 1px solid rgba(255, 255, 255, 36);
     border-radius: 8px;
     padding: 0;
 }}
 QPushButton#SessionsListFilterButton:hover {{
-    background: rgba(255, 255, 255, 32);
-    border-color: rgba(255, 255, 255, 60);
+    background: rgba(255, 255, 255, 36);
+    border-color: rgba(255, 255, 255, 65);
 }}
 QPushButton#SessionsListFilterButton:pressed {{
     background: {PRIMARY_SOFT};
@@ -6596,14 +7540,14 @@ QPushButton#SessionsListFilterRow[active="true"] {{
    to the same tinted active state used by every other selected
    surface in the panel (PRIMARY_GHOST + PRIMARY_BAND). */
 QToolButton#SessionsSearchButton {{
-    background: rgba(255, 255, 255, 18);
-    border: 1px solid rgba(255, 255, 255, 30);
+    background: rgba(255, 255, 255, 22);
+    border: 1px solid rgba(255, 255, 255, 36);
     border-radius: 8px;
     padding: 0;
 }}
 QToolButton#SessionsSearchButton:hover {{
-    background: rgba(255, 255, 255, 32);
-    border-color: rgba(255, 255, 255, 60);
+    background: rgba(255, 255, 255, 36);
+    border-color: rgba(255, 255, 255, 65);
 }}
 QToolButton#SessionsSearchButton:pressed {{
     background: {PRIMARY_SOFT};
@@ -6898,8 +7842,8 @@ QPushButton#SessionsDetailToolbarSegment:checked {{
 }}
 
 QLineEdit#SessionsDetailSearchInput {{
-    background: rgba(255, 255, 255, 14);
-    border: 1px solid rgba(255, 255, 255, 28);
+    background: rgba(255, 255, 255, 20);
+    border: 1px solid rgba(255, 255, 255, 36);
     border-radius: 8px;
     color: #ffffff;
     padding: 4px 10px;
@@ -6921,9 +7865,10 @@ QLabel#SessionsDetailCountChip {{
     background: rgba(255, 255, 255, 16);
 }}
 
-/* Filter chips (用户/助手/文本/工具调用/命令). Checkable, with a clear
-   on/off visual: dim outline when off, blue accent when on. The set
-   defaults to all-on so nothing is hidden out of the box. */
+/* Filter chips (用户/助手/文本/工具调用/命令). These sit inside a dense
+   frosted popover, so use the deeper-but-not-solid PRIMARY_TINT fill
+   with PRIMARY_BAND border instead of the brighter PRIMARY_SOFT button
+   treatment. The set defaults to all-on so nothing is hidden out of the box. */
 QPushButton#SessionsDetailFilterChip {{
     background: rgba(255, 255, 255, 12);
     border: 1px solid rgba(255, 255, 255, 28);
@@ -6938,12 +7883,39 @@ QPushButton#SessionsDetailFilterChip:hover {{
     border-color: rgba(255, 255, 255, 50);
 }}
 QPushButton#SessionsDetailFilterChip:checked {{
-    background: {PRIMARY_SOFT};
+    background: {PRIMARY_GHOST};
     border-color: {PRIMARY_BAND};
     color: #ffffff;
 }}
 QPushButton#SessionsDetailFilterChip:checked:hover {{
-    background: {PRIMARY_BAND};
+    background: {PRIMARY_TINT};
+    border-color: {PRIMARY_BAND};
+}}
+
+/* Quick filters (Only User / Only Assistant). They are commands, not
+   category toggles, so they sit in the count row as compact chips and
+   mirror the selected-state treatment when their one-role filter is active. */
+QPushButton#SessionsDetailQuickFilterButton {{
+    background: rgba(255, 255, 255, 12);
+    border: 1px solid rgba(255, 255, 255, 28);
+    border-radius: 8px;
+    color: rgba(220, 226, 236, 190);
+    padding: 2px 8px;
+    font-size: 11px;
+}}
+QPushButton#SessionsDetailQuickFilterButton:hover {{
+    background: rgba(255, 255, 255, 22);
+    border-color: rgba(255, 255, 255, 50);
+}}
+QPushButton#SessionsDetailQuickFilterButton:pressed {{
+    background: {PRIMARY_GHOST};
+    border-color: {PRIMARY_BAND};
+    color: #ffffff;
+}}
+QPushButton#SessionsDetailQuickFilterButton[active="true"] {{
+    background: {PRIMARY_GHOST};
+    border-color: {PRIMARY_BAND};
+    color: #ffffff;
 }}
 
 /* Reset filters button — base-less icon button anchored next to the
@@ -6970,16 +7942,16 @@ QPushButton#SessionsDetailResetButton:pressed {{
    toolbar; ``hasActiveFilter=true`` shifts it to a tinted state so the
    user can see filter status with the popover closed. */
 QPushButton#SessionsDetailFilterButton {{
-    background: rgba(255, 255, 255, 18);
-    border: 1px solid rgba(255, 255, 255, 30);
+    background: rgba(255, 255, 255, 22);
+    border: 1px solid rgba(255, 255, 255, 38);
     border-radius: 8px;
     color: rgba(235, 235, 245, 220);
     padding: 4px 10px;
     font-size: 12px;
 }}
 QPushButton#SessionsDetailFilterButton:hover {{
-    background: rgba(255, 255, 255, 32);
-    border-color: rgba(255, 255, 255, 60);
+    background: rgba(255, 255, 255, 36);
+    border-color: rgba(255, 255, 255, 65);
 }}
 QPushButton#SessionsDetailFilterButton:pressed {{
     background: {PRIMARY_SOFT};
@@ -7000,6 +7972,35 @@ QFrame#SessionsFilterPopup {{
     background: {SURFACE_FROSTED};
     border: 1px solid {SURFACE_FROSTED_BORDER};
     border-radius: 12px;
+}}
+QFrame#TimeTravelPopup {{
+    background: transparent;
+    border: 0;
+}}
+QWidget#TimeTravelVerticalView {{
+    background: transparent;
+    color: #ffffff;
+}}
+QListView#TimeTravelVerticalList {{
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 28);
+    border-radius: 8px;
+    color: #ffffff;
+    selection-background-color: transparent;
+    selection-color: #ffffff;
+    alternate-background-color: transparent;
+    outline: 0;
+}}
+QListView#TimeTravelVerticalList::item {{
+    background: transparent;
+    color: #ffffff;
+    border: 0;
+    padding: 0;
+}}
+QListView#TimeTravelVerticalList::item:selected,
+QListView#TimeTravelVerticalList::item:hover {{
+    background: transparent;
+    color: #ffffff;
 }}
 QScrollArea#SessionsDetailTimelineScroll {{
     background: transparent;

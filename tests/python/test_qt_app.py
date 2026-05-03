@@ -13,10 +13,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src" / "CodexQuotaViewerWindows.Qt"))
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt  # noqa: E402
-from PySide6.QtGui import QMouseEvent  # noqa: E402
+from PySide6.QtGui import QMouseEvent, QPalette  # noqa: E402
 from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget  # noqa: E402
 
-from codex_quota_viewer.qt_app import ConfirmPhraseDialog, MainWindow, StatusBanner, StatusDetailsPopup, StatusPopupFrame  # noqa: E402
+from codex_quota_viewer.qt_app import ConfirmPhraseDialog, MainWindow, StatusBanner, StatusDetailsPopup, StatusPopupFrame, _apply_dark_palette  # noqa: E402
 from codex_quota_viewer.models import AccountMetadata, AccountRecord, AuthMode, CodexHomeTarget, UiLanguage, now_utc  # noqa: E402
 from codex_quota_viewer.task_worker import emit, serialize  # noqa: E402
 
@@ -30,6 +30,19 @@ def test_button_wrapper_ignores_qt_checked_argument() -> None:
     button.click()
 
     assert calls == ["clicked"]
+
+
+def test_dark_palette_pins_native_view_colors() -> None:
+    app = QApplication.instance() or QApplication([])
+
+    _apply_dark_palette(app)
+
+    palette = app.palette()
+    assert palette.color(QPalette.Base).lightness() < 80
+    assert palette.color(QPalette.Window).lightness() < 80
+    assert palette.color(QPalette.Text).lightness() > 200
+    assert palette.color(QPalette.WindowText).lightness() > 200
+    assert palette.color(QPalette.HighlightedText).lightness() > 200
 
 
 def test_confirm_phrase_requires_full_real_switch_phrase() -> None:
