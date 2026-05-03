@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import (
@@ -11,6 +13,7 @@ from PySide6.QtCore import (
     QItemSelectionModel,
     QModelIndex,
     QPoint,
+    QPointF,
     QRectF,
     QSize,
     QSignalBlocker,
@@ -76,8 +79,8 @@ from .design_tokens import (
     SURFACE_FROSTED_BORDER,
     SURFACE_PANEL,
     SURFACE_PANEL_BORDER,
-    WARM_GHOST,
-    WARM_TINT,
+    TOOL_GHOST,
+    TOOL_TINT,
 )
 from .models import CodexHomeTarget
 from .sessions import (
@@ -88,6 +91,7 @@ from .sessions import (
     SessionTimelineItem,
     SessionsManager,
 )
+from .sessions._perf import _perf_log, _perf_timer
 
 
 _SESSION_STATUS_LABELS: dict[str, str] = {
@@ -116,10 +120,15 @@ _RECORD_EVENT_COUNT_ROLE = Qt.UserRole + 6
 _RECORD_TOOL_COUNT_ROLE = Qt.UserRole + 7
 _RECORD_COMPACT_ROLE = Qt.UserRole + 8
 _GROUP_COUNT_ROLE = Qt.UserRole + 9
+# Pending expansion direction set by ``_queue_expansion_toggle`` so the
+# chevron flips visually the instant the click is accepted, before the
+# (potentially heavy) ``setExpanded`` paint pass runs on the next tick.
+# ``True``/``False`` = will be expanded/collapsed; absent = no pending.
+_PENDING_EXPANSION_ROLE = Qt.UserRole + 10
 
 # Status filter options for the list panel popover. Order matters: the
-# popup row buttons render in this order, and ``_sync_status_filter_button_label``
-# resolves the trigger label by lookup. ``None`` is the unfiltered case.
+# popup row buttons render in this order, and ``_sync_status_filter_button_state``
+# resolves the trigger tooltip by lookup. ``None`` is the unfiltered case.
 _STATUS_FILTER_OPTIONS: tuple[tuple[str | None, str], ...] = (
     (None, "All statuses"),
     ("active", "Active"),
@@ -159,6 +168,8 @@ class SessionsViewState:
     status_filter: str | None
     search_text: str
     selected_session_id: str | None
+
+
 
 
 # --- Native Windows acrylic blur for top-level frameless popups -------------
@@ -557,13 +568,14 @@ class _SessionsTreeModel(QStandardItemModel):
         self._records_by_id: dict[str, SessionRecord] = {}
 
     def set_records(self, records: list[SessionRecord]) -> None:
-        self.beginResetModel()
-        self._records_by_id = {record.id: record for record in records}
-        self.removeRows(0, self.rowCount())
-        groups = _build_workfolder_groups(records)
-        for group in groups:
-            self._append_group(group)
-        self.endResetModel()
+        with _perf_timer("ui.sessions_tree.set_records", count=len(records)):
+            self.beginResetModel()
+            self._records_by_id = {record.id: record for record in records}
+            self.removeRows(0, self.rowCount())
+            groups = _build_workfolder_groups(records)
+            for group in groups:
+                self._append_group(group)
+            self.endResetModel()
 
     def record_for_index(self, index: QModelIndex) -> SessionRecord | None:
         if not index.isValid():
@@ -725,27 +737,341 @@ class _SessionsTreeModel(QStandardItemModel):
 
 
 class _SessionsTreeDelegate(QStyledItemDelegate):
-    """Custom single-column painting for the Sessions workfolder navigator."""
+    """Custom single-column painting for the Sessions workfolder navigator.
+
+    Each top-level workfolder group renders as a bordered "card" mirroring
+    the Accounts page's current-account card visual:
+
+      * collapsed groups → standalone card with all four corners rounded
+      * expanded groups → header card with rounded top corners only;
+        their visible children paint as the body of the SAME card
+        (continuing side borders, with rounded bottom corners on the
+        last visible descendant)
+      * the workfolder whose subtree contains the focused session takes
+        the PRIMARY_GHOST + PRIMARY_BAND treatment; others get a neutral
+        SURFACE_PANEL card so only one card is "active" at a time
+        (matches Accounts: only the current account is blue)
+    """
 
     _GROUP_HEIGHT = 56
     _COMPACTION_HEIGHT = 46
     _RECORD_HEIGHT = 84
     _COMPACT_RECORD_HEIGHT = 66
 
+    # Card chrome — values track design_tokens.py. Inlined as QColor here
+    # rather than parsed from token strings on every paint to keep the
+    # hot path allocation-free.
+    _CARD_FILL_ACTIVE = QColor(10, 132, 255, 32)     # PRIMARY_GHOST
+    _CARD_BORDER_ACTIVE = QColor(10, 132, 255, 130)  # PRIMARY_BAND
+    _CARD_FILL_HOVER = QColor(255, 255, 255, 18)
+    _CARD_BORDER_HOVER = QColor(255, 255, 255, 48)
+    _CARD_FILL_IDLE = QColor(255, 255, 255, 12)      # SURFACE_PANEL
+    _CARD_BORDER_IDLE = QColor(255, 255, 255, 28)    # SURFACE_PANEL_BORDER
+    _CARD_RADIUS = 12.0
+    # Top + bottom inset of the painted card within ``option.rect`` —
+    # creates a vertical gap between consecutive top-level cards.
+    _CARD_VGAP = 4.0
+    # Horizontal inset so the painted border isn't clipped at viewport edges.
+    _CARD_HINSET = 2.0
+
     def __init__(self, view: QTreeView):
         super().__init__(view)
         self._view = view
+        # Reserved blank strip at the top of the first top-level row,
+        # used by SessionsPage to host the "N session(s)" overlay
+        # label that scrolls with the tree's content. Zero by default
+        # — set via ``set_first_row_top_reserve``.
+        self._first_row_top_reserve = 0
+
+        # ---- paint-time caches ------------------------------------------
+        # These eliminate the per-row tree walks that previously made
+        # every expand/collapse feel sluggish on long lists. Each cache
+        # is invalidated on the *minimal* set of signals that can change
+        # its answer — see _invalidate_* hooks below.
+        #
+        # _last_path_cache: top-level row -> tuple encoding the row chain
+        # (top_row, child_row, ...) to that card's rightmost visible
+        # descendant. Used by _is_last_in_card so a row only checks
+        # equality against a precomputed tuple instead of re-walking the
+        # DFS path on every paint.
+        self._last_path_cache: dict[int, tuple[int, ...]] = {}
+        # _active_top_row: row of the top-level workfolder that owns the
+        # focused selection (active card), or None. Recomputed only when
+        # selection changes, so paint-time becomes a single int compare.
+        self._active_top_row: int | None = None
+        self._active_top_row_dirty = True
+        # _svg_cache: (color_hex, path_data) -> QSvgRenderer. Building a
+        # renderer parses XML; without this cache, every record row
+        # re-parses the same tiny SVG on every repaint of the viewport.
+        self._svg_cache: dict[tuple[str, str], QSvgRenderer] = {}
+
+        # ---- cache invalidation hooks -----------------------------------
+        view.expanded.connect(self._on_view_expansion_changed)
+        view.collapsed.connect(self._on_view_expansion_changed)
+        model = view.model()
+        if model is not None:
+            model.modelReset.connect(self._invalidate_all_caches)
+            model.layoutChanged.connect(self._invalidate_all_caches)
+            model.rowsInserted.connect(self._invalidate_path_cache)
+            model.rowsRemoved.connect(self._invalidate_path_cache)
+        sel_model = view.selectionModel()
+        if sel_model is not None:
+            sel_model.currentChanged.connect(self._invalidate_active_cache)
+            sel_model.selectionChanged.connect(self._invalidate_active_cache)
+
+    # ---- cache helpers --------------------------------------------------
+
+    def _on_view_expansion_changed(self, _index) -> None:
+        # Expand/collapse only affects which row caps each card, not which
+        # workfolder is active.
+        self._last_path_cache.clear()
+
+    def _invalidate_path_cache(self, *_args) -> None:
+        self._last_path_cache.clear()
+
+    def _invalidate_active_cache(self, *_args) -> None:
+        self._active_top_row_dirty = True
+
+    def _invalidate_all_caches(self, *_args) -> None:
+        self._last_path_cache.clear()
+        self._active_top_row_dirty = True
+
+    def _last_path_for_top(self, top_row: int) -> tuple[int, ...]:
+        """Encoded row chain to the rightmost visible leaf under the
+        top-level row ``top_row``. Cached; rebuilt on expand/collapse or
+        model change."""
+        cached = self._last_path_cache.get(top_row)
+        if cached is not None:
+            return cached
+        model = self._view.model()
+        if model is None:
+            return ()
+        cur = model.index(top_row, 0)
+        if not cur.isValid():
+            return ()
+        chain: list[int] = [top_row]
+        while True:
+            if not self._view.isExpanded(cur):
+                break
+            n = model.rowCount(cur)
+            if n == 0:
+                break
+            cur = model.index(n - 1, 0, cur)
+            chain.append(cur.row())
+        result = tuple(chain)
+        self._last_path_cache[top_row] = result
+        return result
+
+    def _resolve_active_top_row(self) -> int | None:
+        if not self._active_top_row_dirty:
+            return self._active_top_row
+        result: int | None = None
+        sel_model = self._view.selectionModel()
+        if sel_model is not None:
+            selected_rows = sel_model.selectedRows(0)
+            if selected_rows:
+                top = selected_rows[0]
+                while top.parent().isValid():
+                    top = top.parent()
+                result = top.row()
+            else:
+                current = sel_model.currentIndex()
+                if current.isValid():
+                    top = current
+                    while top.parent().isValid():
+                        top = top.parent()
+                    result = top.row()
+        self._active_top_row = result
+        self._active_top_row_dirty = False
+        return result
+
+    def set_first_row_top_reserve(self, height: int) -> None:
+        height = max(0, height)
+        if self._first_row_top_reserve == height:
+            return
+        self._first_row_top_reserve = height
+        if self._view is not None:
+            self._view.scheduleDelayedItemsLayout()
+
+    def _first_row_extra(self, index) -> int:
+        if (
+            self._first_row_top_reserve > 0
+            and index.row() == 0
+            and not index.parent().isValid()
+        ):
+            return self._first_row_top_reserve
+        return 0
 
     def sizeHint(self, option, index):  # noqa: N802 - Qt naming
+        extra = self._first_row_extra(index)
+        if self._is_last_in_card(index):
+            # Reserve a 4px gap below the last visible row of each
+            # top-level card so the next card has breathing room.
+            extra += int(self._CARD_VGAP)
         if index.data(_GROUP_KIND_ROLE) == "workfolder":
-            return QSize(option.rect.width(), self._GROUP_HEIGHT)
+            return QSize(option.rect.width(), self._GROUP_HEIGHT + extra)
         if index.data(_GROUP_KIND_ROLE) == "compaction":
-            return QSize(option.rect.width(), self._COMPACTION_HEIGHT)
+            return QSize(option.rect.width(), self._COMPACTION_HEIGHT + extra)
         if index.data(_RECORD_COMPACT_ROLE):
-            return QSize(option.rect.width(), self._COMPACT_RECORD_HEIGHT)
-        return QSize(option.rect.width(), self._RECORD_HEIGHT)
+            return QSize(option.rect.width(), self._COMPACT_RECORD_HEIGHT + extra)
+        return QSize(option.rect.width(), self._RECORD_HEIGHT + extra)
+
+    # ---- card chrome helpers --------------------------------------------
+
+    def _top_level_ancestor(self, index):
+        if not index.isValid():
+            return index
+        cur = index
+        while cur.parent().isValid():
+            cur = cur.parent()
+        return cur
+
+    def _is_active_workfolder(self, index) -> bool:
+        """A top-level workfolder is "active" (blue card chrome) when the
+        user is currently focused on its subtree — either it's selected
+        directly, or the focused row's ancestor walk lands on it. Mirrors
+        the Accounts page's "current account" semantics: only one card
+        is blue at a time. Expansion alone does NOT make it active."""
+        if not index.isValid() or index.parent().isValid():
+            return False
+        return self._resolve_active_top_row() == index.row()
+
+    def _parent_card_active(self, index) -> bool:
+        if not index.isValid():
+            return False
+        cur = index
+        while cur.parent().isValid():
+            cur = cur.parent()
+        return self._resolve_active_top_row() == cur.row()
+
+    def _is_last_in_card(self, index) -> bool:
+        """Return True if `index` is the last visible row of its top-level
+        card's expanded subtree — i.e. the row that should close the
+        card with rounded bottom corners + a bottom border. Backed by
+        ``_last_path_cache`` so a viewport-wide repaint after expand/
+        collapse is O(visible_rows) lookups rather than O(visible_rows ×
+        depth) walks."""
+        if not index.isValid():
+            return False
+        # Walk up to encode this index's path as a tuple of row numbers,
+        # then compare against the cached rightmost-leaf path for its
+        # top-level card. The walk-up is O(depth) and short — comparison
+        # is the hot operation, and tuple-eq is C-level fast.
+        cur = index
+        chain: list[int] = []
+        while cur.isValid():
+            chain.append(cur.row())
+            cur = cur.parent()
+        if not chain:
+            return False
+        chain.reverse()
+        return tuple(chain) == self._last_path_for_top(chain[0])
+
+    def _card_colors(self, *, active: bool, hover: bool) -> tuple[QColor, QColor]:
+        if active:
+            return self._CARD_FILL_ACTIVE, self._CARD_BORDER_ACTIVE
+        if hover:
+            return self._CARD_FILL_HOVER, self._CARD_BORDER_HOVER
+        return self._CARD_FILL_IDLE, self._CARD_BORDER_IDLE
+
+    def _paint_card_segment(
+        self,
+        painter: QPainter,
+        rect: QRectF,
+        fill: QColor,
+        border: QColor,
+        *,
+        has_top: bool,
+        has_bottom: bool,
+    ) -> None:
+        """Paint one segment of a connected card.
+
+        ``has_top`` / ``has_bottom`` flag whether the row caps the card
+        at that edge (rounded corners + edge stroke). Side borders are
+        always drawn. Combinations:
+          * (T, T) → standalone card (collapsed group)
+          * (T, F) → card header (expanded group); body continues below
+          * (F, F) → middle row (child of expanded group, not last)
+          * (F, T) → card footer (last visible child of expanded group)
+        """
+        r = self._CARD_RADIUS
+        x, y = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+
+        # ---- fill (closed path so corners are rounded properly) ----
+        if fill is not None and fill.alpha() > 0:
+            fill_path = QPainterPath()
+            fill_path.moveTo(x + (r if has_top else 0), y)
+            fill_path.lineTo(x + w - (r if has_top else 0), y)
+            if has_top:
+                fill_path.arcTo(x + w - 2 * r, y, 2 * r, 2 * r, 90, -90)
+            fill_path.lineTo(x + w, y + h - (r if has_bottom else 0))
+            if has_bottom:
+                fill_path.arcTo(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0, -90)
+            fill_path.lineTo(x + (r if has_bottom else 0), y + h)
+            if has_bottom:
+                fill_path.arcTo(x, y + h - 2 * r, 2 * r, 2 * r, 270, -90)
+            fill_path.lineTo(x, y + (r if has_top else 0))
+            if has_top:
+                fill_path.arcTo(x, y, 2 * r, 2 * r, 180, -90)
+            fill_path.closeSubpath()
+            painter.fillPath(fill_path, fill)
+
+        if border is None or border.alpha() <= 0:
+            return
+
+        # ---- border (open paths drawing only the visible edges) ----
+        # 0.5px offset for crisp 1px strokes at integer DPR.
+        bx = x + 0.5
+        by = y + 0.5
+        bw = w - 1.0
+        bh = h - 1.0
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(Qt.NoBrush)
+
+        # Side borders (always drawn). At capped edges, shrink the span
+        # to leave room for the rounded corner arcs (which are drawn at
+        # the same 0.5-offset rect). At OPEN edges (no cap), let the
+        # line run to the row boundary at integer y so the adjacent
+        # row's side line touches it flush — the +0.5 inset is
+        # deliberately NOT applied there, otherwise a 1px gap would
+        # appear at every row boundary in the connected card.
+        side_top = (by + r) if has_top else y
+        side_bot = (by + bh - r) if has_bottom else (y + h)
+        painter.drawLine(QPointF(bx, side_top), QPointF(bx, side_bot))
+        painter.drawLine(QPointF(bx + bw, side_top), QPointF(bx + bw, side_bot))
+
+        if has_top:
+            top_path = QPainterPath()
+            top_path.moveTo(bx, by + r)
+            top_path.arcTo(bx, by, 2 * r, 2 * r, 180, -90)
+            top_path.lineTo(bx + bw - r, by)
+            top_path.arcTo(bx + bw - 2 * r, by, 2 * r, 2 * r, 90, -90)
+            painter.drawPath(top_path)
+
+        if has_bottom:
+            bot_path = QPainterPath()
+            bot_path.moveTo(bx + bw, by + bh - r)
+            bot_path.arcTo(bx + bw - 2 * r, by + bh - 2 * r, 2 * r, 2 * r, 0, -90)
+            bot_path.lineTo(bx + r, by + bh)
+            bot_path.arcTo(bx, by + bh - 2 * r, 2 * r, 2 * r, 270, -90)
+            painter.drawPath(bot_path)
+
+    # ---- paint dispatch -------------------------------------------------
 
     def paint(self, painter: QPainter, option, index):  # noqa: N802 - Qt naming
+        extra = self._first_row_extra(index)
+        if extra > 0:
+            # Shift the rect down so the existing paint logic uses the
+            # bottom (normal-height) portion of the row. The top
+            # ``extra`` pixels are blank, reserved for the count overlay.
+            option.rect.setTop(option.rect.top() + extra)
+        # If this row is the last in its card, the +CARD_VGAP we added
+        # in sizeHint sits as empty space at the BOTTOM of the rect; the
+        # card chrome should paint inside the rect minus that gap.
+        bottom_gap = int(self._CARD_VGAP) if self._is_last_in_card(index) else 0
+        if bottom_gap > 0:
+            option.rect.setBottom(option.rect.bottom() - bottom_gap)
         painter.save()
         try:
             painter.setRenderHint(QPainter.Antialiasing)
@@ -758,33 +1084,87 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             painter.restore()
 
     def _paint_group(self, painter: QPainter, option, index, kind: str) -> None:
-        rect = QRectF(option.rect).adjusted(0.0, 3.0, -2.0, -3.0)
-        selected = bool(option.state & QStyle.State_Selected)
         hover = bool(option.state & QStyle.State_MouseOver)
+        # Distinguish "what Qt actually shows right now" from "what the
+        # user just clicked toward but the actual setExpanded hasn't
+        # run yet". The card chrome (has_bottom) keys off the actual
+        # state, since children visibility hasn't changed; the chevron
+        # keys off the visual (pending if set) so the click registers
+        # immediately even when setExpanded's paint pass is heavy.
         expanded = self._view.isExpanded(index)
+        pending = index.data(_PENDING_EXPANSION_ROLE)
+        chevron_expanded = pending if isinstance(pending, bool) else expanded
+        is_top_level = not index.parent().isValid()
 
-        if selected or expanded:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(10, 132, 255, 34 if kind == "workfolder" else 18))
-            painter.drawRoundedRect(rect, 8, 8)
-            if kind == "workfolder":
-                painter.setBrush(QColor("#4ba6ff"))
-                painter.drawRoundedRect(QRectF(rect.left(), rect.top(), 3.0, rect.height()), 2, 2)
-        elif hover:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(255, 255, 255, 18))
-            painter.drawRoundedRect(rect, 8, 8)
+        if kind == "workfolder" and is_top_level:
+            # Top-level workfolder group — owns its card. Card chrome
+            # rounds top corners always; bottom corners only when the
+            # card has no expanded children (collapsed standalone).
+            active = self._is_active_workfolder(index)
+            fill, border = self._card_colors(active=active, hover=hover)
+            # Bottom inset is always 0 here: paint() has already
+            # shrunk option.rect by CARD_VGAP for collapsed standalone
+            # groups (via _is_last_in_card → True), so card.bottom()
+            # naturally lands above the gap. Expanded groups keep
+            # card.bottom() at row.bottom() so the side borders flow
+            # flush into the first child row below.
+            card_rect = QRectF(option.rect).adjusted(
+                self._CARD_HINSET,
+                self._CARD_VGAP,
+                -self._CARD_HINSET,
+                0.0,
+            )
+            self._paint_card_segment(
+                painter,
+                card_rect,
+                fill,
+                border,
+                has_top=True,
+                has_bottom=not expanded,
+            )
+        else:
+            # Compaction subgroup — sits inside its parent workfolder's
+            # card body. No own card chrome beyond continuing the parent
+            # card's side borders (and bottom if last in card).
+            parent_active = self._parent_card_active(index)
+            fill, border = self._card_colors(active=parent_active, hover=False)
+            is_last = self._is_last_in_card(index)
+            card_rect = QRectF(option.rect).adjusted(
+                self._CARD_HINSET, 0.0,
+                -self._CARD_HINSET, 0.0,
+            )
+            self._paint_card_segment(
+                painter,
+                card_rect,
+                fill,
+                border,
+                has_top=False,
+                has_bottom=is_last,
+            )
+            # Hover overlay for compaction rows.
+            if hover and not parent_active:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(self._CARD_FILL_HOVER)
+                painter.drawRect(card_rect)
+
+        # ---- inner content (chevron + folder + title + count pill) ----
+        # "Highlighted" content style now follows the active rule for
+        # workfolders and parent_active for compaction subgroups.
+        if kind == "workfolder" and is_top_level:
+            highlighted = self._is_active_workfolder(index)
+        else:
+            highlighted = self._parent_card_active(index)
 
         left = option.rect.left() + (8 if kind == "workfolder" else 30)
         center_y = option.rect.center().y()
-        accent = QColor("#55adff") if selected or expanded else QColor(165, 178, 195)
-        text_color = QColor("#56adff") if kind == "workfolder" and (selected or expanded) else QColor(220, 227, 238)
+        accent = QColor("#55adff") if highlighted else QColor(165, 178, 195)
+        text_color = QColor("#56adff") if kind == "workfolder" and highlighted else QColor(220, 227, 238)
         if kind == "compaction":
             text_color = QColor(145, 152, 165)
             accent = QColor(130, 138, 150)
 
-        self._draw_chevron(painter, left + 9, center_y, expanded, accent)
-        self._draw_folder(painter, left + 31, center_y - 16, accent, selected or expanded)
+        self._draw_chevron(painter, left + 9, center_y, chevron_expanded, accent)
+        self._draw_folder(painter, left + 31, center_y - 16, accent, highlighted)
 
         font = QFont(option.font)
         font.setPointSizeF(font.pointSizeF() + (1.0 if kind == "workfolder" else -0.5))
@@ -808,16 +1188,15 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         if count is not None:
             pill = QRectF(option.rect.right() - pill_w - 10, center_y - 13, pill_w, 26)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(55, 121, 190, 80) if selected or expanded else QColor(255, 255, 255, 14))
+            painter.setBrush(QColor(55, 121, 190, 80) if highlighted else QColor(255, 255, 255, 14))
             painter.drawRoundedRect(pill, 7, 7)
-            painter.setPen(QColor("#74bdff") if selected or expanded else QColor(160, 170, 185))
+            painter.setPen(QColor("#74bdff") if highlighted else QColor(160, 170, 185))
             count_font = QFont(option.font)
             count_font.setPointSizeF(max(count_font.pointSizeF() - 0.5, 8.5))
             painter.setFont(count_font)
             painter.drawText(pill, Qt.AlignCenter, str(count))
 
     def _paint_record(self, painter: QPainter, option, index) -> None:
-        rect = QRectF(option.rect).adjusted(32.0, 4.0, -8.0, -4.0)
         active_session_id = self._view.property("activeSessionId")
         selected = bool(option.state & QStyle.State_Selected) or (
             isinstance(active_session_id, str)
@@ -826,19 +1205,40 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         )
         hover = bool(option.state & QStyle.State_MouseOver)
         compact = bool(index.data(_RECORD_COMPACT_ROLE))
+        parent_active = self._parent_card_active(index)
+        is_last = self._is_last_in_card(index)
 
+        # Continue the parent card's chrome through this row.
+        card_fill, card_border = self._card_colors(active=parent_active, hover=False)
+        card_rect = QRectF(option.rect).adjusted(
+            self._CARD_HINSET, 0.0,
+            -self._CARD_HINSET, 0.0,
+        )
+        self._paint_card_segment(
+            painter,
+            card_rect,
+            card_fill,
+            card_border,
+            has_top=False,
+            has_bottom=is_last,
+        )
+
+        # Inner overlays. Selected row mirrors the Accounts page's
+        # "current account" card recipe — PRIMARY_GHOST fill + 1px
+        # PRIMARY_BAND border — so the focused session reads the same
+        # way the focused account does, even though it's nested inside
+        # an already-active parent card. Hover is just a faint white
+        # tint (selected wins when both apply).
         if selected:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(10, 132, 255, 46))
-            painter.drawRoundedRect(rect, 8, 8)
+            inner = card_rect.adjusted(8.0, 4.0, -8.0, -4.0 if is_last else 0.0)
+            painter.setPen(QPen(self._CARD_BORDER_ACTIVE, 1))
+            painter.setBrush(self._CARD_FILL_ACTIVE)
+            painter.drawRoundedRect(inner, 8, 8)
         elif hover:
+            inner = card_rect.adjusted(8.0, 2.0, -8.0, -2.0 if is_last else 0.0)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(255, 255, 255, 16))
-            painter.drawRoundedRect(rect, 8, 8)
-
-        guide_x = option.rect.left() + 20
-        painter.setPen(QPen(QColor(75, 140, 210, 80), 1))
-        painter.drawLine(guide_x, option.rect.top(), guide_x, option.rect.bottom())
+            painter.drawRoundedRect(inner, 8, 8)
 
         icon_x = option.rect.left() + 38
         icon_y = option.rect.top() + 13
@@ -978,6 +1378,19 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(255, 255, 255, 18) if not active else QColor(10, 132, 255, 68))
         painter.drawRoundedRect(QRectF(x, y, 30, 30), 7, 7)
+        # 18×18 glyph centred in the 30×30 backdrop (6px inset on each side).
+        renderer = self._glyph_renderer(color, path_data)
+        renderer.render(painter, QRectF(x + 6, y + 6, 18, 18))
+
+    def _glyph_renderer(self, color: QColor, path_data: str) -> QSvgRenderer:
+        """Return a cached ``QSvgRenderer`` for the given stroke colour and
+        Lucide path. Building a renderer parses XML, which is too costly
+        to repeat per record per repaint — caching makes the cost O(1)
+        per unique colour instead."""
+        key = (color.name(QColor.HexArgb), path_data)
+        cached = self._svg_cache.get(key)
+        if cached is not None:
+            return cached
         svg = (
             f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
             f'<g fill="none" stroke="{color.name()}" stroke-width="2.25" '
@@ -986,8 +1399,8 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             f'</g></svg>'
         )
         renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
-        # 18×18 glyph centred in the 30×30 backdrop (6px inset on each side).
-        renderer.render(painter, QRectF(x + 6, y + 6, 18, 18))
+        self._svg_cache[key] = renderer
+        return renderer
 
     def _draw_message_icon(
         self,
@@ -1188,14 +1601,22 @@ class SessionsPage(QWidget):
         self._detail_token = 0
         self._pending_detail_id: str | None = None
         self._active_session_id: str | None = None
-        self._restore_selection_id: str | None = None
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(220)
         self._search_debounce.timeout.connect(self._refresh)
 
+        # ---- expansion input buffer -------------------------------------
+        # Toggles requested via tree clicks queue here and flush on the
+        # next event-loop tick (see _queue_expansion_toggle). The queue
+        # also coalesces repeats on the same row so an "expand → collapse
+        # → expand" burst pays the relayout/repaint cost once, not three
+        # times.
+        self._pending_expansion_toggles: dict[tuple[int, ...], bool] = {}
+        self._expansion_flush_scheduled = False
+
         self._build()
-        self._record_count_label.setText(self._translator("Loading sessions..."))
+        self._set_record_count_text(self._translator("Loading sessions..."))
 
     @property
     def target(self) -> CodexHomeTarget:
@@ -1262,7 +1683,7 @@ class SessionsPage(QWidget):
         target = self._target
         filters = self._current_filters()
         factory = self._sessions_manager_factory
-        self._record_count_label.setText(self._translator("Loading sessions..."))
+        self._set_record_count_text(self._translator("Loading sessions..."))
         self._show_list_overlay(True)
 
         def action() -> list[SessionRecord]:
@@ -1303,7 +1724,7 @@ class SessionsPage(QWidget):
 
         # Just the count — the env tabs above already show the active corpus,
         # so the previous "in Sandbox/Real" suffix was redundant.
-        self._record_count_label.setText(
+        self._set_record_count_text(
             self._translator("{count} session(s)").format(count=len(records))
         )
         self._has_loaded = True
@@ -1311,7 +1732,7 @@ class SessionsPage(QWidget):
         self._show_list_overlay(False)
 
     def _show_list_error(self, ex: Exception) -> None:
-        self._record_count_label.setText(
+        self._set_record_count_text(
             self._translator("Sessions list failed: {error}").format(error=str(ex))
         )
         self._tree_model.set_records([])
@@ -1377,6 +1798,17 @@ class SessionsPage(QWidget):
         self._real_tab_btn.setCursor(Qt.PointingHandCursor)
         self._real_tab_btn.setToolTip(self._translator("Sessions target tooltip"))
         self._real_tab_btn.setAccessibleName(self._translator("Real"))
+        # Equal fixed footprint for both pills: width chosen to fit a
+        # 4-char Chinese label at the styled padding, height matches the
+        # 36x36 search/filter chips on the same row. Setting Fixed size
+        # in Python (rather than QSS ``min-width``) is what QHBoxLayout
+        # actually respects — QSS ``min-width`` is a paint hint and
+        # caused the two tabs to render past their layout cell on
+        # narrow panels.
+        for tab_btn in (self._sandbox_tab_btn, self._real_tab_btn):
+            tab_btn.setFixedSize(88, 36)
+            tab_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
         self._env_tab_group.addButton(self._sandbox_tab_btn, 0)
         self._env_tab_group.addButton(self._real_tab_btn, 1)
         self._sandbox_tab_btn.toggled.connect(
@@ -1386,23 +1818,24 @@ class SessionsPage(QWidget):
             lambda checked: self._on_env_tab_toggled(CodexHomeTarget.REAL, checked)
         )
 
-        # Status filter — a popover trigger that telegraphs current
-        # selection inline ("All statuses ▾" / "Active ▾" / ...). The
-        # popup itself is built later in this method (after the search
-        # popup, so it can share the same chrome-install pattern).
+        # Status filter — icon-only popover trigger, sized as a peer of
+        # the search button (40x40 funnel icon). Currently-applied filter
+        # is exposed externally via the ``hasActiveFilter`` property
+        # (PRIMARY_GHOST tint when not "All statuses") and the tooltip,
+        # which always carries the current selection name. The popup
+        # itself is built later in this method (after the search popup,
+        # so it can share the same chrome-install pattern).
         # ``_STATUS_FILTER_OPTIONS`` is the canonical (key, label-key)
-        # ordering used both to populate the popup and to look up the
-        # trigger label.
+        # ordering used both to populate the popup and to format the
+        # trigger tooltip.
         self._status_filter_key: str | None = None
         self._status_filter_button = QPushButton(self)
         self._status_filter_button.setObjectName("SessionsListFilterButton")
+        self._status_filter_button.setIcon(_filter_icon())
+        self._status_filter_button.setIconSize(QSize(20, 20))
+        self._status_filter_button.setFixedSize(36, 36)
         self._status_filter_button.setCursor(Qt.PointingHandCursor)
-        self._status_filter_button.setMinimumHeight(40)
-        self._status_filter_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self._status_filter_button.setProperty("hasActiveFilter", False)
-        self._status_filter_button.setToolTip(
-            self._translator("Sessions status filter tooltip")
-        )
         self._status_filter_button.setToolTipDuration(12_000)
         self._status_filter_button.setAccessibleName(
             self._translator("Sessions status filter tooltip")
@@ -1412,14 +1845,14 @@ class SessionsPage(QWidget):
         self._search_button = QToolButton(self)
         self._search_button.setObjectName("SessionsSearchButton")
         self._search_button.setIcon(_search_session_icon())
-        self._search_button.setIconSize(QSize(22, 22))
+        self._search_button.setIconSize(QSize(20, 20))
         self._search_button.setToolTip(self._translator("Sessions search popup tooltip"))
         self._search_button.setToolTipDuration(12_000)
         self._search_button.setAccessibleName(
             self._translator("Sessions search popup tooltip")
         )
         self._search_button.setProperty("hasQuery", False)
-        self._search_button.setFixedSize(40, 40)
+        self._search_button.setFixedSize(36, 36)
         self._search_button.clicked.connect(self._toggle_search_popup)
 
         self._locate_button = QToolButton(self)
@@ -1518,7 +1951,7 @@ class SessionsPage(QWidget):
             )
             status_popup_layout.addWidget(row_btn)
         self._status_filter_popup.hide()
-        self._sync_status_filter_button_label()
+        self._sync_status_filter_button_state()
 
         # Environment tabs at the very top of the list card — they read
         # like the section title for the list ("which corpus am I looking
@@ -1542,12 +1975,18 @@ class SessionsPage(QWidget):
         env_tab_row.addWidget(self._status_filter_button, 0)
         list_layout.addLayout(env_tab_row)
 
-        # Record count sits as a standalone label just above the tree —
-        # a small left-aligned readout of "N session(s)" that doesn't
-        # compete with the toolbar above it.
+        # Record count is rendered as an overlay parented to the tree's
+        # viewport (configured below, after the tree exists). It scrolls
+        # with the tree's content — visible at the top when scrolled to
+        # the top, and translates off-screen as the user scrolls down,
+        # freeing the visual real estate for actual list content. The
+        # delegate reserves a blank strip at the top of the first row so
+        # the overlay never overlaps the first group's icon or label.
         self._record_count_label = QLabel("")
         self._record_count_label.setObjectName("SessionsRecordCount")
-        list_layout.addWidget(self._record_count_label)
+        # Initial reserve height; refined in _reposition_record_count_label
+        # once the label has real text and a measurable sizeHint.
+        self._record_count_top_reserve = 28
 
         self._tree_model = _SessionsTreeModel(self)
         self._tree = QTreeView(self)
@@ -1563,7 +2002,14 @@ class SessionsPage(QWidget):
         self._tree.setIndentation(0)
         self._tree.setExpandsOnDoubleClick(False)
         self._tree.setAllColumnsShowFocus(False)
-        self._tree.setAnimated(True)
+        # Qt's built-in row-slide animation fights the connected-card
+        # delegate: child rows tween independently while the card's
+        # bottom-corner state migrates row-by-row, producing a "stitched"
+        # transition where neighbors visibly shift at different rates.
+        # Most navigator UIs (file explorers, IDE sidebars, mailbox
+        # lists) collapse instantly anyway — that's the cleaner default
+        # for a card-based tree.
+        self._tree.setAnimated(False)
         self._tree.setHeaderHidden(True)
         # Per-pixel scrolling so the scroll-past-end bump used by the floating
         # action bar is measured in pixels, not rows. With the default
@@ -1574,8 +2020,20 @@ class SessionsPage(QWidget):
         self._tree.setProperty("activeSessionId", "")
         self._tree.hideColumn(1)
         self._tree.hideColumn(2)
-        self._tree.setItemDelegateForColumn(0, _SessionsTreeDelegate(self._tree))
+        self._tree_delegate = _SessionsTreeDelegate(self._tree)
+        self._tree_delegate.set_first_row_top_reserve(self._record_count_top_reserve)
+        self._tree.setItemDelegateForColumn(0, self._tree_delegate)
         self._tree.setStyleSheet(_TREE_QSS)
+
+        # Mount the record-count overlay inside the tree's viewport so
+        # it scrolls with content. The first row's reserve (above) keeps
+        # it from overlapping the first session group at scroll=0.
+        self._record_count_label.setParent(self._tree.viewport())
+        self._record_count_label.move(12, 4)
+        self._record_count_label.raise_()
+        self._tree.verticalScrollBar().valueChanged.connect(
+            self._reposition_record_count_label
+        )
 
         header = self._tree.header()
         header.hide()
@@ -1673,9 +2131,9 @@ class SessionsPage(QWidget):
         floating_layout.addWidget(self._locate_button, 0)
 
         # Lucide icons paired with each batch action. Archive / Trash2 /
-        # ArchiveRestore / Flame map naturally to the action semantics; the
-        # Flame on Purge reinforces the existing ``danger=True`` red styling
-        # to make it clear this one is irreversible.
+        # ArchiveRestore / X map naturally to the action semantics; the
+        # Purge button keeps the existing ``danger=True`` red styling to make
+        # it clear this one is irreversible.
         action_icons = {
             "archive": _archive_icon,
             "trash": _trash_icon,
@@ -1714,6 +2172,13 @@ class SessionsPage(QWidget):
         self._detail_panel = _SessionDetailPanel(self._translator, self)
         self._detail_panel.setMinimumWidth(320)
         self._detail_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Older-history pagination: when the user scrolls past the loaded
+        # tail page the panel asks for the next-older page through this
+        # signal. We route the fetch through the same task_runner the
+        # detail-load path uses so worker mode still applies.
+        self._detail_panel.older_history_requested.connect(
+            self._request_older_timeline_page
+        )
 
         self._splitter = QSplitter(Qt.Horizontal, self)
         self._splitter.setObjectName("SessionsSplitter")
@@ -1871,15 +2336,29 @@ class SessionsPage(QWidget):
             row_btn.setProperty("active", row_key == key)
             row_btn.style().unpolish(row_btn)
             row_btn.style().polish(row_btn)
-        self._sync_status_filter_button_label()
+        self._sync_status_filter_button_state()
         self._refresh()
 
-    def _sync_status_filter_button_label(self) -> None:
+    def _sync_status_filter_button_state(self) -> None:
+        """Refresh the icon-only filter trigger's external affordances.
+
+        The button has no inline text (it's an icon chip), so the
+        currently-applied filter is communicated via:
+
+        * ``hasActiveFilter`` QSS property — switches to the
+          PRIMARY_GHOST + PRIMARY_BAND tinted state when the filter is
+          anything other than "All statuses".
+        * Tooltip — always names the current selection so the user
+          can read filter status by hovering.
+        """
         label_key = next(
             (label for k, label in _STATUS_FILTER_OPTIONS if k == self._status_filter_key),
             "All statuses",
         )
-        self._status_filter_button.setText(f"{self._translator(label_key)} ▾")
+        self._status_filter_button.setToolTip(
+            f"{self._translator('Sessions status filter tooltip')} — "
+            f"{self._translator(label_key)}"
+        )
         active = self._status_filter_key is not None
         if self._status_filter_button.property("hasActiveFilter") == active:
             return
@@ -1920,7 +2399,84 @@ class SessionsPage(QWidget):
     def _on_tree_clicked(self, index: QModelIndex) -> None:
         if not index.isValid() or not self._tree_model.is_group_index(index):
             return
-        self._tree.setExpanded(index, not self._tree.isExpanded(index))
+        self._queue_expansion_toggle(index)
+
+    def _queue_expansion_toggle(self, index: QModelIndex) -> None:
+        """Buffer expansion toggles and apply them on the next event-loop
+        tick. Three reasons:
+
+        * Responsiveness — ``setExpanded`` triggers an immediate
+          viewport relayout + repaint that, on a long list, is heavy
+          enough that the click handler can feel unresponsive even
+          though Qt's event queue accepted the click. Returning right
+          away lets any other queued events (a follow-up click, hover
+          updates, scroll events) drain before the paint pass starts.
+        * Coalescing — rapid expand→collapse→expand bursts on the same
+          row collapse to a single net toggle, so the user only pays
+          for the final state. Without this, a double-click on a
+          workfolder paints both intermediate states.
+        * Pre-flip feedback — the chevron is flipped via
+          ``_PENDING_EXPANSION_ROLE`` *before* ``setExpanded`` runs, so
+          the user sees an immediate visual response to the click even
+          if Qt's relayout/paint pass is about to block the event loop
+          for a moment. Without this, a click during a busy frame
+          looks ignored until the relayout completes.
+        """
+        chain = self._encode_group_index_path(index)
+        pending = self._pending_expansion_toggles.get(chain)
+        if pending is None:
+            new_target = not self._tree.isExpanded(index)
+        else:
+            new_target = not pending
+        self._pending_expansion_toggles[chain] = new_target
+        item = self._tree_model.itemFromIndex(index)
+        if item is not None:
+            item.setData(new_target, _PENDING_EXPANSION_ROLE)
+        if not self._expansion_flush_scheduled:
+            self._expansion_flush_scheduled = True
+            # 16ms ≈ one 60Hz frame: enough for Qt to dispatch the
+            # dataChanged-driven repaint of the chevron before the
+            # heavy setExpanded pass starts. With singleShot(0), the
+            # timer often beats the paint event and the user sees the
+            # chevron flip and the children appear in the same frame
+            # — which defeats the point of pre-flipping.
+            QTimer.singleShot(16, self._flush_pending_expansions)
+
+    @staticmethod
+    def _encode_group_index_path(index: QModelIndex) -> tuple[int, ...]:
+        """Encode a group index as a tuple of row numbers from top down.
+        Used as a stable cross-tick key for ``_pending_expansion_toggles``
+        so we don't have to hold QModelIndex references across event-loop
+        boundaries (where the model could in principle reset)."""
+        chain: list[int] = []
+        cur = index
+        while cur.isValid():
+            chain.append(cur.row())
+            cur = cur.parent()
+        chain.reverse()
+        return tuple(chain)
+
+    def _flush_pending_expansions(self) -> None:
+        self._expansion_flush_scheduled = False
+        queue = self._pending_expansion_toggles
+        self._pending_expansion_toggles = {}
+        model = self._tree_model
+        for chain, target in queue.items():
+            index = QModelIndex()
+            for row in chain:
+                index = model.index(row, 0, index)
+                if not index.isValid():
+                    break
+            else:
+                # Drop the pending hint *before* setExpanded so the
+                # post-expand paint pass keys off the actual state
+                # (which now matches what was pending). Carrying the
+                # role through would just be redundant data.
+                item = model.itemFromIndex(index)
+                if item is not None:
+                    item.setData(None, _PENDING_EXPANSION_ROLE)
+                if self._tree.isExpanded(index) != target:
+                    self._tree.setExpanded(index, target)
 
     def _on_row_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
         if not current.isValid():
@@ -2049,6 +2605,53 @@ class SessionsPage(QWidget):
             return
         self._apply_loaded_detail(detail, token=token, session_id=session_id)
 
+    def _request_older_timeline_page(
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+    ) -> None:
+        """Fetch one older page of timeline rows on the panel's behalf.
+
+        Wired from ``_SessionDetailPanel.older_history_requested``. We
+        only deliver the result back to the panel if the user is still
+        viewing the session that requested it; otherwise we cancel the
+        pending state on the panel so a future edge-trigger can fire.
+        """
+        active_target = self._target
+        factory = self._sessions_manager_factory
+
+        def _deliver(page) -> None:
+            if self._active_session_id != session_id:
+                self._detail_panel.cancel_pending_older()
+                return
+            self._detail_panel.prepend_older_items(page.items, offset)
+
+        if self._task_runner is None:
+            try:
+                manager = factory(active_target)
+                page = manager.get_session_timeline_page(
+                    session_id, offset=offset, limit=limit
+                )
+            except Exception:
+                self._detail_panel.cancel_pending_older()
+                return
+            _deliver(page)
+            return
+
+        def action():
+            return factory(active_target).get_session_timeline_page(
+                session_id, offset=offset, limit=limit
+            )
+
+        def on_success(page) -> None:
+            _deliver(page)
+
+        def on_error(_ex: Exception) -> None:
+            self._detail_panel.cancel_pending_older()
+
+        self._task_runner(action, on_success, on_error)
+
     def _apply_loaded_detail(
         self,
         detail: SessionDetail,
@@ -2079,6 +2682,7 @@ class SessionsPage(QWidget):
             and event.type() == QEvent.Resize
         ):
             self._reposition_list_overlay()
+            self._reposition_floating_actions()
         if (
             obj is getattr(self, "_list_container", None)
             and event.type() == QEvent.Resize
@@ -2090,51 +2694,45 @@ class SessionsPage(QWidget):
         return super().eventFilter(obj, event)
 
     def hideEvent(self, event):  # noqa: N802 - Qt naming
-        # When the user navigates to Accounts/Settings the Sessions widget is
-        # cached in memory; leaving thousands of timeline bubbles alive forces
-        # Qt to re-lay them out on the next show. Drop the rendered timeline
-        # so switching pages stays cheap. We remember the selected row id and
-        # re-issue the detail fetch in showEvent.
+        # Tab-switch keep-alive: leave the rendered timeline intact so
+        # coming back is instant. The sliding window already caps live
+        # bubbles at _WINDOW_SIZE (~120) so the memory cost is bounded;
+        # tearing it down on every hide just bought us a re-fetch +
+        # rebuild on every show, which is exactly what the user
+        # complained about as "loses my progress".
+        #
+        # The popup overlays still get hidden — they're top-level
+        # windows that shouldn't outlive the page being visible.
         self._search_popup.hide()
-        current = self._tree.currentIndex()
-        active = self._tree_model.record_for_index(current)
-        self._restore_selection_id = active.id if active is not None else None
-        self._detail_panel.discard_rendered_timeline()
-        # Bumping the detail token also cancels any in-flight worker result.
-        self._detail_token += 1
         super().hideEvent(event)
 
     def showEvent(self, event):  # noqa: N802 - Qt naming
         super().showEvent(event)
-        # Re-issue detail fetch for the previously selected row, if any. The
-        # tree itself stayed populated; only the timeline panel was discarded.
-        target_id = getattr(self, "_restore_selection_id", None)
-        if not target_id:
+        # Lightweight freshness check. The panel's state is preserved
+        # across hide/show, so by default we do nothing — Qt restores
+        # scroll position automatically. The one case where the cached
+        # render is stale is if a rescan rewrote ``timeline_items``
+        # while we were on another tab; ``count_timeline_items`` lets
+        # us detect that with a single SQL count and trigger a refetch.
+        # If no session is loaded yet there's nothing to validate.
+        panel_session_id = self._detail_panel.loaded_session_id()
+        if panel_session_id is None:
             return
-        self._restore_selection_id = None
-        record = self._records_by_id.get(target_id)
+        try:
+            manager = self._sessions_manager_factory(self._target)
+            record = manager.repository.get_session(panel_session_id)
+            current_total = manager.repository.count_timeline_items(
+                panel_session_id
+            )
+        except Exception:
+            return
         if record is None:
+            # Session row vanished while we were away (purged externally).
+            self._set_detail(None)
             return
-        # IMPORTANT: defer the loading-placeholder + detail fetch one tick.
-        # When this showEvent fires, Qt is still in the middle of mapping the
-        # SessionsPage tree to native windows. Showing the timeline loading
-        # overlay synchronously here can race with that mapping: if the
-        # overlay's grand-ancestor scroll viewport hasn't been mapped yet,
-        # Qt creates a transient top-level HWND for the overlay to host its
-        # paint, and Windows draws that HWND with default OS chrome
-        # (titlebar + app icon, white client area) for the frame or two
-        # before the widget is reparented to its real ancestor surface.
-        # That race is the small white popup with the app icon users saw on
-        # every page switch (and even on re-clicking the Sessions nav).
-        # By the time singleShot(0) fires the page is fully mapped, so the
-        # overlay shows without ever needing its own native window.
-        QTimer.singleShot(0, lambda r=record: self._begin_loading(r))
-
-    def _begin_loading(self, record: "SessionRecord") -> None:
-        # Belt-and-braces: if the user has navigated away again before this
-        # deferred slot fires, drop it.
-        if not self.isVisible():
+        if current_total == self._detail_panel.loaded_timeline_total():
             return
+        # Stale: refetch via the same path used by row-change.
         self._detail_panel.show_loading_placeholder(record)
         self._request_detail(record)
 
@@ -2145,6 +2743,34 @@ class SessionsPage(QWidget):
         viewport = self._tree.viewport()
         overlay.setFixedSize(viewport.size())
         overlay.move(0, 0)
+
+    def _reposition_record_count_label(self, *_args) -> None:
+        """Re-anchor the record-count overlay to the top of the tree
+        viewport, translated upward by the current scroll value so it
+        scrolls with the list content. The first-row delegate reserve
+        keeps it from overlapping the first session group at scroll=0.
+
+        Connected to ``verticalScrollBar().valueChanged`` and called
+        manually after layout changes (resize, model reset).
+        """
+        label = getattr(self, "_record_count_label", None)
+        tree = getattr(self, "_tree", None)
+        if label is None or tree is None:
+            return
+        scroll_value = tree.verticalScrollBar().value()
+        label.adjustSize()
+        label.move(12, 4 - scroll_value)
+        label.raise_()
+
+    def _set_record_count_text(self, text: str) -> None:
+        """Single entry point for updating the count overlay text.
+
+        Wraps ``setText`` so the overlay always re-fits its size and
+        re-anchors immediately after the text changes (instead of
+        waiting for the next scroll event to fix a stale bounding box).
+        """
+        self._record_count_label.setText(text)
+        self._reposition_record_count_label()
 
     def _extend_tree_scroll_range(self) -> None:
         """Bump the tree's vertical scrollbar maximum by ``_scroll_past_end_extra``.
@@ -2177,7 +2803,7 @@ class SessionsPage(QWidget):
             self._extending_scroll_range = False
 
     def _reposition_floating_actions(self) -> None:
-        """Center the floating action bar over the bottom of the list card.
+        """Center the floating action bar over the visible session list.
 
         The bar truly floats: it overlays the tree's viewport without
         shrinking it, so mid-scroll rows pass under the bar (image 2). To
@@ -2189,10 +2815,17 @@ class SessionsPage(QWidget):
         if bar is None:
             return
         container = self._list_container
-        bar.adjustSize()
-        bar_size = bar.size()
+        bar_size = bar.sizeHint().expandedTo(bar.minimumSizeHint())
+        bar.resize(bar_size)
         margin = 18
-        x = max(margin, (container.width() - bar_size.width()) // 2)
+        # Center over the list section (panel) rather than the tree's
+        # viewport. When the tree shows a vertical scrollbar the viewport
+        # is ~12px narrower than the section, and centering on the viewport
+        # made the bar visibly offset to the left of the panel's centre.
+        # The panel border is what the user perceives as "the list", so
+        # center the bar relative to it.
+        centered_x = (container.width() - bar_size.width()) // 2
+        x = max(margin, min(centered_x, container.width() - bar_size.width() - margin))
         y = max(margin, container.height() - bar_size.height() - margin)
         bar.move(x, y)
         bar.raise_()
@@ -2354,6 +2987,18 @@ class _SessionDetailPanel(QFrame):
     # it without disturbing existing chips.)
     _ALL_CHIP_KINDS = ("user", "assistant", "tool_call", "command")
 
+    # Page size used when the panel asks the manager for older timeline
+    # rows after the user scrolls past the loaded edge. Mirrors
+    # DEFAULT_TIMELINE_PAGE_SIZE on the parser side; kept inline so the
+    # panel doesn't need to depend on the parser module.
+    _OLDER_PAGE_SIZE = 200
+
+    # Emitted when the user reaches the loaded edge and there's still
+    # older history in the repository to fetch. SessionsPage routes this
+    # through its task_runner and feeds the result back via
+    # ``prepend_older_items``. Args: (session_id, sql_offset, sql_limit).
+    older_history_requested = Signal(str, int, int)
+
     def __init__(self, translator: Callable[[str], str], parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("SessionsDetailCard")
@@ -2366,6 +3011,29 @@ class _SessionDetailPanel(QFrame):
         self._window_start = 0
         self._window_end = 0
         self._timeline_item_count = 0
+        # Raw timeline items (sorted ascending by ordinal) backing the
+        # coalesced ``_all_blocks``. We keep them so prepended older
+        # pages can be re-coalesced cleanly across the page boundary
+        # without losing the existing tail.
+        self._all_timeline_items: list[SessionTimelineItem] = []
+        # Pre-dedup SQL offset of ``_all_timeline_items[0]`` in the
+        # repository. ``> 0`` means there is older history to page in;
+        # ``== 0`` means we're already at the start of the session.
+        self._loaded_offset: int = 0
+        # Total row count in the repository's timeline_items for the
+        # currently-open session. Used for the status footer and to
+        # let the minimap reason about unloaded ranges later.
+        self._timeline_total: int = 0
+        # Session id we're currently rendering — needed so the older-
+        # page fetch can address the right manager. Cleared by
+        # ``discard_rendered_timeline`` so a stale fetch can't latch on
+        # to the next session.
+        self._loaded_session_id: str | None = None
+        # Single-flight guard. Set when an older-page request is in
+        # flight; cleared when the result lands or the request is
+        # canceled (target switch / session change). Prevents the edge-
+        # slide trigger from spamming the worker.
+        self._loading_older: bool = False
         # The user prompt whose section the viewport currently belongs to.
         # The window stays anchored on this block; the rail puts its dot at
         # the rail's center. Sliding/redraw only happens when this changes.
@@ -3093,22 +3761,33 @@ class _SessionDetailPanel(QFrame):
 
     def set_detail(self, detail: SessionDetail | None, target: CodexHomeTarget) -> None:
         self._render_token += 1
+        # Cancel any in-flight older-page request — its result would
+        # belong to the previous session anyway.
+        self._loading_older = False
         self._clear_timeline()
         if detail is None:
             self._all_blocks = []
+            self._all_timeline_items = []
             self._user_anchor_blocks = []
             self._current_user_block = None
             self._window_start = 0
             self._window_end = 0
             self._timeline_item_count = 0
+            self._loaded_offset = 0
+            self._timeline_total = 0
+            self._loaded_session_id = None
             self._timeline_status.setText("")
             self._set_audit_text("")
             self._clear_minimap()
             self._hide_timeline_overlay()
             self._refresh_count_label()
             return
-        self._all_blocks = _coalesce_timeline_blocks(detail.timeline)
-        self._timeline_item_count = len(detail.timeline)
+        self._all_timeline_items = list(detail.timeline)
+        self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
+        self._timeline_item_count = len(self._all_timeline_items)
+        self._loaded_offset = max(0, getattr(detail, "timeline_loaded_offset", 0))
+        self._timeline_total = max(0, detail.timeline_total)
+        self._loaded_session_id = detail.record.id
         # Keep user anchors for current-section detection; the minimap itself
         # is driven from every materialized block's widget geometry.
         self._user_anchor_blocks = [
@@ -3136,18 +3815,37 @@ class _SessionDetailPanel(QFrame):
         """Drop every bubble widget. Caller is expected to re-fetch and call
         set_detail again on the next show."""
         self._render_token += 1
+        self._loading_older = False
         self._all_blocks = []
+        self._all_timeline_items = []
         self._user_anchor_blocks = []
         self._current_user_block = None
         self._window_start = 0
         self._window_end = 0
         self._timeline_item_count = 0
+        self._loaded_offset = 0
+        self._timeline_total = 0
+        self._loaded_session_id = None
         self._clear_timeline()
         self._timeline_status.setText("")
         self._set_audit_text("")
         self._clear_minimap()
         self._hide_timeline_overlay()
         self._refresh_count_label()
+
+    def loaded_session_id(self) -> str | None:
+        """Session id currently rendered in the panel, or None if empty.
+        Used by SessionsPage on tab show to decide whether the panel
+        already holds the right session and only needs a freshness
+        check (vs. a full re-fetch)."""
+        return self._loaded_session_id
+
+    def loaded_timeline_total(self) -> int:
+        """Repository total at the time the current detail was loaded.
+        SessionsPage compares this against a fresh ``count_timeline_items``
+        on tab-show: if the totals diverge the displayed slice has been
+        invalidated by a rescan and we re-fetch."""
+        return self._timeline_total
 
     def _set_window_centered_on(self, focus_block: int) -> None:
         """Update self._window_start/_end to a window centered on focus_block,
@@ -3181,28 +3879,33 @@ class _SessionDetailPanel(QFrame):
         if start >= end:
             return 0
         added_height = 0
-        if prepend:
-            # Insert in reverse so the original order is preserved at the top.
-            # NOTE: do NOT call widget.adjustSize() here. With a parent already
-            # set by _build_window_widget the widget is owned by the layout —
-            # forcing a sizing pass on a freshly-inserted child can trigger
-            # Qt to promote it to a top-level window for measurement, causing
-            # the brief white-popup flashes the user observed on huge sessions.
-            for block_index in range(end - 1, start - 1, -1):
-                widget = self._build_window_widget(block_index)
-                if widget is None:
-                    continue
-                self._timeline_layout.insertWidget(0, widget)
-                added_height += widget.sizeHint().height() + self._timeline_layout.spacing()
-        else:
-            for block_index in range(start, end):
-                widget = self._build_window_widget(block_index)
-                if widget is None:
-                    continue
-                # Insert before the trailing stretch.
-                self._timeline_layout.insertWidget(
-                    self._timeline_layout.count() - 1, widget
-                )
+        with _perf_timer(
+            "ui.detail_panel.build_window_widgets",
+            count=end - start,
+            prepend=prepend,
+        ):
+            if prepend:
+                # Insert in reverse so the original order is preserved at the top.
+                # NOTE: do NOT call widget.adjustSize() here. With a parent already
+                # set by _build_window_widget the widget is owned by the layout —
+                # forcing a sizing pass on a freshly-inserted child can trigger
+                # Qt to promote it to a top-level window for measurement, causing
+                # the brief white-popup flashes the user observed on huge sessions.
+                for block_index in range(end - 1, start - 1, -1):
+                    widget = self._build_window_widget(block_index)
+                    if widget is None:
+                        continue
+                    self._timeline_layout.insertWidget(0, widget)
+                    added_height += widget.sizeHint().height() + self._timeline_layout.spacing()
+            else:
+                for block_index in range(start, end):
+                    widget = self._build_window_widget(block_index)
+                    if widget is None:
+                        continue
+                    # Insert before the trailing stretch.
+                    self._timeline_layout.insertWidget(
+                        self._timeline_layout.count() - 1, widget
+                    )
         return added_height
 
     def _build_window_widget(self, block_index: int) -> QWidget | None:
@@ -3215,29 +3918,41 @@ class _SessionDetailPanel(QFrame):
         # visual density changes.
         if not self._block_passes_filter(block):
             return None
+        # Pre-marker so a hang inside bubble construction is visible in
+        # the perf log — _perf_timer's exit line never prints if Qt
+        # never returns from the constructor.
+        _perf_log(
+            "ui.detail_panel.build_one",
+            block=block_index,
+            kind=_describe_block_for_perf(block),
+        )
         # Pass the timeline container as parent through every step of the
         # bubble construction chain so no QWidget is ever briefly parentless.
         # Qt promotes parentless widgets to top-level windows during sizing,
         # producing brief white popups on huge sessions.
-        bubble = _build_block_widget(block, parent=self._timeline_container)
-        wrapped = _wrap_bubble(bubble, parent=self._timeline_container)
-        wrapped.setProperty("blockIndex", block_index)
+        with _perf_timer("ui.detail_panel.build_one.done", block=block_index):
+            bubble = _build_block_widget(block, parent=self._timeline_container)
+            wrapped = _wrap_bubble(bubble, parent=self._timeline_container)
+            wrapped.setProperty("blockIndex", block_index)
         return wrapped
 
     def _drop_widgets_at(self, layout_indexes: list[int]) -> int:
         """Delete the widgets at the given layout indexes (descending order
         recommended). Returns the total removed height for scroll compensation."""
         removed_height = 0
-        for layout_index in layout_indexes:
-            if layout_index < 0 or layout_index >= self._timeline_layout.count() - 1:
-                continue
-            item = self._timeline_layout.takeAt(layout_index)
-            widget = item.widget() if item is not None else None
-            if widget is None:
-                continue
-            removed_height += widget.sizeHint().height() + self._timeline_layout.spacing()
-            widget.hide()
-            widget.deleteLater()
+        with _perf_timer(
+            "ui.detail_panel.drop_widgets_at", count=len(layout_indexes)
+        ):
+            for layout_index in layout_indexes:
+                if layout_index < 0 or layout_index >= self._timeline_layout.count() - 1:
+                    continue
+                item = self._timeline_layout.takeAt(layout_index)
+                widget = item.widget() if item is not None else None
+                if widget is None:
+                    continue
+                removed_height += widget.sizeHint().height() + self._timeline_layout.spacing()
+                widget.hide()
+                widget.deleteLater()
         return removed_height
 
     def _recenter_window(self, focus_block: int) -> None:
@@ -3284,9 +3999,31 @@ class _SessionDetailPanel(QFrame):
 
     def _slide_window_up(self) -> None:
         if self._window_start <= 0:
+            # Reached the loaded edge. Try to page in older history from
+            # the manager; once it lands, prepend_older_items will rebuild
+            # the window and the user can keep scrolling up.
+            self._maybe_request_older()
             return
         new_start = max(0, self._window_start - _WINDOW_HALF)
         new_end = min(len(self._all_blocks), new_start + _WINDOW_SIZE)
+
+        # Capture the topmost-visible bubble's blockIndex + viewport
+        # offset so we can land scroll precisely after layout. Using
+        # ``widget.sizeHint().height()`` summed across freshly-inserted
+        # widgets undercounts (word-wrap height-for-width isn't computed
+        # before a layout pass), which made setValue(prev + added_height)
+        # land far above the user's prior view — the "scrolling up jumps"
+        # symptom.
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        raw_scroll = scrollbar.value()
+        top_widget = self._topmost_visible_widget()
+        anchor_block_index: int | None = None
+        anchor_offset = 0
+        if top_widget is not None:
+            candidate = top_widget.property("blockIndex")
+            if isinstance(candidate, int):
+                anchor_block_index = candidate
+                anchor_offset = raw_scroll - top_widget.y()
 
         drop_count = self._window_end - new_end
         if drop_count > 0:
@@ -3295,18 +4032,250 @@ class _SessionDetailPanel(QFrame):
                 list(range(tail_first, tail_first - drop_count, -1))
             )
 
-        scrollbar = self._timeline_scroll.verticalScrollBar()
-        prev_value = scrollbar.value()
-        added_height = self._build_window_widgets(
-            new_start, self._window_start, prepend=True
-        )
         self._suppress_edge_slide = True
-        scrollbar.setValue(prev_value + added_height)
-        self._suppress_edge_slide = False
+        try:
+            self._build_window_widgets(
+                new_start, self._window_start, prepend=True
+            )
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+        finally:
+            self._suppress_edge_slide = False
         self._window_start = new_start
         self._window_end = new_end
         self._refresh_status_label()
         self._refresh_minimap()
+
+        # Defer the scroll restore one event-loop tick so Qt has finished
+        # propagating the real wrapped-text heights to widget.y(); the
+        # apply re-finds the anchor block and lands at widget.y() + offset.
+        if anchor_block_index is not None:
+            QTimer.singleShot(
+                0,
+                lambda b=anchor_block_index, off=anchor_offset, raw=raw_scroll:
+                    self._apply_prepend_anchor(b, off, raw),
+            )
+
+    # --- older-page pagination ------------------------------------------
+    #
+    # The detail panel only holds a tail page of the session timeline so
+    # that opening a 100k-event session is bounded. When the user
+    # scrolls past the loaded edge (``_window_start <= 0`` AND
+    # ``_loaded_offset > 0``), the panel asks SessionsPage for the
+    # immediately-older page through ``older_history_requested``;
+    # SessionsPage routes the fetch through its task_runner and feeds
+    # the result back via ``prepend_older_items``.
+
+    def _maybe_request_older(self) -> None:
+        if self._loading_older:
+            return
+        if self._loaded_offset <= 0:
+            return
+        if not self._loaded_session_id:
+            return
+        page_size = self._OLDER_PAGE_SIZE
+        new_offset = max(0, self._loaded_offset - page_size)
+        page_limit = self._loaded_offset - new_offset
+        if page_limit <= 0:
+            return
+        self._loading_older = True
+        self.older_history_requested.emit(
+            self._loaded_session_id, new_offset, page_limit
+        )
+
+    def cancel_pending_older(self) -> None:
+        """Drop the in-flight older-page request without applying any
+        result. Called by SessionsPage when the user navigates away or
+        the manager surfaces an error."""
+        self._loading_older = False
+
+    def prepend_older_items(
+        self,
+        items: list[SessionTimelineItem],
+        sql_offset: int,
+    ) -> None:
+        """Merge an older page into the panel ahead of the existing tail.
+
+        The freshly-fetched items are concatenated in front of
+        ``_all_timeline_items`` and the entire combined list is re-
+        coalesced — tool-call groups can only merge correctly when they
+        see all the items in document order, so a partial recoalesce at
+        the page boundary would risk splitting/duplicating groups."""
+        self._loading_older = False
+        if not items:
+            # Nothing to add; mark the offset so we don't re-issue the
+            # same request infinitely if the manager returned empty.
+            self._loaded_offset = max(0, min(self._loaded_offset, sql_offset))
+            return
+        if not self._all_timeline_items:
+            # Defensive: shouldn't happen because set_detail seeds
+            # _all_timeline_items before any older-page fetch. Treat as
+            # initial load if it does.
+            self._all_timeline_items = list(items)
+            self._loaded_offset = max(0, sql_offset)
+            self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
+            self._timeline_item_count = len(self._all_timeline_items)
+            return
+
+        # Capture the topmost-visible bubble + its viewport offset so we
+        # can land the user back at the same pixel position after the
+        # recoalesce. Anchoring on the active user prompt (the prior
+        # behavior) snapped the view to that prompt's absolute y on every
+        # older-page fetch — felt like a forced jump.
+        bar = self._timeline_scroll.verticalScrollBar()
+        raw_scroll = bar.value()
+        top_widget = self._topmost_visible_widget()
+        anchor_item_id = self._anchor_id_for_widget(top_widget)
+        anchor_offset = (
+            raw_scroll - top_widget.y() if top_widget is not None else 0
+        )
+        fallback_user_id = self._current_user_anchor_id()
+
+        self._all_timeline_items = list(items) + self._all_timeline_items
+        self._loaded_offset = max(0, sql_offset)
+        self._timeline_item_count = len(self._all_timeline_items)
+        self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
+        self._user_anchor_blocks = [
+            i
+            for i, (kind, payload) in enumerate(self._all_blocks)
+            if kind == "single" and payload.type == "message:user"
+        ]
+
+        new_anchor_block = self._block_for_anchor_id(anchor_item_id)
+        if new_anchor_block is None:
+            # Defensive: top-visible item somehow not in the new blocks.
+            # Fall back to the active user prompt (loses px precision
+            # but keeps the view in the same conversational section),
+            # then to the first user prompt, then to 0.
+            new_anchor_block = self._block_for_message_id(fallback_user_id)
+        if new_anchor_block is None and self._user_anchor_blocks:
+            new_anchor_block = self._user_anchor_blocks[0]
+        if new_anchor_block is None:
+            new_anchor_block = 0 if self._all_blocks else None
+
+        # Track which user section we're in for the minimap highlight —
+        # the user-prompt id may have shifted to a new block index.
+        new_user_block = self._block_for_message_id(fallback_user_id)
+        if new_user_block is not None:
+            self._current_user_block = new_user_block
+
+        focus = new_anchor_block if new_anchor_block is not None else 0
+        self._set_window_centered_on(focus)
+        self._suppress_edge_slide = True
+        try:
+            self._clear_timeline()
+            self._build_window_widgets(
+                self._window_start, self._window_end, prepend=False
+            )
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+        finally:
+            self._suppress_edge_slide = False
+
+        # Defer the scroll restore so Qt has propagated geometry —
+        # widget.y() is unreliable in the same tick as the activate().
+        if new_anchor_block is not None:
+            QTimer.singleShot(
+                0,
+                lambda b=new_anchor_block, off=anchor_offset, raw=raw_scroll:
+                    self._apply_prepend_anchor(b, off, raw),
+            )
+        self._refresh_status_label()
+        self._refresh_minimap()
+
+    def _topmost_visible_widget(self) -> QWidget | None:
+        """The first materialized bubble whose bottom edge sits below the
+        viewport top — i.e. the one that visually anchors the user's
+        current view. ``count() - 1`` skips the trailing stretch."""
+        bar = self._timeline_scroll.verticalScrollBar()
+        viewport_top = bar.value()
+        for i in range(self._timeline_layout.count() - 1):
+            item = self._timeline_layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is None or widget.isHidden():
+                continue
+            if widget.y() + widget.height() > viewport_top:
+                return widget
+        return None
+
+    def _anchor_id_for_widget(self, widget: QWidget | None) -> str | None:
+        """Pull a stable item id from the block this widget represents.
+        For tool-group blocks the leading tool_call's id is used — that
+        leading edge survives recoalesce even when the group merges with
+        newly-prepended tool_calls at the boundary."""
+        if widget is None:
+            return None
+        block_index = widget.property("blockIndex")
+        if not isinstance(block_index, int):
+            return None
+        if not 0 <= block_index < len(self._all_blocks):
+            return None
+        kind, payload = self._all_blocks[block_index]
+        if kind == "single":
+            return getattr(payload, "id", None)
+        if kind == "tool_group" and payload:
+            return getattr(payload[0], "id", None)
+        return None
+
+    def _block_for_anchor_id(self, item_id: str | None) -> int | None:
+        """Find the block (post-recoalesce) that contains ``item_id``.
+        Searches tool-group payload contents too — a leading tool_call
+        may now sit inside a larger merged group at a different index."""
+        if not item_id:
+            return None
+        for index, (kind, payload) in enumerate(self._all_blocks):
+            if kind == "single":
+                if getattr(payload, "id", None) == item_id:
+                    return index
+            elif kind == "tool_group":
+                for tool_item in payload:
+                    if getattr(tool_item, "id", None) == item_id:
+                        return index
+        return None
+
+    def _apply_prepend_anchor(
+        self, block_index: int, offset: int, raw_scroll: int
+    ) -> None:
+        """Restore scroll so the anchored bubble sits at the same viewport
+        offset as before the older-page prepend. Falls back to the raw
+        pre-prepend scroll value (clamped) when the anchor widget isn't
+        materialized — defensive only; ``_set_window_centered_on`` should
+        have brought it into the window."""
+        bar = self._timeline_scroll.verticalScrollBar()
+        target_y: int | None = None
+        for i in range(self._timeline_layout.count() - 1):
+            item = self._timeline_layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is None:
+                continue
+            if widget.property("blockIndex") == block_index:
+                target_y = widget.y()
+                break
+        self._suppress_edge_slide = True
+        try:
+            if target_y is not None:
+                bar.setValue(min(max(0, target_y + offset), bar.maximum()))
+            else:
+                bar.setValue(min(max(0, raw_scroll), bar.maximum()))
+        finally:
+            self._suppress_edge_slide = False
+
+    def _current_user_anchor_id(self) -> str | None:
+        if self._current_user_block is None:
+            return None
+        if 0 <= self._current_user_block < len(self._all_blocks):
+            kind, payload = self._all_blocks[self._current_user_block]
+            if kind == "single":
+                return getattr(payload, "id", None)
+        return None
+
+    def _block_for_message_id(self, message_id: str | None) -> int | None:
+        if not message_id:
+            return None
+        for index, (kind, payload) in enumerate(self._all_blocks):
+            if kind == "single" and getattr(payload, "id", None) == message_id:
+                return index
+        return None
 
     # --------------------------------------------------------- scroll/anchor
 
@@ -3341,7 +4310,14 @@ class _SessionDetailPanel(QFrame):
         max_value = scrollbar.maximum()
         value = scrollbar.value()
         edge_px = max(60, int(viewport_h * _EDGE_TRIGGER_RATIO))
-        if value <= edge_px and self._window_start > 0:
+        # Top edge trigger: either there's headroom inside the loaded
+        # window to slide into, OR there's still older history in the
+        # repository we can page in. _slide_window_up dispatches between
+        # the two internally (slide vs. emit older_history_requested);
+        # the gate just needs to give it a chance to run.
+        if value <= edge_px and (
+            self._window_start > 0 or self._loaded_offset > 0
+        ):
             self._slide_window_up()
         elif (max_value - value) <= edge_px and self._window_end < len(self._all_blocks):
             self._slide_window_down()
@@ -3449,6 +4425,10 @@ class _SessionDetailPanel(QFrame):
         instead of reading child widgets during paint; that avoids stale
         zero-y geometry while Qt is still settling complex QTextEdit bubbles.
         """
+        with _perf_timer("ui.detail_panel.refresh_minimap"):
+            self._refresh_minimap_impl()
+
+    def _refresh_minimap_impl(self) -> None:
         layout = self._timeline_container.layout()
         if layout is not None:
             layout.activate()
@@ -3503,8 +4483,13 @@ class _SessionDetailPanel(QFrame):
             names = ", ".join(_uniq_tool_names(payload, limit=2))
             return f"Tool: {names}" if names else self._translator("Tool calls")
         if payload.type == "message:user":
-            text = (payload.text or "").strip()
-            return text[:80] if text else self._translator("User prompt")
+            # Slice the head BEFORE strip(): on sessions with multi-MB pasted
+            # user messages, ``payload.text.strip()`` allocates the full text
+            # per call, and _refresh_minimap calls this for every block in the
+            # current window on every scroll throttle — turning a single
+            # window slide into hundreds of MB of churn and a UI hang.
+            head = (payload.text or "")[:256].strip()
+            return head[:80] if head else self._translator("User prompt")
         if payload.type == "message:assistant":
             return self._translator("Assistant message")
         return f"Tool: {payload.tool_name or 'unknown_tool'}"
@@ -3867,12 +4852,18 @@ class _BubbleFrame(QFrame):
 
 
 _BubbleFrame._SURFACES = {
-    "user": (_qcolor_from_token(PRIMARY_GHOST), _qcolor_from_token(PRIMARY_TINT)),
+    # Border bumped from PRIMARY_TINT (alpha 64) → PRIMARY_BAND
+    # (alpha 130) so the user bubble carries the same outline weight
+    # as the "Current Account" card in qt_app.py (PRIMARY_GHOST fill +
+    # PRIMARY_BAND border) and the env-tab :checked state — every
+    # "this is mine / this is highlighted" surface uses the same pair
+    # per CLAUDE.md UI principle 1.
+    "user": (_qcolor_from_token(PRIMARY_GHOST), _qcolor_from_token(PRIMARY_BAND)),
     "assistant": (
         _qcolor_from_token(SURFACE_PANEL),
         _qcolor_from_token(SURFACE_PANEL_BORDER),
     ),
-    "tool": (_qcolor_from_token(WARM_GHOST), _qcolor_from_token(WARM_TINT)),
+    "tool": (_qcolor_from_token(TOOL_GHOST), _qcolor_from_token(TOOL_TINT)),
     "environment": (_qcolor_from_token(SLATE_GHOST), _qcolor_from_token(SLATE_TINT)),
 }
 
@@ -3932,6 +4923,11 @@ def _parse_environment_context(text: str) -> dict[str, str] | None:
     """
     if not text:
         return None
+    # Probe the head before any full-string copy. The wrapper is always at
+    # the very start; a multi-MB pasted user message that doesn't open with
+    # the wrapper bails out without allocating a multi-MB copy via strip().
+    if not text[:256].lstrip().startswith(_ENVIRONMENT_CONTEXT_OPEN):
+        return None
     stripped = text.strip()
     if not (
         stripped.startswith(_ENVIRONMENT_CONTEXT_OPEN)
@@ -3970,9 +4966,7 @@ class _EnvironmentContextBubble(_BubbleFrame):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        # Shell icon ties the chip directly to the content (cwd + shell are
-        # what the env block is about — terminal state).
-        role_icon = _make_chip_icon(_shell_icon())
+        role_icon = _make_chip_icon(_environment_icon())
         role_label = QLabel("Environment")
         role_label.setObjectName("SessionsBubbleRole")
         role_label.setProperty("role", "environment")
@@ -4266,6 +5260,27 @@ def _uniq_tool_names(items: list[SessionTimelineItem], *, limit: int) -> list[st
     return seen
 
 
+def _describe_block_for_perf(block: Any) -> str:
+    """Compact one-line description of a block for perf logs. Used by the
+    pre-construction marker so a hang inside a single bubble is pinpointable
+    by the size of its content."""
+    kind, payload = block
+    if kind == "tool_group":
+        total = 0
+        for it in payload:
+            total += len(getattr(it, "input", "") or "")
+            total += len(getattr(it, "output", "") or "")
+        return f"tool_group/n={len(payload)}/chars={total}"
+    item_type = getattr(payload, "type", "")
+    if item_type in ("message:user", "message:assistant"):
+        return f"{item_type}/chars={len(getattr(payload, 'text', '') or '')}"
+    if item_type == "tool_call":
+        in_n = len(getattr(payload, "input", "") or "")
+        out_n = len(getattr(payload, "output", "") or "")
+        return f"tool_call/{getattr(payload, 'tool_name', '?')}/in={in_n}/out={out_n}"
+    return item_type or "?"
+
+
 def _coalesce_timeline_blocks(items: list[SessionTimelineItem]) -> list[Any]:
     """Group consecutive tool_call items into ('tool_group', [items]) blocks.
     Single tool calls (and isolated runs shorter than _TOOL_GROUP_MIN) stay
@@ -4388,6 +5403,21 @@ def _copy_to_clipboard(text: str) -> None:
     clipboard = QGuiApplication.clipboard()
     if clipboard is not None:
         clipboard.setText(text)
+
+
+def _asset_path(name: str) -> Path:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    candidates: list[Path] = []
+    if bundle_root:
+        root = Path(bundle_root)
+        candidates.extend([root / "codex_quota_viewer" / "assets" / name, root / "assets" / name])
+    candidates.append(Path(__file__).resolve().parent / "assets" / name)
+    return next((path for path in candidates if path.exists()), candidates[-1])
+
+
+def _asset_icon(name: str) -> QIcon:
+    path = _asset_path(name)
+    return QIcon(str(path)) if path.exists() else QIcon()
 
 
 def _search_session_icon() -> QIcon:
@@ -4519,19 +5549,22 @@ def _restore_icon() -> QIcon:
 
 
 def _purge_icon() -> QIcon:
-    """Lucide Flame — permanent / irreversible delete.
+    """Lucide X — permanent / irreversible delete.
 
     Stroke is the danger-red ``#FF6961`` (matching ``QPushButton[danger="true"]``
     in qt_app.py's stylesheet) instead of the icon library's default
     ``#c6d3e1``. This icon is purpose-built for the Purge button, where
-    light-grey strokes would clash with the red button text.
+    light-grey strokes would clash with the red button text. The X is drawn
+    with a slightly larger inner box than Lucide's default so its visual
+    footprint aligns with the neighboring toolbar icons.
     """
     return _icon_from_svg(
         """
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
           <g fill="none" stroke="#FF6961" stroke-width="2.25"
              stroke-linecap="round" stroke-linejoin="round">
-            <path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>
+            <path d="M20 4 4 20"/>
+            <path d="M4 4 20 20"/>
           </g>
         </svg>
         """
@@ -4564,6 +5597,26 @@ def _shell_icon() -> QIcon:
             <rect x="3" y="3" width="18" height="18" rx="2"/>
             <path d="m7 11 2-2-2-2"/>
             <path d="M11 13h4"/>
+          </g>
+        </svg>
+        """
+    )
+
+
+def _environment_icon() -> QIcon:
+    """Environment context icon loaded from assets/environment.svg."""
+    icon = _asset_icon("environment.svg")
+    if not icon.isNull():
+        return icon
+    return _icon_from_svg(
+        """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 29.999834 26">
+          <g fill="none" stroke="#ffffff" stroke-width="4"
+             stroke-linecap="round" stroke-linejoin="round"
+             transform="translate(-1.0000828,-3)">
+            <polyline points="10 9 3 16 10 23"/>
+            <line x1="14" y1="27" x2="18" y2="5"/>
+            <polyline points="22 9 29 16 22 23"/>
           </g>
         </svg>
         """
@@ -4997,6 +6050,15 @@ def _icon_from_svg(svg: str, *, logical_size: int = 22) -> QIcon:
     return icon
 
 
+# Hard cap on text passed to the QTextDocument. Beyond ~100KB of unbroken
+# text Qt's word-wrap / markdown engines go quadratic and the UI thread
+# hangs on a single bubble — observed on sessions containing multi-MB
+# pasted file contents (e.g. a 14MB single-line message). 64K chars
+# keeps prose messages intact and forces obvious dumps to be truncated
+# with a visible marker.
+_MAX_RICH_BODY_CHARS = 64 * 1024
+
+
 class _RichBody(QTextEdit):
     """Read-only QTextEdit configured to render bubble bodies inline:
     transparent background, no frame, no scrollbars, content-tight height,
@@ -5037,10 +6099,32 @@ class _RichBody(QTextEdit):
         # add a closing block during HTML normalisation even on stripped
         # input).
         text = (text or "").rstrip()
-        if _looks_like_markdown(text):
-            self.setMarkdown(text)
-        else:
+        # Cap pathological message sizes BEFORE any per-character work.
+        # Codex sessions occasionally contain multi-megabyte messages
+        # (pasted file dumps, screenshot base64). _looks_like_markdown's
+        # `any(marker in text)` scan and Qt's setMarkdown / setPlainText
+        # both go quadratic on multi-MB single-line text and hang the UI
+        # thread. 64K chars is generous for legitimate prose while keeping
+        # the text engine interactive.
+        if len(text) > _MAX_RICH_BODY_CHARS:
+            original_len = len(text)
+            text = (
+                text[:_MAX_RICH_BODY_CHARS]
+                + f"\n\n... [truncated for display: showing first "
+                f"{_MAX_RICH_BODY_CHARS:,} of {original_len:,} chars] ..."
+            )
+        # Force plain text when the source has a truncation marker. Codex's
+        # response_item messages are clamped to 180 chars by the parser
+        # (``_truncate_message``), and the cut routinely falls inside a
+        # markdown table or an unclosed `` ``` `` fence. Qt's setMarkdown on
+        # such malformed input goes pathological — observed as a UI hang on
+        # a 180-char assistant bubble. The trailing "..." that the truncator
+        # appends is the unambiguous signal that we cannot trust the markdown
+        # structure to be balanced.
+        if text.endswith("...") or not _looks_like_markdown(text):
             self.setPlainText(text)
+        else:
+            self.setMarkdown(text)
         self._trim_trailing_empty_blocks()
         cursor = QTextCursor(self.document())
         cursor.select(QTextCursor.Document)
@@ -5225,19 +6309,17 @@ QFrame#SessionsSearchPopup {{
     border: 1px solid {SURFACE_FROSTED_BORDER};
     border-radius: 12px;
 }}
-/* Status filter trigger — peer of the search button on the list-header
-   strip. Cloned from QPushButton#SessionsDetailFilterButton; we use a
-   distinct objectName because that rule is scoped to the detail-panel
-   surface (per CLAUDE.md note about per-surface objectName scoping).
-   Padding sized so the trigger lines up with the 40x40 search button. */
+/* Status filter trigger — icon-only chip, peer of the search button on
+   the list-header strip. Distinct objectName from the detail-panel
+   ``SessionsDetailFilterButton`` because that rule is scoped to the
+   detail-panel surface (per CLAUDE.md note about per-surface objectName
+   scoping). Geometry mirrors ``SessionsSearchButton`` so the two
+   toolbar chips render as one family. */
 QPushButton#SessionsListFilterButton {{
     background: rgba(255, 255, 255, 18);
     border: 1px solid rgba(255, 255, 255, 30);
     border-radius: 8px;
-    color: rgba(235, 235, 245, 220);
-    padding: 8px 14px;
-    font-size: 12px;
-    text-align: left;
+    padding: 0;
 }}
 QPushButton#SessionsListFilterButton:hover {{
     background: rgba(255, 255, 255, 32);
@@ -5250,7 +6332,6 @@ QPushButton#SessionsListFilterButton:pressed {{
 QPushButton#SessionsListFilterButton[hasActiveFilter="true"] {{
     background: {PRIMARY_GHOST};
     border-color: {PRIMARY_BAND};
-    color: #ffffff;
 }}
 /* Status filter popover row buttons — one per status. ``[active="true"]``
    marks the currently-applied filter with the same PRIMARY_GHOST +
@@ -5373,10 +6454,18 @@ QPushButton#SessionsEnvTab {{
     background: rgba(255, 255, 255, 14);
     border: 1px solid rgba(255, 255, 255, 28);
     color: rgba(220, 226, 236, 200);
-    padding: 9px 18px;
+    /* Sized as a peer of the 36x36 search/filter chips. Height is fixed
+       via min/max-height; width comes from the natural text + padding
+       (Sandbox/Real are both 4-char labels, so they balance naturally).
+       Equal-width is enforced from Python via setMinimumWidth on each
+       button — QSS min-width is a paint-time hint, not honored by
+       QHBoxLayout, and using it caused the two tabs to overlap when
+       the panel was narrow. */
+    padding: 0 14px;
     font-size: 13px;
     font-weight: 600;
-    min-height: 32px;
+    min-height: 36px;
+    max-height: 36px;
 }}
 QPushButton#SessionsEnvTab[position="first"] {{
     border-top-left-radius: 8px;
@@ -5571,8 +6660,12 @@ QPushButton#SessionsDetailToolbarSegment:hover {{
     background: rgba(255, 255, 255, 28);
 }}
 QPushButton#SessionsDetailToolbarSegment:checked {{
-    background: {PRIMARY_BAND};
-    border-color: {PRIMARY_STRONG};
+    /* Same selected-state pair as ``SessionsEnvTab:checked`` (and
+       NavButton, current-card, selected table row) per CLAUDE.md UI
+       principle 1 — every "this is selected" surface in the app uses
+       PRIMARY_GHOST fill + PRIMARY_BAND border. */
+    background: {PRIMARY_GHOST};
+    border-color: {PRIMARY_BAND};
     color: #ffffff;
 }}
 
@@ -5733,7 +6826,11 @@ QLabel#SessionsBubbleRole[role="assistant"] {{
     background: rgba(255, 255, 255, 40);
 }}
 QLabel#SessionsBubbleRole[role="tool"] {{
-    background: rgba(220, 160, 80, 130);
+    /* Darker gray than TOOL_GHOST/TOOL_TINT (which sit at alpha 28/96
+       for the bubble surface) so the 11px chip reads cleanly with the
+       parent rule's white text — matches the other role chips, which
+       all keep white text on a darker fill. */
+    background: rgba(120, 128, 142, 180);
 }}
 QLabel#SessionsBubbleRole[role="environment"] {{
     background: rgba(130, 160, 200, 110);

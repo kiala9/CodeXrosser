@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from ._perf import _perf_timer
 from .models import (
     AuditEntry,
     CatalogSessionEntry,
@@ -46,6 +47,32 @@ SESSION_SELECT_COLUMNS = """
 """
 
 
+SESSION_SELECT_COLUMNS_QUALIFIED = """
+    sessions.id as id,
+    coalesce(sessions.active_path, sessions.archive_path, sessions.snapshot_path) as filePath,
+    sessions.active_path as activePath,
+    sessions.archive_path as archivePath,
+    sessions.snapshot_path as snapshotPath,
+    sessions.original_relative_path as originalRelativePath,
+    sessions.cwd as cwd,
+    sessions.started_at as startedAt,
+    sessions.originator as originator,
+    sessions.source as source,
+    sessions.cli_version as cliVersion,
+    sessions.model_provider as modelProvider,
+    sessions.size_bytes as sizeBytes,
+    sessions.line_count as lineCount,
+    sessions.event_count as eventCount,
+    sessions.tool_call_count as toolCallCount,
+    sessions.user_prompt_excerpt as userPromptExcerpt,
+    sessions.latest_agent_message_excerpt as latestAgentMessageExcerpt,
+    sessions.status as status,
+    sessions.created_at as created_at,
+    sessions.updated_at as updated_at,
+    sessions.indexed_at as indexed_at
+"""
+
+
 class SessionRepository:
     def __init__(self, database_path: Path):
         self.database_path = Path(database_path)
@@ -81,22 +108,23 @@ class SessionRepository:
 
     def replace_catalog(self, entries: list[CatalogSessionEntry]) -> list[SessionRecord]:
         indexed_at = _now_iso()
-        with self._lock, self._transaction():
-            existing = self._read_all_session_rows()
-            self._connection.execute("delete from timeline_items")
-            self._connection.execute("delete from sessions")
-            self._clear_session_search()
-            for entry in entries:
-                prior = existing.get(entry.summary.id)
-                created_at = prior["created_at"] if prior else indexed_at
-                updated_at = (
-                    prior["updated_at"]
-                    if prior and not _did_catalog_entry_change(prior, entry)
-                    else indexed_at
-                )
-                self._insert_session(entry, created_at=created_at, updated_at=updated_at, indexed_at=indexed_at)
-                self._insert_session_search(entry)
-                self._insert_timeline_items(entry)
+        with _perf_timer("repository.replace_catalog", entries=len(entries)):
+            with self._lock, self._transaction():
+                existing = self._read_all_session_rows()
+                self._connection.execute("delete from timeline_items")
+                self._connection.execute("delete from sessions")
+                self._clear_session_search()
+                for entry in entries:
+                    prior = existing.get(entry.summary.id)
+                    created_at = prior["created_at"] if prior else indexed_at
+                    updated_at = (
+                        prior["updated_at"]
+                        if prior and not _did_catalog_entry_change(prior, entry)
+                        else indexed_at
+                    )
+                    self._insert_session(entry, created_at=created_at, updated_at=updated_at, indexed_at=indexed_at)
+                    self._insert_session_search(entry)
+                    self._insert_timeline_items(entry)
         return self.list_sessions()
 
     def save_catalog_entry(self, entry: CatalogSessionEntry) -> SessionRecord:
@@ -270,6 +298,52 @@ class SessionRepository:
         next_offset = normalized_offset + limit if normalized_offset + limit < total else None
         return SessionTimelinePage(items=items, total=total, next_offset=next_offset)
 
+    def list_timeline_tail(
+        self,
+        session_id: str,
+        *,
+        limit: int = 200,
+    ) -> SessionTimelinePage:
+        # Most-recent ``limit`` items in ascending ordinal order. Chat
+        # sessions are read tail-first, so seeding the detail panel with
+        # the tail keeps detail-open cost bounded by ``limit`` regardless
+        # of session size — instead of paying O(N) for the full timeline
+        # to dedup and ferry across the SQLite/Python boundary.
+        normalized_limit = max(1, int(limit))
+        total_row = self._connection.execute(
+            "select count(*) as count from timeline_items where session_id = ?",
+            (session_id,),
+        ).fetchone()
+        total = int(total_row["count"] if total_row else 0)
+        if total <= 0:
+            return SessionTimelinePage(items=[], total=0, next_offset=None)
+        offset = max(0, total - normalized_limit)
+        rows = self._connection.execute(
+            """
+            select item_id, type, timestamp, text, tool_name, summary,
+                   input_text, output_text, status
+            from timeline_items
+            where session_id = ?
+            order by ordinal asc
+            limit ? offset ?
+            """,
+            (session_id, normalized_limit, offset),
+        ).fetchall()
+        items = [_map_timeline_row(row) for row in rows]
+        return SessionTimelinePage(items=items, total=total, next_offset=None)
+
+    def count_timeline_items(self, session_id: str) -> int:
+        # Single-row count used by the detail panel's tab-switch
+        # freshness check: comparing against panel._timeline_total tells
+        # us whether the displayed slice is still consistent with the
+        # repository (rescan may have rewritten timeline_items while
+        # the user was on another tab).
+        row = self._connection.execute(
+            "select count(*) as count from timeline_items where session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
     def list_audit_entries(self, session_id: str) -> list[AuditEntry]:
         rows = self._connection.execute(
             """
@@ -365,14 +439,14 @@ class SessionRepository:
     def _list_sessions_with_fts(self, filters: SessionFilters) -> list[SessionRecord]:
         if not self.fts_available:
             raise sqlite3.Error("session_search FTS unavailable")
-        clause, params = _build_session_filter_clause(filters)
+        clause, params = _build_session_filter_clause(filters, table="sessions")
         rows = self._connection.execute(
             f"""
-            select {SESSION_SELECT_COLUMNS}
+            select {SESSION_SELECT_COLUMNS_QUALIFIED}
             from sessions
             inner join session_search on session_search.session_id = sessions.id
             where {clause} and session_search match :query
-            order by started_at desc, id asc
+            order by sessions.started_at desc, sessions.id asc
             """,
             {**params, "query": filters.query or ""},
         ).fetchall()
@@ -640,18 +714,21 @@ def _timeline_item_to_params(session_id: str, ordinal: int, item: SessionTimelin
     )
 
 
-def _build_session_filter_clause(filters: SessionFilters) -> tuple[str, dict[str, Any]]:
+def _build_session_filter_clause(
+    filters: SessionFilters, *, table: str | None = None
+) -> tuple[str, dict[str, Any]]:
     clauses = ["1 = 1"]
     params: dict[str, Any] = {}
+    prefix = f"{table}." if table else ""
     if filters.status:
         if filters.status == "archived":
-            clauses.append("(status = :status or status = 'restorable')")
+            clauses.append(f"({prefix}status = :status or {prefix}status = 'restorable')")
             params["status"] = filters.status
         else:
-            clauses.append("status = :status")
+            clauses.append(f"{prefix}status = :status")
             params["status"] = filters.status
     if filters.cwd:
-        clauses.append("cwd = :cwd")
+        clauses.append(f"{prefix}cwd = :cwd")
         params["cwd"] = filters.cwd
     return " and ".join(clauses), params
 

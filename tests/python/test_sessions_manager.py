@@ -12,8 +12,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src" / "CodexQuotaViewerWindows.Qt"))
 
 from codex_quota_viewer.sessions import (  # noqa: E402
+    CatalogSessionEntry,
     SessionError,
+    SessionFileSummary,
     SessionFilters,
+    SessionTimelineItem,
     SessionsManager,
 )
 from codex_quota_viewer.sessions.helpers import build_fallback_relative_path  # noqa: E402
@@ -111,6 +114,48 @@ def _make_homes(tmp_path: Path) -> tuple[Path, Path]:
     return codex_home, manager_home
 
 
+def _catalog_entry(
+    *,
+    session_id: str,
+    cwd: str,
+    user_prompt_excerpt: str = "hello world",
+    latest_agent_message_excerpt: str = "general kenobi",
+    timeline: list[SessionTimelineItem] | None = None,
+) -> CatalogSessionEntry:
+    started_at = "2026-01-15T10:00:00Z"
+    items = timeline or [
+        SessionTimelineItem(
+            id=f"{session_id}-user",
+            type="message:user",
+            timestamp=started_at,
+            text=user_prompt_excerpt,
+        )
+    ]
+    return CatalogSessionEntry(
+        summary=SessionFileSummary(
+            id=session_id,
+            cwd=cwd,
+            started_at=started_at,
+            originator="vscode",
+            source="vscode",
+            cli_version="0.42.0",
+            model_provider="openai",
+            size_bytes=123,
+            line_count=len(items) + 1,
+            event_count=len(items),
+            tool_call_count=sum(1 for item in items if item.type == "tool_call"),
+            user_prompt_excerpt=user_prompt_excerpt,
+            latest_agent_message_excerpt=latest_agent_message_excerpt,
+        ),
+        timeline=items,
+        active_path=None,
+        archive_path=None,
+        snapshot_path=None,
+        original_relative_path=None,
+        status="active",
+    )
+
+
 def test_sessions_repository_schema_matches_vendor_codexmm(tmp_path: Path) -> None:
     repo = SessionRepository(tmp_path / "index.db")
     try:
@@ -165,6 +210,73 @@ def test_sessions_repository_schema_matches_vendor_codexmm(tmp_path: Path) -> No
             connection.close()
     finally:
         repo.close()
+
+
+def test_sessions_fts_search_qualifies_join_columns(tmp_path: Path) -> None:
+    codex_home, manager_home = _make_homes(tmp_path)
+    cwd = str(tmp_path / "project_fts")
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id="fts-session",
+                    cwd=cwd,
+                    user_prompt_excerpt="needle prompt",
+                )
+            ]
+        )
+
+        records = manager.repository._list_sessions_with_fts(
+            SessionFilters(query="needle", status="active", cwd=cwd)
+        )
+
+        assert [record.id for record in records] == ["fts-session"]
+    finally:
+        manager.close()
+
+
+def test_sessions_timeline_page_preserves_total_after_dedupe(tmp_path: Path) -> None:
+    codex_home, manager_home = _make_homes(tmp_path)
+    session_id = "timeline-session"
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id=session_id,
+                    cwd=str(tmp_path / "project_timeline"),
+                    timeline=[
+                        SessionTimelineItem(
+                            id="user-1",
+                            type="message:user",
+                            timestamp="2026-01-15T10:00:00Z",
+                            text="same text",
+                        ),
+                        SessionTimelineItem(
+                            id="user-2",
+                            type="message:user",
+                            timestamp="2026-01-15T10:00:01Z",
+                            text="same text",
+                        ),
+                        SessionTimelineItem(
+                            id="assistant-1",
+                            type="message:assistant",
+                            timestamp="2026-01-15T10:00:02Z",
+                            text="reply",
+                        ),
+                    ],
+                )
+            ]
+        )
+
+        page = manager.get_session_timeline_page(session_id, offset=0, limit=10)
+
+        assert [item.id for item in page.items] == ["user-1", "assistant-1"]
+        assert page.total == 3
+        assert page.next_offset is None
+    finally:
+        manager.close()
 
 
 def test_sessions_rescan_indexes_active_and_archived_jsonl(tmp_path: Path) -> None:

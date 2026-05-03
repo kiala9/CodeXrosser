@@ -324,6 +324,14 @@ class TitleBar(QFrame):
         layout.addLayout(self._nav_layout)
         layout.addStretch(1)
 
+        # Slot for the inline status pill (replaces the old bottom-of-window
+        # toast). Sits centered in the empty band between nav and utility.
+        # The pill itself is built by MainWindow and inserted via
+        # ``add_status_pill``; until then this index is just an empty stretch.
+        self._status_slot_index = layout.count()
+        self._status_pill: QWidget | None = None
+        layout.addStretch(1)
+
         self._utility_layout = QHBoxLayout()
         self._utility_layout.setContentsMargins(0, 0, 8, 0)
         self._utility_layout.setSpacing(4)
@@ -344,6 +352,20 @@ class TitleBar(QFrame):
 
     def add_utility_button(self, button: QPushButton) -> None:
         self._utility_layout.addWidget(button)
+
+    def add_status_pill(self, pill: QWidget) -> None:
+        """Mount the inline status notification pill in the title bar.
+
+        The pill sits in the empty horizontal band between the nav tabs
+        and the utility cluster (language + min/max/close), centered by
+        the surrounding ``addStretch(1)`` calls in ``__init__``.
+        """
+        layout = self.layout()
+        if self._status_pill is not None and self._status_pill is not pill:
+            self._status_pill.setParent(None)
+        self._status_pill = pill
+        pill.setParent(self)
+        layout.insertWidget(self._status_slot_index, pill, 0, Qt.AlignVCenter)
 
     def _caption_button(self, text: str, kind: str = "default") -> QPushButton:
         button = CaptionButton(kind)
@@ -382,6 +404,48 @@ class TitleBar(QFrame):
         super().mouseDoubleClickEvent(event)
 
 
+class _ElidedLabel(QLabel):
+    """QLabel that elides its text with a right ellipsis when its
+    rendered width is too small to fit the full string. Tracks the
+    original text separately so the elision recomputes cleanly on
+    every resize. Used by StatusBanner so long status messages stay
+    on a single visible line (the full text lives in the tooltip and,
+    when extra detail is available, the details popover)."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._full_text = ""
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt naming
+        self._full_text = text or ""
+        self._sync_elided()
+
+    def fullText(self) -> str:  # noqa: N802 - Qt naming
+        return self._full_text
+
+    def text(self) -> str:
+        return self._full_text
+
+    def clear(self) -> None:
+        self._full_text = ""
+        super().clear()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._sync_elided()
+
+    def _sync_elided(self) -> None:
+        if not self._full_text:
+            super().setText("")
+            return
+        metrics = self.fontMetrics()
+        # Subtract a small slack so wrapped layouts (e.g. label inside
+        # a pill with extra controls) don't fight the ellipsis on the
+        # last pixel.
+        avail = max(0, self.width() - 2)
+        super().setText(metrics.elidedText(self._full_text, Qt.ElideRight, avail))
+
+
 class StatusBanner(QFrame):
     """A pill-shaped notification row with severity-driven color + icon."""
 
@@ -403,10 +467,13 @@ class StatusBanner(QFrame):
         self._icon.setAlignment(Qt.AlignCenter)
         self._icon.setAttribute(Qt.WA_StyledBackground, True)
         self._icon.setAutoFillBackground(False)
-        self._text = QLabel(self)
+        # ``_ElidedLabel`` keeps the message on a single line and
+        # appends an ellipsis when the available pill width is shorter
+        # than the message's natural width. The full text remains
+        # accessible via tooltip + the details popover.
+        self._text = _ElidedLabel(self)
         self._text.setObjectName("StatusText")
-        self._text.setWordWrap(True)
-        self._text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+        self._text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._text.setMinimumWidth(0)
         self._text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self._icon, 0, Qt.AlignVCenter)
@@ -531,6 +598,57 @@ class StatusPopupFrame(QFrame):
         target.setCompositionMode(QPainter.CompositionMode_Source)
         target.drawImage(0, 0, buffer)
         target.end()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
+        # Absorb double-click events on the pill's empty padding so they
+        # don't bubble up to the parent ``TitleBar``'s
+        # ``mouseDoubleClickEvent`` (which toggles maximize). Children
+        # of the pill — e.g. StatusBanner, the close/details buttons —
+        # still process their own double-clicks first; only the
+        # leftover empty area lands here. Pressing or dragging still
+        # propagates so the user can drag the window from the pill.
+        event.accept()
+
+
+class StatusDetailsPopup(StatusPopupFrame):
+    """Frosted-glass dropdown anchored under the title-bar status pill,
+    exposing the full cleaned message text. Mirrors the search/filter
+    popup pattern from sessions_page (top-level Qt.Tool window with a
+    custom paintEvent) so all three frosted popovers feel like the
+    same UI primitive. ESC and click-outside dismiss."""
+
+    dismiss_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None):
+        # Build the window flag set ourselves because the base class's
+        # ``as_window=True`` path also installs ``WindowDoesNotAcceptFocus``
+        # / ``Qt.NoFocus``, which would block ESC-to-dismiss.
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setProperty("severity", "info")
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.key() == Qt.Key_Escape:
+            event.accept()
+            self.dismiss_requested.emit()
+            return
+        super().keyPressEvent(event)
+
+    def event(self, event) -> bool:
+        # Click-outside dismissal: when the popup loses window focus the
+        # user has clicked elsewhere, so dismiss without spawning a
+        # separate transparent click-catcher.
+        if event.type() == QEvent.WindowDeactivate and self.isVisible():
+            self.dismiss_requested.emit()
+        return super().event(event)
 
 
 class QuotaRingWidget(QWidget):
@@ -797,9 +915,16 @@ class ConfirmPhraseDialog(FramelessDialog):
 
 
 class MainWindow(QMainWindow):
-    _STATUS_POPUP_MARGIN = 12
-    _STATUS_POPUP_HEIGHT = 52
-    _STATUS_POPUP_MIN_WIDTH = 360
+    # Inline pill geometry (lives in the title bar). The width band is
+    # sized so the pill reads coherently with the 3 nav-tab buttons
+    # (~210px total) — wider than nav (carries a sentence, not a label)
+    # but capped well below the empty band (~900px at 1280px window)
+    # so the pill never dominates the title bar. Long messages elide
+    # with ellipsis at the visible width; the details popover (anchored
+    # below the pill) exposes the full text.
+    _STATUS_PILL_MIN_WIDTH = 320
+    _STATUS_PILL_MAX_WIDTH = 520
+    _STATUS_PILL_HEIGHT = 40
     _STATUS_AUTO_HIDE_MS = {
         "success": 7_000,
         "info": 9_000,
@@ -832,7 +957,6 @@ class MainWindow(QMainWindow):
         self._audit_table_height = 224
         self._fade_animation: QPropertyAnimation | None = None
         self._resize_material_suspended = False
-        self._status_popup_material_installed = False
         self.quota_timer = QTimer(self)
         self.quota_timer.setInterval(30_000)
         self.quota_timer.timeout.connect(self._auto_refresh_quota)
@@ -954,6 +1078,7 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(0)
 
         title_bar = TitleBar(self)
+        self.title_bar = title_bar
         self.nav_buttons: dict[str, QPushButton] = {}
         for name in ["Accounts", "Sessions", "Settings"]:
             button = QPushButton(self._tr(name))
@@ -1006,51 +1131,82 @@ class MainWindow(QMainWindow):
         self.scroll.setWidget(self.body)
         content_layout.addWidget(self.scroll, 1)
 
+        # Inline status pill — lives in the title bar's empty band between
+        # the nav tabs and the utility cluster (language + min/max/close).
+        # Three controls:
+        #   1. ``status_banner`` — severity icon + elided one-line text
+        #   2. ``details_button`` (▾) — opens ``status_details_popup``
+        #      with the full cleaned text; visible only when the cleaned
+        #      text contains more than the one-line summary
+        #   3. ``status_close_button`` (×) — explicit dismiss, replaces
+        #      the older double-click-to-dismiss UX (which collided with
+        #      the title bar's double-click-to-maximize handler).
         self.status_banner = StatusBanner()
         self.status_banner.setToolTip(self._tr("Status notification tooltip"))
         self.status_banner.setToolTipDuration(12_000)
         self.status_banner.dismiss_requested.connect(self.clear_status)
 
-        self.details_button = QPushButton(self._details_button_text(False))
-        self.details_button.setObjectName("DetailsToggle")
-        self.details_button.setCursor(Qt.PointingHandCursor)
+        self.details_button = QPushButton("▾")
+        self.details_button.setObjectName("StatusDetailsButton")
         self.details_button.setCheckable(True)
+        self.details_button.setCursor(Qt.PointingHandCursor)
         self.details_button.setFlat(True)
+        self.details_button.setFocusPolicy(Qt.NoFocus)
+        self.details_button.setFixedSize(24, 24)
         self.details_button.setToolTip(self._tr("Details tooltip"))
         self.details_button.setToolTipDuration(12_000)
         self.details_button.toggled.connect(self._toggle_details)
         self.details_button.hide()
 
-        self.status_footer = StatusPopupFrame(self, as_window=True)
+        self.status_close_button = QPushButton("✕")
+        self.status_close_button.setObjectName("StatusCloseButton")
+        self.status_close_button.setCursor(Qt.PointingHandCursor)
+        self.status_close_button.setFlat(True)
+        self.status_close_button.setFocusPolicy(Qt.NoFocus)
+        self.status_close_button.setFixedSize(24, 24)
+        self.status_close_button.setToolTip(self._tr("Dismiss tooltip"))
+        self.status_close_button.setToolTipDuration(12_000)
+        self.status_close_button.clicked.connect(self.clear_status)
+
+        self.status_footer = StatusPopupFrame(title_bar, as_window=False)
         self.status_footer.setObjectName("StatusFooter")
         self.status_footer.setProperty("severity", "info")
-        self.status_footer.set_native_acrylic(True)
+        self.status_footer.setMinimumWidth(self._STATUS_PILL_MIN_WIDTH)
+        self.status_footer.setMaximumWidth(self._STATUS_PILL_MAX_WIDTH)
+        self.status_footer.setFixedHeight(self._STATUS_PILL_HEIGHT)
 
-        status_layout = QVBoxLayout(self.status_footer)
-        status_layout.setContentsMargins(0, 0, 0, 0)
-        status_layout.setSpacing(0)
-        status_row = QWidget(self.status_footer)
-        status_row.setObjectName("StatusRow")
-        row_layout = QHBoxLayout(status_row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(0)
-        row_layout.addWidget(self.status_banner, 1)
-        row_layout.addWidget(self.details_button, 0, Qt.AlignVCenter)
-        status_layout.addWidget(status_row)
+        status_layout = QHBoxLayout(self.status_footer)
+        status_layout.setContentsMargins(0, 0, 8, 0)
+        status_layout.setSpacing(2)
+        status_layout.addWidget(self.status_banner, 1)
+        status_layout.addWidget(self.details_button, 0, Qt.AlignVCenter)
+        status_layout.addWidget(self.status_close_button, 0, Qt.AlignVCenter)
 
-        self.details_panel = QTextEdit(self.status_footer)
+        # Details popover — a frosted-glass dropdown anchored under the
+        # pill exposing the full cleaned message text. Hidden by
+        # default; shown when ``details_button`` is checked.
+        self.status_details_popup = StatusDetailsPopup(self)
+        self.status_details_popup.setObjectName("StatusDetailsPopup")
+        self.status_details_popup.dismiss_requested.connect(
+            self._dismiss_details_popover
+        )
+        self._status_details_popup_chrome_installed = False
+        details_popup_layout = QVBoxLayout(self.status_details_popup)
+        details_popup_layout.setContentsMargins(14, 12, 14, 12)
+        details_popup_layout.setSpacing(0)
+        self.details_panel = QTextEdit(self.status_details_popup)
         self.details_panel.setObjectName("DetailsPanel")
         self.details_panel.setReadOnly(True)
         self.details_panel.setFrameShape(QFrame.NoFrame)
         self.details_panel.setAttribute(Qt.WA_TranslucentBackground, True)
         self.details_panel.viewport().setAutoFillBackground(False)
         self.details_panel.viewport().setStyleSheet("background: transparent;")
-        self.details_panel.setMaximumHeight(180)
-        self.details_panel.hide()
-        status_layout.addWidget(self.details_panel)
-        self._raw_status: str = ""
+        details_popup_layout.addWidget(self.details_panel)
+        self.status_details_popup.hide()
 
+        self._raw_status: str = ""
         self.status_footer.hide()
+        title_bar.add_status_pill(self.status_footer)
         root_layout.addWidget(content, 1)
         self.setCentralWidget(root)
         self._apply_style()
@@ -1321,13 +1477,14 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
             }
             /* Status banner (severity-driven notification) ------------ */
+            /* The pill (#StatusFooter) lives inline in the title bar.
+               Frame chrome is painted by StatusPopupFrame.paintEvent;
+               the QSS rule keeps the frame transparent so the painted
+               surface shows through. */
             QFrame#StatusFooter {
                 background: transparent;
                 border-radius: 0;
                 border: 0;
-            }
-            QWidget#StatusRow {
-                background: transparent;
             }
             QFrame#StatusBanner {
                 background: transparent;
@@ -1350,38 +1507,47 @@ class MainWindow(QMainWindow):
             QLabel#StatusIcon[severity="info"] { background: #0A84FF; }
             QLabel#StatusIcon[severity="warning"] { background: #FFD60A; color: #14181f; }
             QLabel#StatusIcon[severity="error"] { background: #FF453A; }
-            QPushButton#DetailsToggle {
+            /* Pill-end controls: small flat buttons that share the
+               same neutral-on-hover, brighter-on-active rhythm. The
+               details chevron uses ``[checked]`` to show the popover
+               is open; the close button always reads as a dismiss. */
+            QPushButton#StatusDetailsButton,
+            QPushButton#StatusCloseButton {
                 background: transparent;
                 border: 0;
-                border-left: 1px solid rgba(255, 255, 255, 26);
-                border-radius: 0;
+                border-radius: 6px;
                 color: rgba(235, 235, 245, 153);
-                padding: 0 14px;
-                font-size: 12px;
-                font-weight: 500;
-                min-height: 40px;
-                min-width: 88px;
+                font-size: 13px;
+                padding: 0;
             }
-            QPushButton#DetailsToggle:hover {
+            QPushButton#StatusDetailsButton:hover,
+            QPushButton#StatusCloseButton:hover {
+                background: rgba(255, 255, 255, 28);
                 color: #ffffff;
-                background: rgba(255, 255, 255, 14);
             }
-            QPushButton#DetailsToggle:checked {
-                color: #0A84FF;
+            QPushButton#StatusDetailsButton:pressed,
+            QPushButton#StatusCloseButton:pressed {
+                background: rgba(255, 255, 255, 46);
+                color: #ffffff;
             }
-            QPushButton#DetailsToggle:disabled {
+            QPushButton#StatusDetailsButton:checked {
+                background: rgba(10, 132, 255, 64);
+                color: #ffffff;
+            }
+            QPushButton#StatusDetailsButton:disabled {
                 color: rgba(235, 235, 245, 60);
+            }
+            QFrame#StatusDetailsPopup {
+                background: transparent;
+                border: 0;
             }
             QTextEdit#DetailsPanel {
                 background: transparent;
                 border: 0;
-                border-top: 1px solid rgba(255, 255, 255, 24);
-                border-radius: 0;
-                color: rgba(235, 235, 245, 200);
+                color: rgba(235, 235, 245, 220);
                 font-family: "Consolas", "SF Mono", "JetBrains Mono", monospace;
-                font-size: 11px;
-                padding: 10px 14px 12px 14px;
-                margin: 0 12px 12px 12px;
+                font-size: 12px;
+                selection-background-color: rgba(10, 132, 255, 130);
             }
 
             /* Inputs --------------------------------------------------- */
@@ -1496,9 +1662,6 @@ class MainWindow(QMainWindow):
         value = target.value if isinstance(target, CodexHomeTarget) else str(target)
         return self._tr(value)
 
-    def _details_button_text(self, expanded: bool) -> str:
-        return self._tr("Details") + (" ▴" if expanded else " ▾")
-
     def _show_language_menu(self) -> None:
         menu = QMenu(self)
         english = QAction(self._tr("English"), menu)
@@ -1537,9 +1700,6 @@ class MainWindow(QMainWindow):
             button.setToolTip(self._tr(f"{key} view tooltip"))
         if hasattr(self, "language_button"):
             self.language_button.setToolTip(self._tr("Switch language tooltip"))
-        if hasattr(self, "details_button"):
-            self.details_button.setText(self._details_button_text(self.details_button.isChecked()))
-            self.details_button.setToolTip(self._tr("Details tooltip"))
         if hasattr(self, "status_banner"):
             self.status_banner.setToolTip(self._tr("Status notification tooltip"))
 
@@ -1676,43 +1836,24 @@ class MainWindow(QMainWindow):
             combo.hidePopup()
 
     def _position_status_popup(self) -> None:
+        """Show / hide the inline title-bar status pill.
+
+        Geometry is owned by ``TitleBar``'s QHBoxLayout (the pill's
+        min/max width and fixed height are set on the widget itself), so
+        this method no longer computes positions manually — it just
+        ensures the pill is raised above sibling widgets when visible
+        and re-anchors the details popover (if open) so it tracks the
+        pill on window move/resize. Kept under the original name so
+        existing call sites don't change.
+        """
         footer = getattr(self, "status_footer", None)
-        content = getattr(self, "content", None)
-        if footer is None or content is None:
+        if footer is None:
             return
-        available_width = max(240, content.width() - (self._STATUS_POPUP_MARGIN * 2))
-        popup_width = available_width
-        if available_width >= self._STATUS_POPUP_MIN_WIDTH:
-            popup_width = max(self._STATUS_POPUP_MIN_WIDTH, popup_width)
-        details_open = bool(getattr(self, "details_panel", None) is not None and self.details_panel.isVisible())
-        if details_open:
-            footer.setFixedWidth(popup_width)
-            footer.adjustSize()
-            popup_height = min(max(120, footer.sizeHint().height()), 260)
-        else:
-            popup_height = self._STATUS_POPUP_HEIGHT
-        footer.setFixedSize(popup_width, popup_height)
-        x = max(self._STATUS_POPUP_MARGIN, (content.width() - popup_width) // 2)
-        y = max(self._STATUS_POPUP_MARGIN, content.height() - popup_height - self._STATUS_POPUP_MARGIN)
-        if footer.isWindow():
-            footer.move(content.mapToGlobal(QPoint(x, y)))
-        else:
-            footer.move(x, y)
         if footer.isVisible():
             footer.raise_()
-
-    def _install_status_popup_material(self) -> None:
-        footer = getattr(self, "status_footer", None)
-        if footer is None or not footer.isWindow():
-            return
-        if hasattr(footer, "set_native_acrylic"):
-            footer.set_native_acrylic(True)
-        if getattr(self, "_status_popup_material_installed", False):
-            self._restore_native_window_chrome_after_popup()
-            return
-        _install_dialog_chrome(footer, disable_border=True)
-        self._status_popup_material_installed = _install_acrylic_blur(footer, enabled=True, tint_alpha=58)
-        self._restore_native_window_chrome_after_popup()
+        popup = getattr(self, "status_details_popup", None)
+        if popup is not None and popup.isVisible():
+            self._position_details_popover()
 
     def set_status(self, text: str, severity: str | None = None) -> None:
         cleaned = _strip_ansi(text or "")
@@ -1723,26 +1864,35 @@ class MainWindow(QMainWindow):
         self._raw_status = cleaned
         kind = severity or _infer_severity(summary)
         self.status_banner.set_message(summary, kind)
-        if hasattr(self, "details_panel"):
+        if hasattr(self, "status_footer"):
             self.status_footer.setProperty("severity", kind)
-            show_footer = bool(summary)
-            content = getattr(self, "content", None)
-            if content is not None:
-                show_footer = show_footer and content.isVisible()
             self.status_footer.style().unpolish(self.status_footer)
             self.status_footer.style().polish(self.status_footer)
             self.status_footer.update()
-            self.details_panel.setPlainText(cleaned)
+            # Tooltip carries the full cleaned text so users can read
+            # the long form on hover even when ellipsis truncates it.
+            self.status_banner.setToolTip(cleaned or summary)
+            # Details popover state: show the chevron only when the
+            # cleaned text has more than the one-line summary; refresh
+            # the panel contents so an already-open popover updates in
+            # place.
             has_extra = bool(cleaned) and cleaned != summary
-            self.details_button.setEnabled(has_extra)
-            self.details_button.setVisible(has_extra)
-            if not has_extra and self.details_button.isChecked():
-                self.details_button.setChecked(False)
+            if hasattr(self, "details_button"):
+                self.details_button.setEnabled(has_extra)
+                self.details_button.setVisible(has_extra)
+                if not has_extra and self.details_button.isChecked():
+                    was_blocked = self.details_button.blockSignals(True)
+                    self.details_button.setChecked(False)
+                    self.details_button.blockSignals(was_blocked)
+                    if hasattr(self, "status_details_popup"):
+                        self.status_details_popup.hide()
+            if hasattr(self, "details_panel"):
+                self.details_panel.setPlainText(cleaned)
+            if hasattr(self, "status_details_popup"):
+                self.status_details_popup.setProperty("severity", kind)
+                self.status_details_popup.update()
+            self.status_footer.setVisible(True)
             self._position_status_popup()
-            self.status_footer.setVisible(show_footer)
-            self._position_status_popup()
-            if show_footer:
-                self._install_status_popup_material()
         if self.tray_icon:
             self.tray_icon.setToolTip(_trim_tray_text("Codex Quota Viewer: " + summary))
         self._schedule_status_auto_hide(kind)
@@ -1751,19 +1901,20 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_status_auto_hide_timer"):
             self._status_auto_hide_timer.stop()
         self._raw_status = ""
+        if hasattr(self, "status_banner"):
+            self.status_banner.set_message("")
+            self.status_banner.setToolTip(self._tr("Status notification tooltip"))
         if hasattr(self, "details_button") and self.details_button.isChecked():
             was_blocked = self.details_button.blockSignals(True)
             self.details_button.setChecked(False)
             self.details_button.blockSignals(was_blocked)
-            self.details_button.setText(self._details_button_text(False))
-        if hasattr(self, "details_panel"):
-            self.details_panel.clear()
-            self.details_panel.hide()
         if hasattr(self, "details_button"):
             self.details_button.setEnabled(False)
             self.details_button.hide()
-        if hasattr(self, "status_banner"):
-            self.status_banner.set_message("")
+        if hasattr(self, "details_panel"):
+            self.details_panel.clear()
+        if hasattr(self, "status_details_popup"):
+            self.status_details_popup.hide()
         if hasattr(self, "status_footer"):
             self.status_footer.hide()
         if getattr(self, "tray_icon", None):
@@ -1773,18 +1924,65 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_status_auto_hide_timer"):
             return
         self._status_auto_hide_timer.stop()
-        if getattr(self, "details_button", None) is not None and self.details_button.isChecked():
+        # Pause auto-hide while the details popover is open so the user
+        # can read at their own pace; resume when they dismiss it.
+        details_open = (
+            getattr(self, "details_button", None) is not None
+            and self.details_button.isChecked()
+        )
+        if details_open:
             return
         self._status_auto_hide_timer.start(self._STATUS_AUTO_HIDE_MS.get(severity, self._STATUS_AUTO_HIDE_MS["info"]))
 
+    # ---- details popover ------------------------------------------------
+
     def _toggle_details(self, checked: bool) -> None:
-        self.details_panel.setVisible(checked)
-        self.details_button.setText(self._details_button_text(checked))
-        self._position_status_popup()
         if checked:
+            self._show_details_popover()
             self._status_auto_hide_timer.stop()
-        elif self.status_footer.isVisible():
-            self._schedule_status_auto_hide(str(self.status_footer.property("severity") or "info"))
+        else:
+            self.status_details_popup.hide()
+            if self.status_footer.isVisible():
+                self._schedule_status_auto_hide(
+                    str(self.status_footer.property("severity") or "info")
+                )
+
+    def _show_details_popover(self) -> None:
+        self._position_details_popover()
+        self.status_details_popup.show()
+        self.status_details_popup.raise_()
+        if not self._status_details_popup_chrome_installed and sys.platform == "win32":
+            _install_dialog_chrome(self.status_details_popup, disable_border=True)
+            _install_acrylic_blur(
+                self.status_details_popup, enabled=True, tint_alpha=58
+            )
+            self.status_details_popup.set_native_acrylic(True)
+            self._status_details_popup_chrome_installed = True
+        self.status_details_popup.activateWindow()
+
+    def _position_details_popover(self) -> None:
+        pill = self.status_footer
+        if pill is None:
+            return
+        # Width: same as the pill so the dropdown reads as an extension
+        # of the same visual element. Height: tall enough for the text,
+        # capped so it never crowds the window.
+        width = pill.width()
+        height = min(260, max(120, self.status_details_popup.sizeHint().height()))
+        anchor = pill.mapToGlobal(QPoint(0, pill.height() + 4))
+        self.status_details_popup.setFixedSize(width, height)
+        self.status_details_popup.move(anchor)
+
+    def _dismiss_details_popover(self) -> None:
+        if self.details_button.isChecked():
+            was_blocked = self.details_button.blockSignals(True)
+            self.details_button.setChecked(False)
+            self.details_button.blockSignals(was_blocked)
+        self.status_details_popup.hide()
+        if self.status_footer.isVisible():
+            self._schedule_status_auto_hide(
+                str(self.status_footer.property("severity") or "info")
+            )
 
     def run_task(
         self,

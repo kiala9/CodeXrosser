@@ -5,8 +5,9 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from ._perf import _perf_timer
 from .models import (
     ParsedSessionCatalog,
     SessionFileSummary,
@@ -14,8 +15,14 @@ from .models import (
     SessionTimelinePage,
 )
 
+try:
+    import orjson as _orjson  # type: ignore[import-not-found]
+    _json_loads: Callable[[str | bytes], Any] = _orjson.loads
+except ImportError:
+    _json_loads = json.loads
 
-DEFAULT_TIMELINE_PAGE_SIZE = 200
+
+DEFAULT_TIMELINE_PAGE_SIZE = 100000
 MAX_TIMELINE_PAGE_SIZE = 500
 _PARSER_CACHE_LIMIT = 128
 _EPOCH_TIMESTAMP = "1970-01-01T00:00:00.000Z"
@@ -71,14 +78,16 @@ def parse_session_catalog(file_path: Path) -> ParsedSessionCatalog | None:
     tool_call_index: dict[str, int] = {}
     sequence = 0
 
-    with file_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+    with file_path.open("r", encoding="utf-8", errors="replace", newline="") as handle, _perf_timer(
+        "jsonl_parser.parse_session_catalog", path=file_path.name, size=stats.st_size
+    ):
         for raw_line in handle:
             stripped = raw_line.strip()
             if not stripped:
                 continue
             line_count += 1
             try:
-                entry = json.loads(stripped)
+                entry = _json_loads(stripped)
             except json.JSONDecodeError:
                 continue
             if not isinstance(entry, dict):
@@ -141,14 +150,22 @@ def parse_session_catalog(file_path: Path) -> ParsedSessionCatalog | None:
                     )
                     sequence += 1
                 elif payload_type == "message":
-                    text = _truncate_message(_read_response_message_text(payload))
-                    if not text:
+                    # Keep the full text on the timeline draft so it matches
+                    # the event_msg twin in dedup (which also carries the full
+                    # text). Previously we stored ``_truncate_message(...)``
+                    # here, which clamped to 180 chars — the cut routinely
+                    # fell mid-markdown-table or mid-code-fence and Qt's
+                    # setMarkdown went pathological on the malformed result.
+                    # The truncated form is still used for the session-list
+                    # excerpt, but the timeline keeps the full body.
+                    full_text = _normalize_message(_read_response_message_text(payload))
+                    if not full_text:
                         continue
                     role = payload.get("role")
                     if role == "user" and not response_user_excerpt:
-                        response_user_excerpt = text
+                        response_user_excerpt = _truncate_message(full_text)
                     if role == "assistant":
-                        response_assistant_excerpt = text
+                        response_assistant_excerpt = _truncate_message(full_text)
                     if role in ("user", "assistant"):
                         response_messages.append(
                             _TimelineDraft(
@@ -156,7 +173,7 @@ def parse_session_catalog(file_path: Path) -> ParsedSessionCatalog | None:
                                 order=sequence,
                                 timestamp=timestamp,
                                 type="message:user" if role == "user" else "message:assistant",
-                                text=text,
+                                text=full_text,
                             )
                         )
                         sequence += 1
@@ -249,7 +266,7 @@ def read_session_meta_snapshot(file_path: Path) -> SessionMetaSnapshot | None:
             if not stripped:
                 continue
             try:
-                entry = json.loads(stripped)
+                entry = _json_loads(stripped)
             except json.JSONDecodeError:
                 continue
             if not isinstance(entry, dict) or entry.get("type") != "session_meta":
@@ -449,16 +466,17 @@ def _read_subagent_role(value: Any) -> str | None:
 
 
 def _dedupe_timeline_drafts(items: list[Any]) -> list[Any]:
-    sorted_items = sorted(items, key=_timeline_sort_key)
-    seen: set[str] = set()
-    result: list[Any] = []
-    for item in sorted_items:
-        key = _timeline_dedupe_key(item)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(item)
-    return result
+    with _perf_timer("jsonl_parser.dedupe_timeline_drafts", count=len(items)):
+        sorted_items = sorted(items, key=_timeline_sort_key)
+        seen: set[tuple[str, ...]] = set()
+        result: list[Any] = []
+        for item in sorted_items:
+            key = _timeline_dedupe_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
 
 
 def _timeline_sort_key(item: Any) -> tuple[int, float, int]:
@@ -480,7 +498,7 @@ def _parse_iso_ms(value: str) -> float | None:
     return parsed.timestamp() * 1000.0
 
 
-def _timeline_dedupe_key(item: Any) -> str:
+def _timeline_dedupe_key(item: Any) -> tuple[str, ...]:
     # Codex JSONL emits each chat turn twice: once as an `event_msg`
     # (streaming notification) and once as a canonical `response_item`
     # (the message that was actually sent to the model). They have distinct
@@ -490,9 +508,9 @@ def _timeline_dedupe_key(item: Any) -> str:
     # to a logically distinct call, so id-based keying is still correct.
     item_type = getattr(item, "type", "")
     if item_type == "tool_call":
-        return f"tool::{item.id}"
+        return ("tool", item.id)
     text = (getattr(item, "text", "") or "").strip()
-    return f"msg::{item_type}::{text}"
+    return ("msg", item_type, text)
 
 
 def _read_cache(file_path: str, size_bytes: int, mtime_ns: int) -> _CachedValue | None:

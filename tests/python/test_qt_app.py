@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import sys
 from pathlib import Path
@@ -14,9 +16,9 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget  # noqa: E402
 
-from codex_quota_viewer.qt_app import ConfirmPhraseDialog, MainWindow, StatusBanner, StatusPopupFrame  # noqa: E402
+from codex_quota_viewer.qt_app import ConfirmPhraseDialog, MainWindow, StatusBanner, StatusDetailsPopup, StatusPopupFrame  # noqa: E402
 from codex_quota_viewer.models import AccountMetadata, AccountRecord, AuthMode, CodexHomeTarget, UiLanguage, now_utc  # noqa: E402
-from codex_quota_viewer.task_worker import serialize  # noqa: E402
+from codex_quota_viewer.task_worker import emit, serialize  # noqa: E402
 
 
 def test_button_wrapper_ignores_qt_checked_argument() -> None:
@@ -241,6 +243,19 @@ def test_task_worker_serialize_handles_enums_and_preview() -> None:
     assert data["target"] == "Real"
 
 
+def test_task_worker_emit_is_ascii_safe_for_gbk_stdout(monkeypatch) -> None:
+    raw = io.BytesIO()
+    gbk_stdout = io.TextIOWrapper(raw, encoding="gbk", errors="strict", newline="")
+    monkeypatch.setattr(sys, "stdout", gbk_stdout)
+
+    emit("result", message="contains warning ⚠")
+    gbk_stdout.flush()
+
+    line = raw.getvalue().decode("gbk")
+    assert "\\u26a0" in line
+    assert json.loads(line)["message"] == "contains warning ⚠"
+
+
 def test_button_uses_current_ui_language() -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow.__new__(MainWindow)
@@ -257,57 +272,21 @@ def _status_test_window() -> MainWindow:
     window = MainWindow.__new__(MainWindow)
     window._language = UiLanguage.ENGLISH
     window.status_banner = StatusBanner()
-    window.status_footer = QFrame()
+    window.status_footer = StatusPopupFrame()
     window.status_footer.setObjectName("StatusFooter")
-    window.details_button = QPushButton("Details")
+    window.status_footer.show()  # set_status sets visible; layout-managed in app
+    window.details_button = QPushButton("▾")
     window.details_button.setCheckable(True)
+    window.details_button.hide()
+    window.status_close_button = QPushButton("✕")
+    window.status_details_popup = StatusDetailsPopup()
     window.details_panel = QTextEdit()
+    window._status_details_popup_chrome_installed = True
     window._status_auto_hide_timer = QTimer()
     window._status_auto_hide_timer.setSingleShot(True)
     window.tray_icon = None
     window._raw_status = ""
     return window
-
-
-def test_status_popup_positions_as_overlay_inside_content() -> None:
-    app = QApplication.instance() or QApplication([])
-    window = MainWindow.__new__(MainWindow)
-    window.content = QWidget()
-    window.content.resize(900, 500)
-    window.status_footer = QFrame(window.content)
-    layout = QVBoxLayout(window.status_footer)
-    layout.addWidget(QLabel("Saved successfully."))
-
-    MainWindow._position_status_popup(window)
-
-    assert window.status_footer.parent() is window.content
-    assert window.status_footer.width() == 876
-    assert window.status_footer.height() == 52
-    assert window.status_footer.x() == 12
-    assert window.status_footer.y() == window.content.height() - window.status_footer.height() - 12
-
-
-def test_status_popup_window_positions_against_content_global_origin() -> None:
-    app = QApplication.instance() or QApplication([])
-    owner = QWidget()
-    owner.setGeometry(40, 50, 960, 600)
-    content = QWidget(owner)
-    content.setGeometry(20, 30, 900, 500)
-    window = MainWindow.__new__(MainWindow)
-    window.content = content
-    window.status_footer = StatusPopupFrame(owner, as_window=True)
-    QVBoxLayout(window.status_footer).addWidget(QLabel("Saved successfully."))
-    owner.show()
-    app.processEvents()
-
-    MainWindow._position_status_popup(window)
-
-    expected = content.mapToGlobal(QPoint(12, content.height() - window.status_footer.height() - 12))
-    assert window.status_footer.isWindow()
-    assert window.status_footer.width() == 876
-    assert window.status_footer.height() == 52
-    assert window.status_footer.pos() == expected
-    owner.close()
 
 
 def test_status_popup_frame_paints_without_backdrop_source() -> None:
@@ -340,11 +319,48 @@ def test_status_auto_hide_timer_and_clear_status() -> None:
 
     assert window.status_banner.text() == ""
     assert not window.status_footer.isVisible()
-    assert not window.details_panel.isVisible()
     assert not window._status_auto_hide_timer.isActive()
 
 
-def test_details_pauses_and_resumes_status_auto_hide() -> None:
+def test_set_status_routes_full_text_to_tooltip() -> None:
+    """Long messages surface their full cleaned text via the banner's
+    tooltip, in addition to populating the details popover panel."""
+    app = QApplication.instance() or QApplication([])
+    window = _status_test_window()
+
+    MainWindow.set_status(window, "line one\nline two", "info")
+
+    # Tooltip carries the full cleaned text (multi-line), even when the
+    # banner itself only renders a one-line summary.
+    assert "line one" in window.status_banner.toolTip()
+    assert "line two" in window.status_banner.toolTip()
+    # Details panel inside the popover is also primed with the full text
+    # so the popover renders correctly the moment it opens.
+    assert "line one" in window.details_panel.toPlainText()
+    assert "line two" in window.details_panel.toPlainText()
+
+
+def test_set_status_shows_details_button_when_extra_present() -> None:
+    """The ▾ details trigger is shown only when the cleaned text has
+    more content than the one-line summary; for single-line messages
+    it stays hidden so the pill doesn't carry meaningless affordances."""
+    app = QApplication.instance() or QApplication([])
+    window = _status_test_window()
+
+    # Multi-line — summary will collapse to the first line, leaving extra.
+    MainWindow.set_status(window, "headline\nmore body text", "info")
+    assert window.details_button.isVisible()
+    assert window.details_button.isEnabled()
+
+    # Single-line — no details, button hidden.
+    MainWindow.set_status(window, "Saved successfully.", "success")
+    assert not window.details_button.isVisible()
+    assert not window.details_button.isEnabled()
+
+
+def test_details_popover_pauses_and_resumes_auto_hide() -> None:
+    """Opening the details popover pauses the auto-hide timer so the
+    user can read at their own pace; closing it resumes the timer."""
     app = QApplication.instance() or QApplication([])
     window = _status_test_window()
 
@@ -358,6 +374,46 @@ def test_details_pauses_and_resumes_status_auto_hide() -> None:
     window.details_button.setChecked(False)
     MainWindow._toggle_details(window, False)
     assert window._status_auto_hide_timer.isActive()
+
+
+def test_clear_status_closes_details_popover() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = _status_test_window()
+
+    MainWindow.set_status(window, "line one\nline two", "info")
+    window.details_button.setChecked(True)
+    MainWindow._toggle_details(window, True)
+
+    MainWindow.clear_status(window)
+
+    assert not window.details_button.isChecked()
+    assert not window.details_button.isVisible()
+    assert not window.status_details_popup.isVisible()
+
+
+def test_status_popup_frame_absorbs_double_click() -> None:
+    """A double-click on the pill's empty padding must not bubble up to
+    TitleBar's ``mouseDoubleClickEvent`` (which toggles maximize). The
+    override on StatusPopupFrame should mark the event as accepted."""
+    app = QApplication.instance() or QApplication([])
+    container = QWidget()
+    frame = StatusPopupFrame(container)
+    frame.setGeometry(0, 0, 200, 40)
+
+    event = QMouseEvent(
+        QEvent.Type.MouseButtonDblClick,
+        QPointF(20, 20),
+        QPointF(20, 20),
+        QPointF(20, 20),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(frame, event)
+
+    # Accepted means Qt won't propagate it to the parent (TitleBar).
+    assert event.isAccepted()
+    container.close()
 
 
 def test_status_banner_double_click_requests_dismiss() -> None:

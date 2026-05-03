@@ -16,7 +16,12 @@ from .services import AppServices
 
 def emit(message_type: str, **payload: Any) -> None:
     payload["type"] = message_type
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    # This worker talks to the Qt host through stdout JSON lines. On
+    # Chinese Windows builds Python may default stdout to GBK/CP936; session
+    # excerpts can contain characters like U+26A0 that GBK cannot encode.
+    # Keep the transport ASCII-only and let json.loads on the host restore
+    # the original Unicode text.
+    print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")), flush=True)
 
 
 def progress(message: str) -> None:

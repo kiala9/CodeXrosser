@@ -413,6 +413,432 @@ def test_stale_list_result_dropped_when_token_advances() -> None:
     assert ids == ["second"]
 
 
+def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
+    """Tail-loaded session: when the user scrolls to the loaded edge,
+    the panel emits older_history_requested with the offset/limit
+    needed to fetch the immediately-older page from the manager."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("paginated")
+    # Pretend the session has 1000 events but only the last 200 are
+    # currently loaded — exactly what the new tail-load path produces.
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    captured: list[tuple[str, int, int]] = []
+    panel.older_history_requested.connect(
+        lambda sid, off, lim: captured.append((sid, off, lim))
+    )
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    assert panel._loaded_offset == 800
+    assert panel._timeline_total == 1000
+
+    # Slide-up at the loaded edge → fetch request goes out, single-flight
+    # guard prevents duplicates until prepend_older_items lands.
+    panel._slide_window_up()
+    assert captured == [(rec.id, 600, 200)]
+    assert panel._loading_older is True
+    panel._slide_window_up()
+    assert captured == [(rec.id, 600, 200)]  # still single-flight
+
+    # Older page comes back: items prepend, anchor preserved by id.
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+    assert panel._loading_older is False
+    assert panel._loaded_offset == 600
+    assert len(panel._all_timeline_items) == 400
+    assert panel._current_user_block is not None
+    kind, payload = panel._all_blocks[panel._current_user_block]
+    assert kind == "single"
+    # Anchor must still be e-800 (first user prompt that was visible
+    # before the prepend), regardless of where it now sits in _all_blocks.
+    assert payload.id == "e-800"
+    panel.close()
+
+
+def test_prepend_older_anchors_to_topmost_visible_bubble() -> None:
+    """Older-page prepend must anchor the scroll restore onto the bubble
+    that was at the viewport top — not snap to the active user prompt.
+    The bug being regressed: ``_scroll_to_anchor_after_prepend`` set
+    scroll to ``_current_user_block.widget.y()`` unconditionally, so
+    every fetch yanked the view back to the nearest user prompt."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+    from PySide6.QtWidgets import QWidget
+
+    QApplication.instance() or QApplication([])
+    rec = _record("anchor-topmost")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+
+    # Pick a non-user item as the simulated "topmost-visible" bubble.
+    # If the fix is working, the prepend will anchor on this exact id;
+    # if the old bug were back, it would anchor on the nearest user
+    # prompt (e-800 or e-805) instead.
+    target_id = "e-803"
+    target_block_index = next(
+        i
+        for i, (kind, payload) in enumerate(panel._all_blocks)
+        if kind == "single" and getattr(payload, "id", None) == target_id
+    )
+    fake_top = QWidget()
+    fake_top.setProperty("blockIndex", target_block_index)
+    panel._topmost_visible_widget = lambda: fake_top  # type: ignore[method-assign]
+
+    captured: dict[str, object] = {}
+
+    def stub_apply(block_index: int, offset: int, raw_scroll: int) -> None:
+        captured["block_index"] = block_index
+        captured["offset"] = offset
+        captured["raw_scroll"] = raw_scroll
+
+    panel._apply_prepend_anchor = stub_apply  # type: ignore[method-assign]
+
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+    QApplication.processEvents()
+
+    # The anchor must be the new index of e-803, not of the surrounding
+    # user prompts. _block_for_anchor_id resolves the post-recoalesce
+    # block index for the same id we captured before the prepend.
+    new_target_block = panel._block_for_anchor_id(target_id)
+    assert new_target_block is not None
+    assert captured.get("block_index") == new_target_block
+    user_block_e800 = panel._block_for_message_id("e-800")
+    user_block_e805 = panel._block_for_message_id("e-805")
+    assert captured.get("block_index") not in {user_block_e800, user_block_e805}
+    panel.close()
+
+
+def test_block_for_anchor_id_resolves_tool_group_inner_ids() -> None:
+    """``_block_for_anchor_id`` must find a tool_call by id even when
+    coalesce has merged it into a tool_group block. ``_block_for_message_id``
+    only checks single-item blocks and returns None for tool_group inner
+    ids — the new helper has to cover that gap so prepend's topmost-
+    visible anchor survives a tool-group merge at the boundary."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("anchor-toolgroup")
+    timeline = [
+        SessionTimelineItem(
+            id="e-user", type="message:user", timestamp="t", text="hi"
+        ),
+        SessionTimelineItem(
+            id="e-tc-1",
+            type="tool_call",
+            timestamp="t",
+            tool_name="read",
+            summary="r1",
+            status="completed",
+        ),
+        SessionTimelineItem(
+            id="e-tc-2",
+            type="tool_call",
+            timestamp="t",
+            tool_name="read",
+            summary="r2",
+            status="completed",
+        ),
+        SessionTimelineItem(
+            id="e-asst", type="message:assistant", timestamp="t", text="ok"
+        ),
+    ]
+    detail = SessionDetail(
+        record=rec, audit_entries=[], timeline=timeline,
+        timeline_total=len(timeline), timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+
+    # tool_call items coalesce into a tool_group block.
+    group_block = next(
+        i for i, (kind, _payload) in enumerate(panel._all_blocks) if kind == "tool_group"
+    )
+    # The legacy helper can't see inner tool_call ids.
+    assert panel._block_for_message_id("e-tc-2") is None
+    # The new helper must.
+    assert panel._block_for_anchor_id("e-tc-2") == group_block
+    assert panel._block_for_anchor_id("e-tc-1") == group_block
+    # Single-block lookups still work.
+    assert panel._block_for_anchor_id("e-user") == panel._block_for_message_id("e-user")
+    assert panel._block_for_anchor_id("e-asst") == panel._block_for_message_id("e-asst")
+    panel.close()
+
+
+def test_scroll_settled_at_top_edge_triggers_older_fetch() -> None:
+    """Regression: when the panel is tail-loaded with _window_start == 0
+    but _loaded_offset > 0, scrolling near the top edge MUST trigger
+    older_history_requested. The bug was that _on_scroll_settled gated
+    the up-slide on _window_start > 0 alone, so the natural
+    "scroll-up-at-top-of-loaded-tail" gesture never reached the older-
+    page request path."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("scroll-edge")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    captured: list[tuple[str, int, int]] = []
+    panel.older_history_requested.connect(
+        lambda sid, off, lim: captured.append((sid, off, lim))
+    )
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    # Initial state: window starts at the loaded edge, but there's older
+    # history to fetch. _window_start == 0 alone used to short-circuit
+    # the up-slide path; with the fix, _on_scroll_settled must still
+    # invoke _slide_window_up so it can route to _maybe_request_older.
+    assert panel._window_start == 0
+    assert panel._loaded_offset == 800
+
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    # Synthesize a scroll-near-top condition. Range needs a positive
+    # max so edge-trigger arithmetic has room to run.
+    scrollbar.setRange(0, 5_000)
+    scrollbar.setValue(20)  # well within the edge_px band
+    panel._scroll_throttle.stop()
+    panel._on_scroll_settled()
+
+    assert captured == [(rec.id, 600, 200)]
+    panel.close()
+
+
+def test_hide_event_keeps_rendered_timeline_alive() -> None:
+    """Tab-switch keep-alive contract: hideEvent must NOT tear down the
+    panel's rendered state. The user's scroll position, loaded items,
+    and window bounds all need to survive the page being hidden so the
+    next show is instant."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from PySide6.QtGui import QHideEvent
+
+    QApplication.instance() or QApplication([])
+    rec = _record("keepalive")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 3 == 0 else "message:assistant",
+            timestamp="t",
+            text=f"item {i}",
+        )
+        for i in range(20)
+    ]
+    detail = SessionDetail(
+        record=rec, audit_entries=[], timeline=timeline,
+        timeline_total=len(timeline), timeline_next_offset=None,
+    )
+    factory = _make_manager_factory([rec])
+    page = SessionsPage(
+        sessions_manager_factory=factory,
+        confirm_real_action=Mock(return_value=True),
+    )
+    # Populate the panel directly so we don't depend on async detail
+    # fetch timing.
+    page._detail_panel.set_detail(detail, page.target)
+    pre_session_id = page._detail_panel.loaded_session_id()
+    pre_total = page._detail_panel.loaded_timeline_total()
+    pre_blocks_count = len(page._detail_panel._all_blocks)
+    pre_render_token = page._detail_panel._render_token
+
+    page.hideEvent(QHideEvent())
+
+    # The panel's contents must be untouched.
+    assert page._detail_panel.loaded_session_id() == pre_session_id
+    assert page._detail_panel.loaded_timeline_total() == pre_total
+    assert len(page._detail_panel._all_blocks) == pre_blocks_count
+    # _render_token would bump if discard_rendered_timeline / set_detail
+    # ran — keep-alive guarantees neither does.
+    assert page._detail_panel._render_token == pre_render_token
+    page.close()
+
+
+def test_show_event_skips_refetch_when_repository_count_unchanged() -> None:
+    """Freshness check: when ``count_timeline_items`` matches the
+    panel's ``loaded_timeline_total``, showEvent is a true no-op —
+    no detail token bump, no fetch dispatched."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from PySide6.QtGui import QShowEvent
+
+    QApplication.instance() or QApplication([])
+    rec = _record("fresh-data")
+    timeline = [
+        SessionTimelineItem(
+            id="e-0", type="message:user", timestamp="t", text="hi"
+        ),
+        SessionTimelineItem(
+            id="e-1", type="message:assistant", timestamp="t", text="ok"
+        ),
+    ]
+    detail = SessionDetail(
+        record=rec, audit_entries=[], timeline=timeline,
+        timeline_total=2, timeline_next_offset=None,
+    )
+    factory = _make_manager_factory([rec])
+    page = SessionsPage(
+        sessions_manager_factory=factory,
+        confirm_real_action=Mock(return_value=True),
+    )
+    page._detail_panel.set_detail(detail, page.target)
+
+    manager = factory.return_value
+    manager.repository.get_session.side_effect = lambda sid: rec
+    # Repository agrees with what panel saw at set_detail time.
+    manager.repository.count_timeline_items.side_effect = lambda sid: 2
+
+    pre_token = page._detail_token
+    pre_detail_calls = manager.get_session_detail.call_count
+
+    page.showEvent(QShowEvent())
+
+    assert page._detail_token == pre_token
+    assert manager.get_session_detail.call_count == pre_detail_calls
+    page.close()
+
+
+def test_show_event_refetches_when_repository_count_diverges() -> None:
+    """If a rescan rewrote timeline_items while we were on another
+    tab, ``count_timeline_items`` will diverge from the panel's cached
+    ``loaded_timeline_total``. showEvent must spot the divergence and
+    dispatch a refetch via the same path as row-change."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from PySide6.QtGui import QShowEvent
+
+    QApplication.instance() or QApplication([])
+    rec = _record("stale-data")
+    timeline = [
+        SessionTimelineItem(
+            id="e-0", type="message:user", timestamp="t", text="hi"
+        ),
+    ]
+    detail = SessionDetail(
+        record=rec, audit_entries=[], timeline=timeline,
+        timeline_total=1, timeline_next_offset=None,
+    )
+    factory = _make_manager_factory([rec])
+    page = SessionsPage(
+        sessions_manager_factory=factory,
+        confirm_real_action=Mock(return_value=True),
+    )
+    page._detail_panel.set_detail(detail, page.target)
+
+    manager = factory.return_value
+    manager.repository.get_session.side_effect = lambda sid: rec
+    # Pretend a rescan added rows while the user was away.
+    manager.repository.count_timeline_items.side_effect = lambda sid: 7
+
+    pre_token = page._detail_token
+
+    page.showEvent(QShowEvent())
+
+    # _request_detail bumps the token; that's our refetch signal.
+    assert page._detail_token > pre_token
+    page.close()
+
+
+def test_detail_panel_no_older_request_at_session_start() -> None:
+    """A session that fits entirely in the initial load (loaded_offset
+    == 0) must NOT trigger older fetches at the top edge — there's no
+    history to page in."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("complete")
+    items = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(150)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=items,
+        timeline_total=150,
+        timeline_next_offset=None,
+        timeline_loaded_offset=0,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    captured: list[Any] = []
+    panel.older_history_requested.connect(lambda *args: captured.append(args))
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._slide_window_up()
+    assert captured == []
+    assert panel._loading_older is False
+    panel.close()
+
+
 def test_sliding_window_keeps_widget_count_capped() -> None:
     """Big session → timeline panel materializes only _WINDOW_SIZE widgets,
     and bidirectional sliding preserves that cap exactly."""

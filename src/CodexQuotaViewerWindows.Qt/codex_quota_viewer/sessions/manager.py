@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import errors
+from ._perf import _perf_timer
 from .helpers import (
     build_fallback_relative_path,
     build_resume_command,
@@ -86,20 +87,32 @@ class SessionsManager:
 
     def get_session_detail(self, session_id: str) -> SessionDetail:
         record = self._require_session(session_id)
-        # Pull the entire persisted timeline; the detail panel chunk-renders
-        # bubbles so even multi-thousand-event sessions stay responsive.
-        page = self.repository.list_timeline_page(
-            session_id, offset=0, limit=1_000_000
-        )
-        deduped = _dedupe_persisted_timeline(page.items)
-        audit_entries = self.repository.list_audit_entries(session_id)
-        return SessionDetail(
-            record=record,
-            audit_entries=audit_entries,
-            timeline=deduped,
-            timeline_total=len(deduped) if deduped is not page.items else page.total,
-            timeline_next_offset=page.next_offset,
-        )
+        with _perf_timer("manager.get_session_detail", session_id=session_id):
+            # Tail-load only the most recent page. Chat sessions are read
+            # most-recent-first, and full-history loads at million-row scale
+            # were blocking the UI thread on dedup + object construction
+            # alone. The detail panel runs a sliding-window renderer over
+            # whatever timeline we hand it, so a bounded tail keeps the
+            # detail-open cost flat regardless of session size — and the
+            # panel pages older history in via ``get_session_timeline_page``
+            # when the user scrolls past the loaded edge.
+            page = self.repository.list_timeline_tail(
+                session_id, limit=DEFAULT_TIMELINE_PAGE_SIZE
+            )
+            deduped = _dedupe_persisted_timeline(page.items)
+            audit_entries = self.repository.list_audit_entries(session_id)
+            # Pre-dedup SQL offset of the slice we just loaded. Used by the
+            # panel as the anchor for older-page requests; dedup reduces
+            # the visible item count but does not move the SQL offset.
+            loaded_offset = max(0, page.total - len(page.items))
+            return SessionDetail(
+                record=record,
+                audit_entries=audit_entries,
+                timeline=deduped,
+                timeline_total=page.total,
+                timeline_next_offset=page.next_offset,
+                timeline_loaded_offset=loaded_offset,
+            )
 
     def get_session_timeline_page(
         self,
@@ -119,7 +132,7 @@ class SessionsManager:
             return page
         return SessionTimelinePage(
             items=deduped,
-            total=len(deduped),
+            total=page.total,
             next_offset=page.next_offset,
         )
 
