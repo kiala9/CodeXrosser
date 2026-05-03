@@ -19,13 +19,21 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from codex_quota_viewer.localization import translate  # noqa: E402
 from codex_quota_viewer.models import CodexHomeTarget, UiLanguage  # noqa: E402
 from codex_quota_viewer.sessions.models import (  # noqa: E402
+    Attachment,
     SessionDetail,
     SessionRecord,
+    SessionTimelineItem,
 )
 from codex_quota_viewer.sessions_page import (  # noqa: E402
     SessionsPage,
+    _AttachmentCard,
+    _FileCard,
+    _ImageCard,
+    _MessageBubble,
     _SessionsTreeModel,
     _build_workfolder_groups,
+    _decode_data_uri,
+    _extract_markdown_attachments,
     _format_size,
     _format_started_at,
     _index_matches_viewport_position,
@@ -156,6 +164,156 @@ def test_sessions_message_body_falls_back_to_plain_for_xml_envelope() -> None:
     assert not _looks_like_markdown("<environment_context>\n  <cwd>...</cwd>\n</environment_context>")
     assert not _looks_like_markdown("<shell>powershell</shell>")
     assert not _looks_like_markdown("plain text")
+
+
+# ----------------------------------------------------------------------
+# Image attachment rendering
+# ----------------------------------------------------------------------
+
+
+# 1×1 transparent PNG, encoded as a Codex-style data URI. Same fixture
+# used by the parser tests; kept duplicated to avoid cross-file import.
+_TEST_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwAD"
+    "hgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+def test_decode_data_uri_returns_image_for_valid_png() -> None:
+    QApplication.instance() or QApplication([])
+    image = _decode_data_uri(_TEST_PNG_DATA_URI)
+    assert image is not None
+    assert not image.isNull()
+    assert image.width() == 1
+    assert image.height() == 1
+
+
+def test_decode_data_uri_rejects_malformed_payload() -> None:
+    QApplication.instance() or QApplication([])
+    assert _decode_data_uri("data:image/png;base64,not-actually-base64!!!") is None
+    assert _decode_data_uri("not a data uri") is None
+    assert _decode_data_uri("") is None
+
+
+def test_extract_markdown_attachments_strips_data_uri_image() -> None:
+    text = (
+        "intro line\n"
+        "![cap](" + _TEST_PNG_DATA_URI + ")\n"
+        "outro line"
+    )
+    rewritten, attachments = _extract_markdown_attachments(text)
+    assert "![" not in rewritten
+    assert "intro line" in rewritten
+    assert "outro line" in rewritten
+    assert len(attachments) == 1
+    assert attachments[0].kind == "image"
+    assert attachments[0].mime == "image/png"
+    assert attachments[0].source == "markdown"
+    assert attachments[0].alt == "cap"
+
+
+def test_extract_markdown_attachments_leaves_remote_url_inline() -> None:
+    text = "see ![remote](https://example.com/foo.png) inline"
+    rewritten, attachments = _extract_markdown_attachments(text)
+    # Remote URLs stay in the markdown text so Qt's native renderer can
+    # still try to fetch them — no attachment card for those.
+    assert "https://example.com/foo.png" in rewritten
+    assert attachments == ()
+
+
+def test_message_bubble_renders_image_card_for_payload_attachment() -> None:
+    QApplication.instance() or QApplication([])
+    attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri=_TEST_PNG_DATA_URI,
+        source="payload",
+    )
+    item = SessionTimelineItem(
+        id="m-1",
+        type="message:user",
+        timestamp="2026-04-28T05:10:14Z",
+        text="点击seed sandbox弹出",
+        attachments=(attachment,),
+    )
+    bubble = _MessageBubble(
+        "user", item.timestamp, item.text, parent=None, attachments=item.attachments
+    )
+    image_cards = bubble.findChildren(_ImageCard)
+    assert len(image_cards) == 1
+    assert isinstance(image_cards[0], _AttachmentCard)
+
+
+def test_message_bubble_extracts_markdown_image_into_card() -> None:
+    """A bubble whose text body contains ``![](data:...)`` rewrites the
+    body to drop the markdown fragment and adds an ``_ImageCard``."""
+    QApplication.instance() or QApplication([])
+    text = f"see ![diagram]({_TEST_PNG_DATA_URI}) above"
+    item = SessionTimelineItem(
+        id="m-2",
+        type="message:assistant",
+        timestamp="2026-04-28T05:10:15Z",
+        text=text,
+    )
+    bubble = _MessageBubble(
+        "assistant",
+        item.timestamp,
+        item.text,
+        parent=None,
+        attachments=item.attachments,
+    )
+    image_cards = bubble.findChildren(_ImageCard)
+    assert len(image_cards) == 1
+
+
+def test_message_bubble_handles_malformed_data_uri_with_placeholder() -> None:
+    QApplication.instance() or QApplication([])
+    bad_attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri="data:image/png;base64,xxxxxxxx-not-valid-xxxxxxxx",
+        source="payload",
+    )
+    item = SessionTimelineItem(
+        id="m-3",
+        type="message:user",
+        timestamp="2026-04-28T05:10:16Z",
+        text="broken image",
+        attachments=(bad_attachment,),
+    )
+    bubble = _MessageBubble(
+        "user", item.timestamp, item.text, parent=None, attachments=item.attachments
+    )
+    image_cards = bubble.findChildren(_ImageCard)
+    # Card still constructs — the failure placeholder is shown only after
+    # the card receives its first showEvent (lazy decode). The card's
+    # presence with a non-decodable URI is the regression we care about:
+    # parser must hand it through without crashing.
+    assert len(image_cards) == 1
+
+
+def test_message_bubble_renders_file_card_for_file_attachment() -> None:
+    QApplication.instance() or QApplication([])
+    attachment = Attachment(
+        kind="file",
+        mime="application/pdf",
+        path="/tmp/example.pdf",
+        name="example.pdf",
+        source="payload",
+    )
+    item = SessionTimelineItem(
+        id="m-4",
+        type="message:user",
+        timestamp="2026-04-28T05:10:17Z",
+        text="here's a file",
+        attachments=(attachment,),
+    )
+    bubble = _MessageBubble(
+        "user", item.timestamp, item.text, parent=None, attachments=item.attachments
+    )
+    file_cards = bubble.findChildren(_FileCard)
+    assert len(file_cards) == 1
 
 
 def test_sessions_page_real_target_archive_requires_confirmation(monkeypatch) -> None:

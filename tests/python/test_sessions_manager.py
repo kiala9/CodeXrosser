@@ -571,6 +571,263 @@ def test_sessions_jsonl_parser_keeps_response_items_sharing_timestamp(tmp_path: 
     assert timeline_types.count("message:assistant") == 2
 
 
+# ----------------------------------------------------------------------
+# Image / attachment parsing
+# ----------------------------------------------------------------------
+
+
+# 1×1 transparent PNG, encoded as a Codex-style data URI. Compact enough
+# to inline in tests without bloating the file but exercises the full
+# decode path (real PNG header → MIME extraction → Attachment).
+_PNG_1X1_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwAD"
+    "hgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_JPEG_TINY_DATA_URI = "data:image/jpeg;base64,/9j/2wBDAA=="
+
+
+def _write_image_session(
+    sessions_root: Path,
+    *,
+    session_id: str,
+    started_at: str,
+    content: list[dict],
+) -> Path:
+    relative = build_fallback_relative_path(started_at, session_id)
+    target = sessions_root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(
+            {
+                "type": "session_meta",
+                "timestamp": started_at,
+                "payload": {
+                    "id": session_id,
+                    "timestamp": started_at,
+                    "cwd": str(sessions_root),
+                    "originator": "vscode",
+                    "source": "vscode",
+                    "cli_version": "0.42.0",
+                    "model_provider": "openai",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response_item",
+                "timestamp": started_at,
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                },
+            }
+        ),
+    ]
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target
+
+
+def test_jsonl_parser_extracts_bracketed_image_payload(tmp_path: Path) -> None:
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="aaaaaaaa-1111-2222-3333-444444444444",
+        started_at="2026-04-28T05:10:14Z",
+        content=[
+            {"type": "input_text", "text": "点击seed sandbox弹出\n"},
+            {"type": "input_text", "text": "<image>"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI, "detail": "high"},
+            {"type": "input_text", "text": "</image>"},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    # Bracket tokens were adjacent to the image part — both should be
+    # stripped from the rendered text.
+    assert "<image>" not in item.text
+    assert "</image>" not in item.text
+    assert "点击seed sandbox弹出" in item.text
+    assert len(item.attachments) == 1
+    attachment = item.attachments[0]
+    assert attachment.kind == "image"
+    assert attachment.mime == "image/png"
+    assert attachment.data_uri is not None
+    assert attachment.data_uri.startswith("data:image/png;base64,")
+
+
+def test_jsonl_parser_handles_jpeg_mime(tmp_path: Path) -> None:
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="bbbbbbbb-1111-2222-3333-444444444444",
+        started_at="2026-04-28T06:00:00Z",
+        content=[
+            {"type": "input_text", "text": "look at this"},
+            {"type": "input_image", "image_url": _JPEG_TINY_DATA_URI},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    assert user_items[0].attachments[0].mime == "image/jpeg"
+
+
+def test_jsonl_parser_keeps_bare_angle_brackets_in_prose(tmp_path: Path) -> None:
+    """Pure prose containing literal ``<image>`` text but no real image
+    part keeps the bracket tokens intact — the stripping rule fires only
+    when adjacent to an actual ``input_image`` content part."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="cccccccc-1111-2222-3333-444444444444",
+        started_at="2026-04-28T07:00:00Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": "I tried <image> in the markdown but it didn't render",
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    assert "<image>" in user_items[0].text
+    assert user_items[0].attachments == ()
+
+
+def test_jsonl_parser_strips_only_neighbouring_brackets(tmp_path: Path) -> None:
+    """When two image parts are present and the brackets only neighbour
+    the second one, the first image's text remains untouched."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="dddddddd-1111-2222-3333-444444444444",
+        started_at="2026-04-28T08:00:00Z",
+        content=[
+            {"type": "input_text", "text": "hi"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI},
+            {"type": "input_text", "text": "<image>"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI},
+            {"type": "input_text", "text": "</image>"},
+            {"type": "input_text", "text": "bye"},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    # Both images captured; bracket tokens around the SECOND image stripped.
+    assert len(item.attachments) == 2
+    # Brackets removed because they wrap an actual image part.
+    assert "<image>" not in item.text
+    assert "</image>" not in item.text
+    # Surrounding prose preserved.
+    assert "hi" in item.text and "bye" in item.text
+
+
+def test_repository_migrates_attachments_column_on_upgrade(tmp_path: Path) -> None:
+    """An existing pre-migration DB (timeline_items without
+    ``attachments_json``) gains the column when the repository opens it,
+    so users upgrading from an older build don't lose access to their
+    sessions."""
+    db_path = tmp_path / "sessions.db"
+    legacy_schema = """
+        create table sessions (
+          id text primary key,
+          active_path text,
+          archive_path text,
+          snapshot_path text,
+          original_relative_path text,
+          cwd text not null,
+          started_at text not null,
+          originator text not null,
+          source text not null,
+          cli_version text not null,
+          model_provider text not null,
+          size_bytes integer not null default 0,
+          line_count integer not null default 0,
+          event_count integer not null default 0,
+          tool_call_count integer not null default 0,
+          user_prompt_excerpt text not null default '',
+          latest_agent_message_excerpt text not null default '',
+          status text not null,
+          created_at text not null,
+          updated_at text not null
+        );
+        create table timeline_items (
+          session_id text not null,
+          ordinal integer not null,
+          item_id text not null,
+          type text not null,
+          timestamp text not null,
+          text text,
+          tool_name text,
+          summary text,
+          input_text text,
+          output_text text,
+          status text,
+          primary key (session_id, ordinal)
+        );
+        create table audit_log (
+          id integer primary key autoincrement,
+          action text not null,
+          session_id text not null,
+          source_path text,
+          target_path text,
+          details_json text not null default '{}',
+          created_at text not null
+        );
+    """
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(legacy_schema)
+    legacy.close()
+
+    repository = SessionRepository(db_path)
+    try:
+        rows = repository._connection.execute("pragma table_info(timeline_items)").fetchall()
+        column_names = {str(row["name"]) for row in rows}
+        assert "attachments_json" in column_names
+    finally:
+        repository.close()
+
+
+def test_repository_round_trips_attachments(tmp_path: Path) -> None:
+    """Attachments survive the SQLite write/read cycle so the detail
+    panel (which always pulls timeline items via ``list_timeline_page``)
+    sees the same images the parser captured."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    _write_image_session(
+        codex_home / "sessions",
+        session_id="eeeeeeee-1111-2222-3333-444444444444",
+        started_at="2026-04-28T09:00:00Z",
+        content=[
+            {"type": "input_text", "text": "first"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI, "detail": "high"},
+        ],
+    )
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.rescan()
+        detail = manager.get_session_detail("eeeeeeee-1111-2222-3333-444444444444")
+        user_items = [item for item in detail.timeline if item.type == "message:user"]
+        assert len(user_items) == 1
+        attachments = user_items[0].attachments
+        assert len(attachments) == 1
+        assert attachments[0].kind == "image"
+        assert attachments[0].mime == "image/png"
+        assert attachments[0].data_uri == _PNG_1X1_DATA_URI
+    finally:
+        manager.close()
+
+
 def test_sessions_filters_by_status(tmp_path: Path) -> None:
     codex_home, manager_home = _make_homes(tmp_path)
     _write_session_jsonl(

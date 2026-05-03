@@ -38,6 +38,7 @@ create table if not exists timeline_items (
   input_text text,
   output_text text,
   status text,
+  attachments_json text,
   primary key (session_id, ordinal)
 );
 

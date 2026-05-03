@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 import sys
 from dataclasses import dataclass
@@ -34,6 +36,8 @@ from PySide6.QtGui import (
     QFontMetrics,
     QGuiApplication,
     QIcon,
+    QImage,
+    QMouseEvent,
     QPainter,
     QPainterPath,
     QPen,
@@ -47,6 +51,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
+    QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -97,6 +103,7 @@ from .design_tokens import (
 from .frosted_surface import _FrostedSurface
 from .models import CodexHomeTarget
 from .sessions import (
+    Attachment,
     AuditEntry,
     SessionDetail,
     SessionFilters,
@@ -2261,6 +2268,10 @@ class SessionsPage(QWidget):
         self._confirm_real_action = confirm_real_action
         self._log_audit = log_audit
         self._translator = translator or (lambda key: key)
+        # Module-level hook so attachment cards (constructed deep inside
+        # _MessageBubble, with no translator argument) can localise their
+        # headers and dialogs.
+        set_session_card_translator(self._translator)
         self._task_runner = task_runner
         self._target = CodexHomeTarget.SANDBOX
         self._records_by_id: dict[str, SessionRecord] = {}
@@ -6044,7 +6055,14 @@ _BubbleFrame._SURFACES = {
 
 
 class _MessageBubble(_BubbleFrame):
-    def __init__(self, role: str, timestamp: str, text: str, parent: QWidget):
+    def __init__(
+        self,
+        role: str,
+        timestamp: str,
+        text: str,
+        parent: QWidget,
+        attachments: tuple[Attachment, ...] = (),
+    ) -> None:
         super().__init__(role, parent)
 
         layout = QVBoxLayout(self)
@@ -6072,9 +6090,26 @@ class _MessageBubble(_BubbleFrame):
         header.addWidget(timestamp_label, 0, Qt.AlignVCenter)
         layout.addLayout(header)
 
-        body = _RichBody(text or "", self)
+        # Markdown image links embedded in the message text get extracted
+        # into the same attachment channel so they render with the same
+        # CHV-style card chrome as Codex payload screenshots — and so the
+        # ``![]()`` fragments don't double-render alongside the card.
+        body_text, md_attachments = _extract_markdown_attachments(text or "")
+        all_attachments = tuple(attachments) + md_attachments
+
+        body = _RichBody(body_text, self)
         body.setObjectName("SessionsBubbleBody")
         layout.addWidget(body)
+
+        for index, attachment in enumerate(all_attachments):
+            card: _AttachmentCard
+            if attachment.kind == "image":
+                image_card = _ImageCard(attachment, self)
+                image_card.set_image_index(index)
+                card = image_card
+            else:
+                card = _FileCard(attachment, self)
+            layout.addWidget(card)
 
 
 _ENVIRONMENT_CONTEXT_OPEN = "<environment_context>"
@@ -6534,7 +6569,13 @@ def _build_timeline_widget(item: SessionTimelineItem, *, parent: QWidget) -> QWi
         if env_pairs is not None:
             return _EnvironmentContextBubble(item.timestamp, env_pairs, parent=parent)
     role = "user" if item.type == "message:user" else "assistant"
-    return _MessageBubble(role, item.timestamp, item.text, parent=parent)
+    return _MessageBubble(
+        role,
+        item.timestamp,
+        item.text,
+        parent=parent,
+        attachments=item.attachments,
+    )
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -7067,6 +7108,69 @@ def _download_icon() -> QIcon:
     )
 
 
+def _image_icon() -> QIcon:
+    """Lucide Image — generic picture glyph for image attachment cards."""
+    return _icon_from_svg(
+        """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+          <g fill="none" stroke="#c6d3e1" stroke-width="2.25"
+             stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+            <circle cx="8.5" cy="8.5" r="1.5"/>
+            <polyline points="21 15 16 10 5 21"/>
+          </g>
+        </svg>
+        """
+    )
+
+
+def _zoom_in_icon() -> QIcon:
+    """Lucide ZoomIn — open the full-resolution image dialog."""
+    return _icon_from_svg(
+        """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+          <g fill="none" stroke="#c6d3e1" stroke-width="2.25"
+             stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="7"/>
+            <line x1="21" x2="16.5" y1="21" y2="16.5"/>
+            <line x1="11" x2="11" y1="8" y2="14"/>
+            <line x1="8" x2="14" y1="11" y2="11"/>
+          </g>
+        </svg>
+        """
+    )
+
+
+def _file_icon() -> QIcon:
+    """Lucide File — generic file-attachment glyph."""
+    return _icon_from_svg(
+        """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+          <g fill="none" stroke="#c6d3e1" stroke-width="2.25"
+             stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </g>
+        </svg>
+        """
+    )
+
+
+def _x_icon() -> QIcon:
+    """Lucide X — close action for the image zoom dialog."""
+    return _icon_from_svg(
+        """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+          <g fill="none" stroke="#c6d3e1" stroke-width="2.25"
+             stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" x2="6" y1="6" y2="18"/>
+            <line x1="6" x2="18" y1="6" y2="18"/>
+          </g>
+        </svg>
+        """
+    )
+
+
 def _reset_icon() -> QIcon:
     """Lucide RotateCcw — reset/undo action (clears the active filters)."""
     return _icon_from_svg(
@@ -7408,6 +7512,644 @@ def _looks_like_markdown(text: str) -> bool:
             return False
     markers = ("```", "**", "## ", "### ", "#### ", "- ", "* ", "1. ", "> ", "[", "`")
     return any(marker in text for marker in markers)
+
+
+# ---- Image attachment rendering -------------------------------------------
+
+# Module-level translator hook. The Sessions page sets this once on
+# initialization so attachment cards can localise their headers, save
+# dialogs, and error placeholders without threading a translator through
+# every helper layer.
+_session_card_translator: Callable[[str], str] = lambda text: text
+
+
+def set_session_card_translator(translator: Callable[[str], str]) -> None:
+    """Install the translator used by image / file attachment cards.
+
+    Call once during ``SessionsPage`` setup. Idempotent — re-calling with a
+    new translator updates future bubbles; bubbles already on screen keep
+    their existing labels until the timeline rebuilds.
+    """
+    global _session_card_translator
+    _session_card_translator = translator
+
+
+def _t(text: str) -> str:
+    return _session_card_translator(text)
+
+
+# Hard cap on a single image's decoded byte size. A 16 MB ceiling rejects
+# pathological inputs (a multi-MB base64 blob in a session JSONL would
+# already have inflated context, but decoding it would also blow up
+# QImage memory) without affecting any realistic screenshot.
+_MAX_IMAGE_DECODED_BYTES = 16 * 1024 * 1024
+# Maximum on-screen width for an attachment card body. Bubble bodies are
+# already capped to the timeline width; this further constrains image
+# pixmaps so a large screenshot doesn't dominate the message column.
+_IMAGE_CARD_MAX_WIDTH = 480
+# Markdown image syntax. We extract these into the same attachment channel
+# so MD-attached screenshots get the same card chrome as Codex-payload
+# images. ``http(s)://`` sources are left in the text so Qt can fetch and
+# render them inline (no download UX needed for those).
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)\)")
+_IMAGE_FILE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg",
+}
+_MIME_TO_EXTENSION: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/x-icon": ".ico",
+    "image/vnd.microsoft.icon": ".ico",
+    "image/svg+xml": ".svg",
+}
+
+
+def _decode_data_uri(data_uri: str) -> QImage | None:
+    """Decode a ``data:image/...;base64,<...>`` URI to a ``QImage``.
+
+    Returns ``None`` when the URI is malformed, the base64 payload doesn't
+    decode, the decoded byte count exceeds the safety cap, or Qt declines
+    to load the bytes (unsupported MIME / corrupt header).
+    """
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    comma = data_uri.find(",")
+    if comma < 0:
+        return None
+    payload = data_uri[comma + 1 :]
+    # ``base64.b64decode`` is forgiving with whitespace but will raise on
+    # invalid padding/characters; treat any failure as a decode miss so the
+    # caller can swap in the failure placeholder.
+    try:
+        encoded = payload.encode("ascii", errors="ignore")
+        # Cheap pre-check: a base64 string of length L decodes to ~3*L/4
+        # bytes. Bail before the expensive decode if the upper bound
+        # already breaches the cap.
+        if len(encoded) // 4 * 3 > _MAX_IMAGE_DECODED_BYTES:
+            return None
+        decoded = base64.b64decode(encoded, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) > _MAX_IMAGE_DECODED_BYTES:
+        return None
+    image = QImage()
+    if not image.loadFromData(decoded):
+        return None
+    return image
+
+
+def _extract_markdown_attachments(
+    text: str,
+) -> tuple[str, tuple[Attachment, ...]]:
+    """Pull markdown image links out of ``text`` and into the attachment
+    channel.
+
+    Local file paths and ``data:image/...`` data URIs become ``Attachment``
+    entries with ``source="markdown"`` and the original ``![]()`` fragment
+    is removed from the rendered text. Remote ``http(s)://`` images are
+    left in place so Qt's native renderer can fetch them inline; no
+    download / zoom UX exists for those.
+    """
+    if not text or "![" not in text:
+        return text, ()
+    attachments: list[Attachment] = []
+
+    def replace(match: re.Match[str]) -> str:
+        src = match.group("src").strip()
+        alt = match.group("alt") or ""
+        if not src:
+            return match.group(0)
+        if src.startswith("data:"):
+            mime_match = re.match(r"^data:([a-z0-9.+\-]+/[a-z0-9.+\-]+);base64,", src, re.IGNORECASE)
+            mime = mime_match.group(1).lower() if mime_match else "image/octet-stream"
+            attachments.append(
+                Attachment(
+                    kind="image",
+                    mime=mime,
+                    data_uri=src,
+                    alt=alt or None,
+                    source="markdown",
+                )
+            )
+            return ""
+        lowered = src.lower()
+        if lowered.startswith(("http://", "https://")):
+            return match.group(0)
+        suffix = Path(src).suffix.lower()
+        if suffix in _IMAGE_FILE_EXTENSIONS:
+            attachments.append(
+                Attachment(
+                    kind="image",
+                    mime=_MIME_FROM_EXTENSION.get(suffix, "image/unknown"),
+                    path=src,
+                    alt=alt or None,
+                    source="markdown",
+                )
+            )
+            return ""
+        return match.group(0)
+
+    rewritten = _MARKDOWN_IMAGE_RE.sub(replace, text)
+    return rewritten, tuple(attachments)
+
+
+_MIME_FROM_EXTENSION: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+}
+
+
+def _suffix_for_mime(mime: str) -> str:
+    return _MIME_TO_EXTENSION.get(mime.lower(), ".png")
+
+
+def _load_attachment_image(attachment: Attachment) -> QImage | None:
+    """Resolve an attachment to a ``QImage``.
+
+    Tries the embedded data URI first (the common case for Codex payload
+    screenshots) and falls back to a filesystem path for markdown image
+    links. Returns ``None`` on any failure so the caller can show the
+    failure placeholder.
+    """
+    if attachment.data_uri:
+        image = _decode_data_uri(attachment.data_uri)
+        if image is not None:
+            return image
+    if attachment.path:
+        try:
+            resolved = Path(attachment.path)
+            if not resolved.is_absolute():
+                # MD links can be relative to the project root; resolve
+                # against the application working directory so a session
+                # opened with cwd=<project> picks them up.
+                resolved = Path.cwd() / resolved
+            if resolved.exists():
+                image = QImage(str(resolved))
+                if not image.isNull():
+                    return image
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+_ATTACHMENT_CARD_QSS = (
+    "QToolButton#SessionsAttachmentToolButton {{"
+    " background: transparent;"
+    " border: none;"
+    " border-radius: 6px;"
+    " padding: 4px;"
+    "}}"
+    "QToolButton#SessionsAttachmentToolButton:hover {{"
+    " background: {primary_ghost};"
+    "}}"
+    "QToolButton#SessionsAttachmentToolButton:pressed {{"
+    " background: {primary_band};"
+    "}}"
+    "QLabel#SessionsAttachmentHeaderLabel {{"
+    " color: rgba(255, 255, 255, 200);"
+    " font-size: 11px;"
+    " font-weight: 600;"
+    " letter-spacing: 0.4px;"
+    "}}"
+    "QLabel#SessionsAttachmentFailureLabel {{"
+    " color: rgba(255, 255, 255, 110);"
+    " font-size: 12px;"
+    "}}"
+    "QLabel#SessionsAttachmentCaption {{"
+    " color: rgba(255, 255, 255, 130);"
+    " font-size: 11px;"
+    "}}"
+).format(primary_ghost=PRIMARY_GHOST, primary_band=PRIMARY_BAND)
+
+
+class _AttachmentCard(QFrame):
+    """Base custom-painted frame for attachment cards (image or file).
+
+    Mirrors ``_BubbleFrame``'s paintEvent pattern — QSS background fills
+    don't reach QFrame subclasses sitting under ``WA_TranslucentBackground``
+    parents, so we paint a rounded SURFACE_PANEL fill with a 1px border in
+    ``paintEvent`` directly. Subclasses override ``_build_body`` to insert
+    the attachment-specific body widget below the header strip.
+    """
+
+    _RADIUS = 12.0
+
+    def __init__(self, attachment: Attachment, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._attachment = attachment
+        self.setObjectName("SessionsAttachmentCard")
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        self.setStyleSheet(_ATTACHMENT_CARD_QSS)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(_make_chip_icon(self._header_icon(), size=14), 0, Qt.AlignVCenter)
+        title_label = QLabel(self._header_text())
+        title_label.setObjectName("SessionsAttachmentHeaderLabel")
+        header.addWidget(title_label, 0, Qt.AlignVCenter)
+        header.addStretch(1)
+        for button in self._build_action_buttons():
+            header.addWidget(button, 0, Qt.AlignVCenter)
+        layout.addLayout(header)
+
+        body_widget = self._build_body()
+        if body_widget is not None:
+            layout.addWidget(body_widget)
+        caption = self._caption_text()
+        if caption:
+            caption_label = QLabel(caption)
+            caption_label.setObjectName("SessionsAttachmentCaption")
+            caption_label.setWordWrap(True)
+            layout.addWidget(caption_label)
+
+    # ----- Subclass hooks --------------------------------------------------
+
+    def _header_icon(self) -> QIcon:
+        return _file_icon()
+
+    def _header_text(self) -> str:
+        return _t("Attachment")
+
+    def _build_action_buttons(self) -> list[QToolButton]:
+        return []
+
+    def _build_body(self) -> QWidget | None:
+        return None
+
+    def _caption_text(self) -> str | None:
+        return None
+
+    # ----- Painting --------------------------------------------------------
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        del event
+        fill = _qcolor_from_token(SURFACE_PANEL)
+        border = _qcolor_from_token(SURFACE_PANEL_BORDER)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, self._RADIUS, self._RADIUS)
+        painter.fillPath(path, fill)
+        painter.setPen(QPen(border, 1.0))
+        painter.drawPath(path)
+        painter.end()
+
+
+class _ImageBody(QLabel):
+    """Click-to-zoom image surface inside an ``_ImageCard``.
+
+    Carries the activation signal as a callable rather than a real Qt
+    signal to keep the inheritance chain shallow (QLabel does not emit
+    natural click events).
+    """
+
+    def __init__(self, on_activate: Callable[[], None], parent: QWidget | None = None):
+        super().__init__(parent)
+        self._on_activate = on_activate
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self._on_activate()
+        super().mouseReleaseEvent(event)
+
+
+class _ImageCard(_AttachmentCard):
+    """Attachment card showing a single image with zoom + download chrome.
+
+    Mirrors the Claude History Viewer pattern from the user's reference:
+    header strip with image icon + 图像 label + zoom + download buttons,
+    body shows the pixmap scaled into the card width. Click the image to
+    open ``_ImageZoomDialog`` at full resolution; click download to save
+    via ``QFileDialog``.
+    """
+
+    def __init__(self, attachment: Attachment, parent: QWidget) -> None:
+        self._image: QImage | None = None
+        self._pixmap: QPixmap | None = None
+        self._body_label: QLabel | None = None
+        self._image_index: int = 0
+        super().__init__(attachment, parent)
+
+    def set_image_index(self, index: int) -> None:
+        # Used to disambiguate save filenames when a single bubble carries
+        # multiple images. Set after construction by the bubble.
+        self._image_index = index
+
+    # ----- Subclass hooks --------------------------------------------------
+
+    def _header_icon(self) -> QIcon:
+        return _image_icon()
+
+    def _header_text(self) -> str:
+        return _t("Image")
+
+    def _build_action_buttons(self) -> list[QToolButton]:
+        zoom_button = QToolButton(self)
+        zoom_button.setObjectName("SessionsAttachmentToolButton")
+        zoom_button.setIcon(_zoom_in_icon())
+        zoom_button.setIconSize(QSize(14, 14))
+        zoom_button.setCursor(QCursor(Qt.PointingHandCursor))
+        zoom_button.setToolTip(_t("Zoom image"))
+        zoom_button.clicked.connect(self._open_zoom_dialog)
+
+        download_button = QToolButton(self)
+        download_button.setObjectName("SessionsAttachmentToolButton")
+        download_button.setIcon(_download_icon())
+        download_button.setIconSize(QSize(14, 14))
+        download_button.setCursor(QCursor(Qt.PointingHandCursor))
+        download_button.setToolTip(_t("Download image"))
+        download_button.clicked.connect(self._save_image)
+        return [zoom_button, download_button]
+
+    def _build_body(self) -> QWidget | None:
+        body = _ImageBody(self._open_zoom_dialog, self)
+        body.setObjectName("SessionsAttachmentImageBody")
+        body.setMinimumHeight(120)
+        body.setMaximumHeight(360)
+        self._body_label = body
+        return body
+
+    def _caption_text(self) -> str | None:
+        alt = (self._attachment.alt or "").strip()
+        if not alt or alt.lower() == "high":
+            # ``detail: "high"`` is the OpenAI image-detail flag and never
+            # useful as a caption — skip it. Real markdown alt-text falls
+            # through.
+            return None
+        return alt
+
+    # ----- Lifecycle -------------------------------------------------------
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        if self._image is None:
+            self._image = _load_attachment_image(self._attachment)
+            if self._image is None:
+                self._show_failure_placeholder()
+            else:
+                self._pixmap = QPixmap.fromImage(self._image)
+        self._update_pixmap_for_width()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._update_pixmap_for_width()
+
+    def _show_failure_placeholder(self) -> None:
+        body = self._body_label
+        if body is None:
+            return
+        body.setObjectName("SessionsAttachmentFailureLabel")
+        body.setStyleSheet(self.styleSheet())
+        body.setText(_t("Image failed to load"))
+        body.setCursor(QCursor(Qt.ArrowCursor))
+        body.setMinimumSize(200, 120)
+        body.setMaximumHeight(160)
+
+    def _update_pixmap_for_width(self) -> None:
+        body = self._body_label
+        if body is None or self._pixmap is None or self._pixmap.isNull():
+            return
+        # Available width = card width minus card padding (10 + 10) so the
+        # pixmap fits the body precisely.
+        card_width = max(self.width() - 20, 0)
+        target_width = min(card_width, _IMAGE_CARD_MAX_WIDTH)
+        if target_width <= 0:
+            return
+        pixmap_width = self._pixmap.width()
+        pixmap_height = self._pixmap.height()
+        if pixmap_width <= 0 or pixmap_height <= 0:
+            return
+        if pixmap_width <= target_width:
+            scaled = self._pixmap
+        else:
+            scaled = self._pixmap.scaledToWidth(target_width, Qt.SmoothTransformation)
+        body.setPixmap(scaled)
+        body.setMinimumHeight(min(scaled.height(), 360))
+        body.setMaximumHeight(scaled.height())
+
+    # ----- Actions ---------------------------------------------------------
+
+    def _open_zoom_dialog(self) -> None:
+        if self._image is None:
+            return
+        dialog = _ImageZoomDialog(self._image, self._attachment, self)
+        dialog.show()
+        dialog.install_dwm_chrome_after_show()
+
+    def _save_image(self) -> None:
+        if self._image is None:
+            return
+        suffix = _suffix_for_mime(self._attachment.mime)
+        default_name = f"cqv-image-{self._image_index + 1:03d}{suffix}"
+        filter_label = _t("Image files ({extensions})").format(
+            extensions="*.png *.jpg *.jpeg *.gif *.webp *.bmp"
+        )
+        all_files = _t("All files (*)")
+        save_path, _selected = QFileDialog.getSaveFileName(
+            self,
+            _t("Save image as..."),
+            default_name,
+            f"{filter_label};;{all_files}",
+        )
+        if not save_path:
+            return
+        if not self._image.save(save_path):
+            QMessageBox.warning(
+                self,
+                _t("Save image"),
+                _t("Failed to save image: {error}").format(error=save_path),
+            )
+
+
+class _FileCard(_AttachmentCard):
+    """Forward-looking placeholder card for non-image file attachments.
+
+    Codex Desktop does not currently emit ``input_file`` content parts in
+    session JSONL, but the parser already accepts the shape so when the
+    payload appears we can render it without re-architecting. The card
+    shows a name + MIME row and a single download button.
+    """
+
+    def _header_icon(self) -> QIcon:
+        return _file_icon()
+
+    def _header_text(self) -> str:
+        return self._attachment.name or _t("Attachment")
+
+    def _build_action_buttons(self) -> list[QToolButton]:
+        download_button = QToolButton(self)
+        download_button.setObjectName("SessionsAttachmentToolButton")
+        download_button.setIcon(_download_icon())
+        download_button.setIconSize(QSize(14, 14))
+        download_button.setCursor(QCursor(Qt.PointingHandCursor))
+        download_button.setToolTip(_t("Download image"))
+        download_button.clicked.connect(self._save_file)
+        return [download_button]
+
+    def _build_body(self) -> QWidget | None:
+        info = QLabel(self._attachment.mime, self)
+        info.setObjectName("SessionsAttachmentCaption")
+        info.setWordWrap(True)
+        return info
+
+    def _save_file(self) -> None:
+        default_name = self._attachment.name or "attachment"
+        save_path, _selected = QFileDialog.getSaveFileName(
+            self,
+            _t("Save image as..."),
+            default_name,
+            _t("All files (*)"),
+        )
+        if not save_path:
+            return
+        if self._attachment.data_uri:
+            decoded_bytes = _decode_data_uri_to_bytes(self._attachment.data_uri)
+            if decoded_bytes is None:
+                QMessageBox.warning(self, _t("Save image"), _t("Failed to save image: {error}").format(error=save_path))
+                return
+            try:
+                Path(save_path).write_bytes(decoded_bytes)
+            except OSError as exc:
+                QMessageBox.warning(
+                    self, _t("Save image"), _t("Failed to save image: {error}").format(error=str(exc))
+                )
+
+
+def _decode_data_uri_to_bytes(data_uri: str) -> bytes | None:
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    comma = data_uri.find(",")
+    if comma < 0:
+        return None
+    payload = data_uri[comma + 1 :]
+    try:
+        return base64.b64decode(payload.encode("ascii", errors="ignore"), validate=False)
+    except (binascii.Error, ValueError):
+        return None
+
+
+class _ImageZoomDialog(_FrostedSurface):
+    """Frosted full-resolution image viewer.
+
+    Subclass of ``_FrostedSurface`` (per CLAUDE.md UI principle 5: any new
+    floating popup goes through the canonical primitive) — gives us the
+    acrylic blur, DWM-rounded corners, and ESC dismissal for free. The
+    body is a ``QScrollArea`` so very tall screenshots can still pan.
+    """
+
+    RADIUS = 14.0
+    DISMISS_ON_ESCAPE = True
+    DISMISS_ON_DEACTIVATE = False
+    ACCEPT_FOCUS = True
+
+    def __init__(
+        self,
+        image: QImage,
+        attachment: Attachment,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent=parent, as_window=True)
+        self._image = image
+        self._attachment = attachment
+        self.setWindowTitle(_t("Image"))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 16)
+        outer.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        title_icon = _make_chip_icon(_image_icon(), size=14)
+        header.addWidget(title_icon, 0, Qt.AlignVCenter)
+        title_label = QLabel(_t("Image"))
+        title_label.setObjectName("SessionsAttachmentHeaderLabel")
+        header.addWidget(title_label, 0, Qt.AlignVCenter)
+        header.addStretch(1)
+        save_button = QPushButton(_t("Save image"), self)
+        save_button.setCursor(QCursor(Qt.PointingHandCursor))
+        save_button.clicked.connect(self._save)
+        header.addWidget(save_button, 0, Qt.AlignVCenter)
+        close_button = QToolButton(self)
+        close_button.setObjectName("SessionsAttachmentToolButton")
+        close_button.setStyleSheet(_ATTACHMENT_CARD_QSS)
+        close_button.setIcon(_x_icon())
+        close_button.setIconSize(QSize(14, 14))
+        close_button.setCursor(QCursor(Qt.PointingHandCursor))
+        close_button.setToolTip(_t("Close"))
+        close_button.clicked.connect(self.close)
+        header.addWidget(close_button, 0, Qt.AlignVCenter)
+        outer.addLayout(header)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        canvas = QLabel(self)
+        canvas.setAlignment(Qt.AlignCenter)
+        canvas.setPixmap(QPixmap.fromImage(image))
+        canvas.setStyleSheet("background: transparent;")
+        scroll.setWidget(canvas)
+        outer.addWidget(scroll, 1)
+
+        target_w = min(image.width() + 40, 1280)
+        target_h = min(image.height() + 110, 900)
+        self.resize(max(target_w, 480), max(target_h, 360))
+
+    def install_dwm_chrome_after_show(self) -> None:
+        # Per ``frosted_surface.py`` — DWM chrome must be installed AFTER
+        # ``show()`` because the call requires a valid native HWND. The
+        # caller invokes this right after ``show()``.
+        try:
+            self.install_dwm_chrome()
+        except Exception:
+            # DWM is best-effort; on failure the window still renders, just
+            # without acrylic. Don't let a chrome miss break the dialog.
+            pass
+
+    def _save(self) -> None:
+        suffix = _suffix_for_mime(self._attachment.mime)
+        default_name = f"cqv-image-001{suffix}"
+        filter_label = _t("Image files ({extensions})").format(
+            extensions="*.png *.jpg *.jpeg *.gif *.webp *.bmp"
+        )
+        all_files = _t("All files (*)")
+        save_path, _selected = QFileDialog.getSaveFileName(
+            self,
+            _t("Save image as..."),
+            default_name,
+            f"{filter_label};;{all_files}",
+        )
+        if not save_path:
+            return
+        if not self._image.save(save_path):
+            QMessageBox.warning(
+                self,
+                _t("Save image"),
+                _t("Failed to save image: {error}").format(error=save_path),
+            )
 
 
 def _path_segments(value: str) -> list[str]:

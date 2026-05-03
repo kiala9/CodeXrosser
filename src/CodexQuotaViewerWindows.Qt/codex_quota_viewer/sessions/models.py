@@ -10,6 +10,68 @@ SessionStatus = Literal["active", "archived", "deleted_pending_purge", "restorab
 TimelineKind = Literal["message:user", "message:assistant", "tool_call"]
 
 
+AttachmentKind = Literal["image", "file"]
+AttachmentSource = Literal["payload", "markdown"]
+
+
+@dataclass(frozen=True)
+class Attachment:
+    kind: AttachmentKind
+    mime: str
+    data_uri: str | None = None
+    path: str | None = None
+    alt: str | None = None
+    name: str | None = None
+    source: AttachmentSource = "payload"
+
+    def to_json(self) -> dict[str, Any]:
+        # ``data_uri`` is intentionally preserved for repository round-tripping
+        # (image bytes live in SQLite alongside the timeline) but is dropped
+        # from IPC payloads via ``to_ipc_json`` below.
+        payload: dict[str, Any] = {
+            "kind": self.kind,
+            "mime": self.mime,
+            "source": self.source,
+        }
+        if self.data_uri is not None:
+            payload["dataUri"] = self.data_uri
+        if self.path is not None:
+            payload["path"] = self.path
+        if self.alt is not None:
+            payload["alt"] = self.alt
+        if self.name is not None:
+            payload["name"] = self.name
+        return payload
+
+    def to_ipc_json(self) -> dict[str, Any]:
+        payload = self.to_json()
+        payload.pop("dataUri", None)
+        return payload
+
+    @classmethod
+    def from_json(cls, value: Any) -> "Attachment | None":
+        if not isinstance(value, dict):
+            return None
+        kind = value.get("kind")
+        if kind not in ("image", "file"):
+            return None
+        mime = value.get("mime")
+        if not isinstance(mime, str):
+            return None
+        source = value.get("source")
+        if source not in ("payload", "markdown"):
+            source = "payload"
+        return cls(
+            kind=kind,  # type: ignore[arg-type]
+            mime=mime,
+            data_uri=value.get("dataUri") if isinstance(value.get("dataUri"), str) else None,
+            path=value.get("path") if isinstance(value.get("path"), str) else None,
+            alt=value.get("alt") if isinstance(value.get("alt"), str) else None,
+            name=value.get("name") if isinstance(value.get("name"), str) else None,
+            source=source,  # type: ignore[arg-type]
+        )
+
+
 @dataclass(frozen=True)
 class SessionFileSummary:
     id: str
@@ -38,6 +100,7 @@ class SessionTimelineItem:
     input: str = ""
     output: str = ""
     status: Literal["pending", "completed", "errored"] | None = None
+    attachments: tuple[Attachment, ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         if self.type == "tool_call":
@@ -51,12 +114,15 @@ class SessionTimelineItem:
                 "output": self.output,
                 "status": self.status or "pending",
             }
-        return {
+        payload: dict[str, Any] = {
             "id": self.id,
             "type": self.type,
             "timestamp": self.timestamp,
             "text": self.text,
         }
+        if self.attachments:
+            payload["attachments"] = [att.to_ipc_json() for att in self.attachments]
+        return payload
 
 
 @dataclass(frozen=True)

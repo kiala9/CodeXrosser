@@ -171,6 +171,19 @@ ZH_HANS: dict[str, str] = {
     "Select a snapshot first.": "请先选择一个快照。",
     "Delete Snapshot": "删除快照",
     "Delete {target} snapshot {snapshot_id}? This cannot be undone.": "删除 {target} 快照 {snapshot_id}？此操作不可撤销。",
+    "Image": "图像",
+    "Attachment": "附件",
+    "Image failed to load": "图像加载失败",
+    "Save image": "保存图像",
+    "Save image as...": "图像另存为...",
+    "Zoom image": "放大图像",
+    "Download image": "下载图像",
+    "Close": "关闭",
+    "Image saved to {path}": "图像已保存到 {path}",
+    "Failed to save image: {error}": "保存图像失败：{error}",
+    "Open file": "打开文件",
+    "Image files ({extensions})": "图像文件（{extensions}）",
+    "All files (*)": "所有文件 (*)",
 }
 
 
