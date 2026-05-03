@@ -28,7 +28,6 @@ from PySide6.QtGui import (
     QFont,
     QGuiApplication,
     QIcon,
-    QImage,
     QPainter,
     QPainterPath,
     QPen,
@@ -82,6 +81,7 @@ from .design_tokens import (
     TOOL_GHOST,
     TOOL_TINT,
 )
+from .frosted_surface import _FrostedSurface
 from .models import CodexHomeTarget
 from .sessions import (
     AuditEntry,
@@ -172,117 +172,7 @@ class SessionsViewState:
 
 
 
-# --- Native Windows acrylic blur for top-level frameless popups -------------
-#
-# Mirrors the helpers in qt_app.py. Inlined here to avoid a circular import
-# (qt_app imports SessionsPage from this module). Both functions are no-ops
-# on non-Windows platforms; the popup falls back to the painted background.
-
-def _install_acrylic_blur_for_popup(window: QWidget, *, tint_alpha: int = 58) -> bool:
-    """Enable Windows Terminal-style acrylic blur behind a frameless window."""
-    try:
-        import sys
-        if sys.platform != "win32":
-            return False
-        import ctypes
-        from ctypes import wintypes
-
-        class _AccentPolicy(ctypes.Structure):
-            _fields_ = [
-                ("AccentState", ctypes.c_int),
-                ("AccentFlags", ctypes.c_int),
-                ("GradientColor", ctypes.c_uint),
-                ("AnimationId", ctypes.c_int),
-            ]
-
-        class _WindowCompositionAttributeData(ctypes.Structure):
-            _fields_ = [
-                ("Attribute", ctypes.c_int),
-                ("Data", ctypes.c_void_p),
-                ("SizeOfData", ctypes.c_size_t),
-            ]
-
-        set_window_composition_attribute = (
-            ctypes.windll.user32.SetWindowCompositionAttribute
-        )
-        set_window_composition_attribute.argtypes = [
-            wintypes.HWND,
-            ctypes.POINTER(_WindowCompositionAttributeData),
-        ]
-        set_window_composition_attribute.restype = wintypes.BOOL
-
-        ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
-        WCA_ACCENT_POLICY = 19
-        # GradientColor is AABBGGRR. Match the dark-info tint used by the
-        # main-window status footer so the search popup feels native.
-        alpha = min(255, max(0, int(tint_alpha)))
-        red, green, blue = 24, 31, 36
-        tint = (alpha << 24) | (blue << 16) | (green << 8) | red
-        accent = _AccentPolicy(ACCENT_ENABLE_ACRYLICBLURBEHIND, 2, tint, 0)
-        data = _WindowCompositionAttributeData(
-            WCA_ACCENT_POLICY,
-            ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p),
-            ctypes.sizeof(accent),
-        )
-        return bool(
-            set_window_composition_attribute(
-                wintypes.HWND(int(window.winId())), ctypes.byref(data)
-            )
-        )
-    except Exception:
-        return False
-
-
-def _install_dialog_chrome_for_popup(
-    window: QWidget,
-    *,
-    corner_preference: int = 2,
-) -> None:
-    """Win11 rounded corners + transparent border for frameless windows.
-
-    ``corner_preference`` maps to the DWMWCP_* constants:
-
-      * ``0`` = ``DWMWCP_DEFAULT`` (system decides)
-      * ``1`` = ``DWMWCP_DONOTROUND`` — keep the HWND rectangular and
-        let the caller's ``paintEvent`` own all corner rounding.
-        Use this when the painted corner radius is larger than Win11's
-        ~8px default rounding, otherwise the DWM clip leaves a thin
-        ring between the two radii where the system drop shadow shows
-        through (visible as a soft "shadow on the top corners" on
-        compact toolbars).
-      * ``2`` = ``DWMWCP_ROUND`` (default, Win11 large radius ≈ 8px)
-      * ``3`` = ``DWMWCP_ROUNDSMALL`` (Win11 small radius)
-    """
-    try:
-        import sys
-        if sys.platform != "win32":
-            return
-        import ctypes
-        from ctypes import wintypes
-
-        DWMWA_WINDOW_CORNER_PREFERENCE = 33
-        DWMWA_BORDER_COLOR = 34
-        DWMWA_COLOR_NONE = 0xFFFFFFFE
-        hwnd = wintypes.HWND(int(window.winId()))
-        value = ctypes.c_int(int(corner_preference))
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd,
-            ctypes.c_int(DWMWA_WINDOW_CORNER_PREFERENCE),
-            ctypes.byref(value),
-            ctypes.sizeof(value),
-        )
-        border = ctypes.c_uint(DWMWA_COLOR_NONE)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd,
-            ctypes.c_int(DWMWA_BORDER_COLOR),
-            ctypes.byref(border),
-            ctypes.sizeof(border),
-        )
-    except Exception:
-        pass
-
-
-class _SessionsSearchPopup(QFrame):
+class _SessionsSearchPopup(_FrostedSurface):
     """Frameless top-level search popup with a translucent painted background.
 
     On Windows the parent installs native acrylic blur via SetWindowComposition-
@@ -295,94 +185,23 @@ class _SessionsSearchPopup(QFrame):
       native acrylic blur on this HWND (matching the status notification).
       Qt.Popup looks the same painted but the HWND it produces is treated by
       DWM as a transient/menu surface and the acrylic call is rejected.
+
+    Painted radius is 14px — deliberately oversized vs. Win11's ~8px DWM
+    ROUND clip so the painted arc visually swallows the shadow ring at
+    each corner. The taller popup body hides the ring artifact that
+    plagues the wide-flat floating action bar.
     """
 
-    dismiss_requested = Signal()
+    RADIUS = 14.0
+    BORDER_RADIUS = 13.5
+    INNER_RADIUS = 12.5
+    ACCEPT_FOCUS = True
+    DISMISS_ON_ESCAPE = True
+    DISMISS_ON_DEACTIVATE = True
 
     def __init__(self, parent: QWidget | None = None):
-        super().__init__(
-            parent,
-            Qt.Tool
-            | Qt.FramelessWindowHint
-            | Qt.NoDropShadowWindowHint,
-        )
+        super().__init__(parent, as_window=True)
         self.setObjectName("SessionsSearchPopup")
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_NoSystemBackground, True)
-        self.setAutoFillBackground(False)
-        self.setFrameShape(QFrame.NoFrame)
-        self.setLineWidth(0)
-        self.setMidLineWidth(0)
-        # Popup must accept focus so the user can type into the QLineEdit.
-        self.setFocusPolicy(Qt.StrongFocus)
-        self._native_acrylic = False
-
-    def set_native_acrylic(self, enabled: bool) -> None:
-        if self._native_acrylic == enabled:
-            return
-        self._native_acrylic = enabled
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        del event
-        dpr = self.devicePixelRatioF()
-        buffer = QImage(
-            max(1, int(self.width() * dpr)),
-            max(1, int(self.height() * dpr)),
-            QImage.Format_ARGB32_Premultiplied,
-        )
-        buffer.setDevicePixelRatio(dpr)
-        buffer.fill(Qt.transparent)
-
-        rect = QRectF(self.rect())
-        path = QPainterPath()
-        path.addRoundedRect(rect, 14.0, 14.0)
-
-        painter = QPainter(buffer)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setClipPath(path)
-
-        # Info-style surface, matching StatusPopupFrame's "info" severity.
-        base = QColor(18, 39, 54, 222)
-        border = QColor(10, 132, 255, 165)
-        tint = QColor(10, 132, 255, 30)
-        if self._native_acrylic:
-            base.setAlpha(46)
-            tint.setAlpha(14)
-        painter.fillPath(path, base)
-        painter.fillPath(path, tint)
-        painter.setClipping(False)
-
-        border_rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        border_path = QPainterPath()
-        border_path.addRoundedRect(border_rect, 13.5, 13.5)
-        painter.setPen(QPen(border, 1.0))
-        painter.drawPath(border_path)
-        inner = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
-        inner_path = QPainterPath()
-        inner_path.addRoundedRect(inner, 12.5, 12.5)
-        painter.setPen(QPen(QColor(255, 255, 255, 18), 1.0))
-        painter.drawPath(inner_path)
-        painter.end()
-
-        target = QPainter(self)
-        target.setCompositionMode(QPainter.CompositionMode_Source)
-        target.drawImage(0, 0, buffer)
-        target.end()
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if event.key() == Qt.Key_Escape:
-            event.accept()
-            self.dismiss_requested.emit()
-            return
-        super().keyPressEvent(event)
-
-    def event(self, event) -> bool:
-        # Closing on WindowDeactivate gives a click-outside-to-dismiss UX
-        # without spawning a separate transparent click-catcher widget.
-        if event.type() == QEvent.WindowDeactivate and self.isVisible():
-            self.dismiss_requested.emit()
-        return super().event(event)
 
 
 class _SessionsFilterPopup(_SessionsSearchPopup):
@@ -569,7 +388,7 @@ class _ScrollJumpButton(QWidget):
         super().mouseReleaseEvent(event)
 
 
-class _SessionsFloatingActionBar(QFrame):
+class _SessionsFloatingActionBar(_FrostedSurface):
     """Frosted-glass floating action bar.
 
     Built as a top-level ``Qt.Tool`` translucent window (same recipe as
@@ -578,8 +397,7 @@ class _SessionsFloatingActionBar(QFrame):
     child widget can't host ``SetWindowCompositionAttribute`` — the
     OS only blurs at the HWND boundary — so a previous attempt that
     layered tint + highlight on a child QFrame still read as a flat
-    translucent rectangle next to the search/filter popups, which is
-    exactly the gap the user reported.
+    translucent rectangle next to the search/filter popups.
 
     Lifecycle is owned by ``SessionsPage``: the page reparents the bar
     on construction (so destruction is automatic), shows/hides it on
@@ -588,97 +406,24 @@ class _SessionsFloatingActionBar(QFrame):
     NOT follow their Qt parent's screen position automatically, so
     every layout-affecting event has to fire ``mapToGlobal`` and
     ``move``).
+
+    Painted radius is matched to Win11's DWM ``DWMWCP_ROUND`` clip
+    (~8px) so the rounded fill reaches the same arc that DWM masks the
+    HWND with. With a 12px fill against an 8px DWM clip, the 4px ring
+    at each corner — DWM-visible but outside the painted curve — was
+    transparent and leaked the acrylic backdrop's dark tint, reading
+    as a faint shadow on the top corners. The search popup gets away
+    with 14px paint because its taller body visually swallows the same
+    ring; the wide-flat toolbar makes the artifact stand out.
     """
 
+    RADIUS = 8.0
+    BORDER_RADIUS = 7.5
+    INNER_RADIUS = 6.5
+
     def __init__(self, parent: QWidget | None = None):
-        super().__init__(
-            parent,
-            Qt.Tool
-            | Qt.FramelessWindowHint
-            | Qt.NoDropShadowWindowHint
-            | Qt.WindowDoesNotAcceptFocus,
-        )
+        super().__init__(parent, as_window=True)
         self.setObjectName("SessionsFloatingActions")
-        self.setFrameShape(QFrame.NoFrame)
-        self.setLineWidth(0)
-        self.setMidLineWidth(0)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_NoSystemBackground, True)
-        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.setAutoFillBackground(False)
-        self.setFocusPolicy(Qt.NoFocus)
-        # Toggled by the host once Windows acrylic blur is verified to
-        # have taken effect on this HWND. Drops the painted base alpha
-        # so the OS-level blurred backdrop shows through cleanly,
-        # matching the search/filter popup behaviour.
-        self._native_acrylic = False
-
-    def set_native_acrylic(self, enabled: bool) -> None:
-        if self._native_acrylic == enabled:
-            return
-        self._native_acrylic = enabled
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        del event
-        dpr = self.devicePixelRatioF()
-        buffer = QImage(
-            max(1, int(self.width() * dpr)),
-            max(1, int(self.height() * dpr)),
-            QImage.Format_ARGB32_Premultiplied,
-        )
-        buffer.setDevicePixelRatio(dpr)
-        buffer.fill(Qt.transparent)
-
-        # Painted radius matched to Win11's DWM ROUND clip radius
-        # (~8px) so the rounded fill reaches the same arc that DWM
-        # masks the HWND with. With our previous 12px fill against an
-        # 8px DWM clip, the 4px ring at each corner — DWM-visible but
-        # outside our painted curve — was transparent and leaked the
-        # acrylic backdrop's dark tint, reading as a faint shadow on
-        # the top corners. The search popup gets away with 14px paint
-        # because its taller body visually swallows the same ring;
-        # the wide-flat toolbar makes the artifact stand out.
-        # 8px outer fill, 7.5 border (1px stroke pixel-aligned at 0.5
-        # offset), 6.5 inner highlight (1px stroke at 1.5 offset).
-        rect = QRectF(self.rect())
-        path = QPainterPath()
-        path.addRoundedRect(rect, 8.0, 8.0)
-
-        painter = QPainter(buffer)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setClipPath(path)
-
-        # Info-style surface — same colours as ``_SessionsSearchPopup``
-        # and the info-severity ``StatusPopupFrame`` so the three
-        # frosted Sessions surfaces read as one family.
-        base = QColor(18, 39, 54, 222)
-        border = QColor(10, 132, 255, 165)
-        tint = QColor(10, 132, 255, 30)
-        if self._native_acrylic:
-            base.setAlpha(46)
-            tint.setAlpha(14)
-        painter.fillPath(path, base)
-        painter.fillPath(path, tint)
-        painter.setClipping(False)
-
-        border_rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        border_path = QPainterPath()
-        border_path.addRoundedRect(border_rect, 7.5, 7.5)
-        painter.setPen(QPen(border, 1.0))
-        painter.drawPath(border_path)
-
-        inner = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
-        inner_path = QPainterPath()
-        inner_path.addRoundedRect(inner, 6.5, 6.5)
-        painter.setPen(QPen(QColor(255, 255, 255, 18), 1.0))
-        painter.drawPath(inner_path)
-        painter.end()
-
-        target = QPainter(self)
-        target.setCompositionMode(QPainter.CompositionMode_Source)
-        target.drawImage(0, 0, buffer)
-        target.end()
 
 
 class _SessionsTreeModel(QStandardItemModel):
@@ -1763,7 +1508,6 @@ class SessionsPage(QWidget):
         # hidden via stack-widget swap, only when the parent's window
         # itself is hidden).
         self._floating_actions_window_filter_installed = False
-        self._floating_actions_acrylic_installed = False
         # Set in showEvent and cleared by either the tree viewport's
         # first paint after show (preferred — see ``eventFilter``) or
         # a fallback timer (in case the tree never paints, e.g. an
@@ -2055,7 +1799,6 @@ class SessionsPage(QWidget):
         # by the buffered paintEvent (CompositionMode_Source).
         self._search_popup.setStyleSheet(_LIST_CARD_QSS)
         self._search_popup.dismiss_requested.connect(self._dismiss_search_popup)
-        self._search_popup_chrome_installed = False
         popup_layout = QHBoxLayout(self._search_popup)
         popup_layout.setContentsMargins(14, 12, 14, 12)
         popup_layout.setSpacing(10)
@@ -2089,7 +1832,6 @@ class SessionsPage(QWidget):
         self._status_filter_popup.dismiss_requested.connect(
             self._dismiss_status_filter_popup
         )
-        self._status_filter_popup_chrome_installed = False
         status_popup_layout = QVBoxLayout(self._status_filter_popup)
         status_popup_layout.setContentsMargins(8, 8, 8, 8)
         status_popup_layout.setSpacing(2)
@@ -2374,11 +2116,7 @@ class SessionsPage(QWidget):
         self._position_search_popup()
         self._search_popup.show()
         self._search_popup.raise_()
-        if not self._search_popup_chrome_installed:
-            _install_dialog_chrome_for_popup(self._search_popup)
-            if _install_acrylic_blur_for_popup(self._search_popup, tint_alpha=58):
-                self._search_popup.set_native_acrylic(True)
-            self._search_popup_chrome_installed = True
+        self._search_popup.install_dwm_chrome()
         self._search_popup.activateWindow()
         self._search.setFocus(Qt.PopupFocusReason)
         self._search.selectAll()
@@ -2445,13 +2183,7 @@ class SessionsPage(QWidget):
         self._position_status_filter_popup()
         self._status_filter_popup.show()
         self._status_filter_popup.raise_()
-        if not self._status_filter_popup_chrome_installed:
-            _install_dialog_chrome_for_popup(self._status_filter_popup)
-            if _install_acrylic_blur_for_popup(
-                self._status_filter_popup, tint_alpha=58
-            ):
-                self._status_filter_popup.set_native_acrylic(True)
-            self._status_filter_popup_chrome_installed = True
+        self._status_filter_popup.install_dwm_chrome()
         self._status_filter_popup.activateWindow()
         active_btn = self._status_filter_row_buttons.get(self._status_filter_key)
         if active_btn is not None:
@@ -3100,32 +2832,26 @@ class SessionsPage(QWidget):
         QTimer.singleShot(0, self._install_floating_actions_acrylic)
 
     def _install_floating_actions_acrylic(self) -> None:
-        """Apply Windows native acrylic blur + DWM rounded corners +
-        transparent border to the floating bar's HWND. Idempotent —
-        only runs once. Mirrors the install path used by the search
-        popup so all three frosted Sessions surfaces feel consistent.
+        """Install Windows acrylic blur + DWM rounded corners on the
+        floating bar's HWND once it's mapped.
 
-        Earlier we tried ``DWMWCP_DONOTROUND`` thinking it would erase
-        a small painted-vs-clipped corner shadow; instead it left the
-        HWND rectangular and the acrylic backdrop bled into the
-        rectangular corner "ears" outside our 12px painted rounding,
+        ``install_dwm_chrome`` is itself idempotent, but we still need
+        the visibility check: ``winId()`` realises a top-level proxy
+        too early if the bar hasn't been shown yet, and the OS would
+        then refuse the acrylic install on the wrong HWND.
+
+        Historical note: ``DWMWCP_DONOTROUND`` was tried thinking it
+        would erase a small painted-vs-clipped corner shadow; instead
+        it left the HWND rectangular and the acrylic backdrop bled
+        into the rectangular corner "ears" outside the painted rounding,
         producing a much louder blue glow. The default DWM ROUND clip
-        is the right call here even with a small radius mismatch —
-        the OS handles all the corner pixels itself.
+        is the right call here even with a small radius mismatch — the
+        OS handles all the corner pixels itself.
         """
-        if self._floating_actions_acrylic_installed:
-            return
         bar = getattr(self, "_floating_actions", None)
-        if bar is None:
+        if bar is None or not bar.isVisible():
             return
-        # The HWND only exists once the window has been shown at least
-        # once; ``winId()`` would create a top-level proxy too early.
-        if not bar.isVisible():
-            return
-        if _install_acrylic_blur_for_popup(bar, tint_alpha=58):
-            bar.set_native_acrylic(True)
-            _install_dialog_chrome_for_popup(bar)
-        self._floating_actions_acrylic_installed = True
+        bar.install_dwm_chrome()
 
     def _capture_expansion(self) -> set[tuple[str, str]]:
         expanded: set[tuple[str, str]] = set()
@@ -3368,7 +3094,6 @@ class _SessionDetailPanel(QFrame):
         # pattern (which re-applies _LIST_CARD_QSS to itself).
         self._filter_popup.setStyleSheet(_DETAIL_PANEL_QSS)
         self._filter_popup.dismiss_requested.connect(self._dismiss_filter_popup)
-        self._filter_popup_chrome_installed = False
         layout.addLayout(self._build_detail_toolbar_row())
         self._populate_filter_popup()
 
@@ -3739,11 +3464,7 @@ class _SessionDetailPanel(QFrame):
         self._position_filter_popup()
         self._filter_popup.show()
         self._filter_popup.raise_()
-        if not self._filter_popup_chrome_installed:
-            _install_dialog_chrome_for_popup(self._filter_popup)
-            if _install_acrylic_blur_for_popup(self._filter_popup, tint_alpha=58):
-                self._filter_popup.set_native_acrylic(True)
-            self._filter_popup_chrome_installed = True
+        self._filter_popup.install_dwm_chrome()
         self._filter_popup.activateWindow()
 
     def _position_filter_popup(self) -> None:
