@@ -1316,3 +1316,139 @@ def test_scroll_jump_buttons_jump_to_extreme_values() -> None:
     assert scrollbar.value() == 0
     panel._scroll_to_bottom()
     assert scrollbar.value() == 5_000
+
+
+def _build_search_timeline(total: int, marker: str, matches_at: range) -> list[Any]:
+    """Synthetic timeline for the search-filter tests. Items at the
+    `matches_at` indices have ``marker`` appended to their text so a
+    substring search hits exactly those positions; every item is a
+    plain message (no tool_calls) so coalescing is 1 item = 1 block."""
+    from codex_quota_viewer.sessions.models import SessionTimelineItem
+    matches = set(matches_at)
+    return [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp=f"2026-01-01T00:00:{i % 60:02d}Z",
+            text=f"item {i} {marker}" if i in matches else f"item {i}",
+        )
+        for i in range(total)
+    ]
+
+
+def test_search_filter_packs_matches_into_contiguous_window() -> None:
+    """All matched bubbles must be materialized contiguously, even when
+    the matches lie in the back half of a long timeline that the
+    unfiltered window would never reach."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("packed")
+    matches_at = range(0, 600, 50)  # 12 matches: 0, 50, 100, ..., 550
+    timeline = _build_search_timeline(600, "transparent", matches_at)
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+
+    panel._search_query = "transparent"
+    panel._apply_filters()
+
+    assert panel._filtered_block_indices is not None
+    assert len(panel._filtered_block_indices) == 12
+    assert panel._window_start == 0
+    assert panel._window_end == 12
+    rendered = panel._timeline_layout.count() - 1  # minus trailing stretch
+    assert rendered == 12
+    # Every materialized widget belongs to a matching physical block.
+    expected = set(matches_at)
+    for layout_index in range(rendered):
+        widget = panel._timeline_layout.itemAt(layout_index).widget()
+        assert widget.property("blockIndex") in expected
+    panel.close()
+
+
+def test_search_filter_can_advance_window_to_later_matches() -> None:
+    """When matches outnumber _WINDOW_SIZE, the slide must advance through
+    matches — not raw blocks. Regression guard for the bug where a
+    filter-collapsed viewport had ``scrollbar.maximum() == 0`` so the
+    edge-trigger never fired and late matches stayed unreachable."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel, _WINDOW_SIZE
+
+    QApplication.instance() or QApplication([])
+    rec = _record("advance")
+    matches_at = range(0, 600, 3)  # 200 matches
+    timeline = _build_search_timeline(600, "transparent", matches_at)
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+
+    panel._search_query = "transparent"
+    panel._apply_filters()
+
+    assert panel._filtered_block_indices is not None
+    assert len(panel._filtered_block_indices) == 200
+    assert panel._window_start == 0
+    assert panel._window_end == _WINDOW_SIZE
+
+    last_widget = panel._timeline_layout.itemAt(
+        panel._timeline_layout.count() - 2
+    ).widget()
+    last_block_before = last_widget.property("blockIndex")
+
+    panel._slide_window_down()
+
+    assert panel._window_end > _WINDOW_SIZE
+    assert panel._window_end - panel._window_start == _WINDOW_SIZE
+    rendered = panel._timeline_layout.count() - 1
+    assert rendered == _WINDOW_SIZE
+    last_widget_after = panel._timeline_layout.itemAt(
+        panel._timeline_layout.count() - 2
+    ).widget()
+    last_block_after = last_widget_after.property("blockIndex")
+    assert last_block_after > last_block_before
+    panel.close()
+
+
+def test_clearing_search_restores_unfiltered_view() -> None:
+    """Reset must drop the filtered view back to None and re-seed the
+    window with the legacy [0, _WINDOW_SIZE) bounds."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel, _WINDOW_SIZE
+
+    QApplication.instance() or QApplication([])
+    rec = _record("restore")
+    matches_at = range(0, 600, 50)
+    timeline = _build_search_timeline(600, "transparent", matches_at)
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+
+    panel._search_query = "transparent"
+    panel._apply_filters()
+    assert panel._filtered_block_indices is not None
+
+    panel._on_reset_filters()
+
+    assert panel._filtered_block_indices is None
+    assert panel._window_start == 0
+    assert panel._window_end == _WINDOW_SIZE
+    rendered = panel._timeline_layout.count() - 1
+    assert rendered == _WINDOW_SIZE
+    panel.close()

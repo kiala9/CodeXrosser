@@ -34,10 +34,8 @@ from PySide6.QtGui import (
     QCursor,
     QDesktopServices,
     QIcon,
-    QImage,
     QMouseEvent,
     QPainter,
-    QPainterPath,
     QPen,
     QPixmap,
 )
@@ -76,6 +74,7 @@ from .design_tokens import (
     PRIMARY_GHOST,
     PRIMARY_SOFT,
 )
+from .frosted_surface import _FrostedSurface
 from .models import (
     AccountRecord,
     AuthMode,
@@ -518,8 +517,24 @@ class StatusBanner(QFrame):
         super().mouseDoubleClickEvent(event)
 
 
-class StatusPopupFrame(QFrame):
-    """Lean toast surface, matching the original narrow notification style."""
+class StatusPopupFrame(_FrostedSurface):
+    """Lean toast surface, matching the original narrow notification style.
+
+    Two construction modes via ``as_window``:
+
+    * ``False`` (default) — embedded child of the title bar. Renders the
+      pill in the chrome row; ``_FrostedSurface`` switches its blit to
+      ``CompositionMode_SourceOver`` and relies on the ``QFrame#StatusFooter``
+      QSS rule (``background: transparent``) to paint through the rounded
+      corner ears.
+    * ``True`` — standalone top-level toast window with real HWND alpha.
+
+    Severity dispatch is per-instance via ``self.property("severity")``;
+    ``_resolve_palette`` looks up ``_SURFACES`` so callers can swap
+    severity at runtime with ``setProperty`` and ``style().polish()``.
+    """
+
+    ABSORB_DOUBLE_CLICK = True
 
     _SURFACES = {
         "success": (QColor(18, 54, 44, 222), QColor(48, 209, 88, 178), QColor(48, 209, 88, 32)),
@@ -529,85 +544,11 @@ class StatusPopupFrame(QFrame):
     }
 
     def __init__(self, parent: QWidget | None = None, *, as_window: bool = False):
-        flags = Qt.WindowFlags()
-        if as_window:
-            flags = Qt.Tool | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint | Qt.WindowDoesNotAcceptFocus
-        super().__init__(parent, flags)
-        self._native_acrylic = False
-        self.setFrameShape(QFrame.NoFrame)
-        self.setLineWidth(0)
-        self.setMidLineWidth(0)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_NoSystemBackground, True)
-        if as_window:
-            self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-            self.setFocusPolicy(Qt.NoFocus)
-        self.setAutoFillBackground(False)
+        super().__init__(parent, as_window=as_window)
 
-    def set_native_acrylic(self, enabled: bool) -> None:
-        if self._native_acrylic == enabled:
-            return
-        self._native_acrylic = enabled
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        del event
-        dpr = self.devicePixelRatioF()
-        buffer = QImage(
-            max(1, int(self.width() * dpr)),
-            max(1, int(self.height() * dpr)),
-            QImage.Format_ARGB32_Premultiplied,
-        )
-        buffer.setDevicePixelRatio(dpr)
-        buffer.fill(Qt.transparent)
-
-        rect = QRectF(self.rect())
-        path = QPainterPath()
-        path.addRoundedRect(rect, 12.0, 12.0)
-
-        painter = QPainter(buffer)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setClipPath(path)
-
+    def _resolve_palette(self) -> tuple[QColor, QColor, QColor]:
         severity = str(self.property("severity") or "info")
-        base, border, tint = self._SURFACES.get(severity, self._SURFACES["info"])
-        if self._native_acrylic:
-            base = QColor(base)
-            border = QColor(border)
-            tint = QColor(tint)
-            base.setAlpha(46)
-            tint.setAlpha(14)
-            border.setAlpha(min(178, max(148, border.alpha())))
-        painter.fillPath(path, base)
-        painter.fillPath(path, tint)
-        painter.setClipping(False)
-
-        border_rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        border_path = QPainterPath()
-        border_path.addRoundedRect(border_rect, 11.5, 11.5)
-        painter.setPen(QPen(border, 1.0))
-        painter.drawPath(border_path)
-        inner = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
-        inner_path = QPainterPath()
-        inner_path.addRoundedRect(inner, 10.5, 10.5)
-        painter.setPen(QPen(QColor(255, 255, 255, 18), 1.0))
-        painter.drawPath(inner_path)
-        painter.end()
-
-        target = QPainter(self)
-        target.setCompositionMode(QPainter.CompositionMode_Source)
-        target.drawImage(0, 0, buffer)
-        target.end()
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
-        # Absorb double-click events on the pill's empty padding so they
-        # don't bubble up to the parent ``TitleBar``'s
-        # ``mouseDoubleClickEvent`` (which toggles maximize). Children
-        # of the pill — e.g. StatusBanner, the close/details buttons —
-        # still process their own double-clicks first; only the
-        # leftover empty area lands here. Pressing or dragging still
-        # propagates so the user can drag the window from the pill.
-        event.accept()
+        return self._SURFACES.get(severity, self._SURFACES["info"])
 
 
 class StatusDetailsPopup(StatusPopupFrame):
@@ -617,38 +558,14 @@ class StatusDetailsPopup(StatusPopupFrame):
     custom paintEvent) so all three frosted popovers feel like the
     same UI primitive. ESC and click-outside dismiss."""
 
-    dismiss_requested = Signal()
+    ACCEPT_FOCUS = True
+    DISMISS_ON_ESCAPE = True
+    DISMISS_ON_DEACTIVATE = True
+    ABSORB_DOUBLE_CLICK = False
 
     def __init__(self, parent: QWidget | None = None):
-        # Build the window flag set ourselves because the base class's
-        # ``as_window=True`` path also installs ``WindowDoesNotAcceptFocus``
-        # / ``Qt.NoFocus``, which would block ESC-to-dismiss.
-        super().__init__(parent)
-        self.setWindowFlags(
-            Qt.Tool
-            | Qt.FramelessWindowHint
-            | Qt.NoDropShadowWindowHint
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_NoSystemBackground, True)
-        self.setAutoFillBackground(False)
-        self.setFocusPolicy(Qt.StrongFocus)
+        super().__init__(parent, as_window=True)
         self.setProperty("severity", "info")
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if event.key() == Qt.Key_Escape:
-            event.accept()
-            self.dismiss_requested.emit()
-            return
-        super().keyPressEvent(event)
-
-    def event(self, event) -> bool:
-        # Click-outside dismissal: when the popup loses window focus the
-        # user has clicked elsewhere, so dismiss without spawning a
-        # separate transparent click-catcher.
-        if event.type() == QEvent.WindowDeactivate and self.isVisible():
-            self.dismiss_requested.emit()
-        return super().event(event)
 
 
 class QuotaRingWidget(QWidget):
@@ -1190,7 +1107,6 @@ class MainWindow(QMainWindow):
         self.status_details_popup.dismiss_requested.connect(
             self._dismiss_details_popover
         )
-        self._status_details_popup_chrome_installed = False
         details_popup_layout = QVBoxLayout(self.status_details_popup)
         details_popup_layout.setContentsMargins(14, 12, 14, 12)
         details_popup_layout.setSpacing(0)
@@ -1951,13 +1867,7 @@ class MainWindow(QMainWindow):
         self._position_details_popover()
         self.status_details_popup.show()
         self.status_details_popup.raise_()
-        if not self._status_details_popup_chrome_installed and sys.platform == "win32":
-            _install_dialog_chrome(self.status_details_popup, disable_border=True)
-            _install_acrylic_blur(
-                self.status_details_popup, enabled=True, tint_alpha=58
-            )
-            self.status_details_popup.set_native_acrylic(True)
-            self._status_details_popup_chrome_installed = True
+        self.status_details_popup.install_dwm_chrome()
         self.status_details_popup.activateWindow()
 
     def _position_details_popover(self) -> None:
