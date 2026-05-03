@@ -224,6 +224,16 @@ class SessionTimelinePage:
 
 
 @dataclass(frozen=True)
+class SessionTimelineIndexItem:
+    ordinal: int
+    item_id: str
+    type: TimelineKind
+    timestamp: str
+    preview: str
+    tool_name: str | None = None
+
+
+@dataclass(frozen=True)
 class SessionDetail:
     record: SessionRecord
     audit_entries: list[AuditEntry]

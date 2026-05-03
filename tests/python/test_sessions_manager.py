@@ -21,6 +21,7 @@ from codex_quota_viewer.sessions import (  # noqa: E402
 )
 from codex_quota_viewer.sessions.helpers import build_fallback_relative_path  # noqa: E402
 from codex_quota_viewer.sessions.jsonl_parser import (  # noqa: E402
+    DEFAULT_TIMELINE_PAGE_SIZE,
     clear_parser_cache,
     parse_session_catalog,
     parse_session_timeline_page,
@@ -275,6 +276,82 @@ def test_sessions_timeline_page_preserves_total_after_dedupe(tmp_path: Path) -> 
         assert [item.id for item in page.items] == ["user-1", "assistant-1"]
         assert page.total == 3
         assert page.next_offset is None
+    finally:
+        manager.close()
+
+
+def test_get_session_detail_tail_load_is_bounded(tmp_path: Path) -> None:
+    codex_home, manager_home = _make_homes(tmp_path)
+    session_id = "bounded-detail-session"
+    total = DEFAULT_TIMELINE_PAGE_SIZE + 37
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id=session_id,
+                    cwd=str(tmp_path / "project_bounded_detail"),
+                    timeline=[
+                        SessionTimelineItem(
+                            id=f"e-{i}",
+                            type="message:user" if i % 2 == 0 else "message:assistant",
+                            timestamp="2026-01-15T10:00:00Z",
+                            text=f"message {i}",
+                        )
+                        for i in range(total)
+                    ],
+                )
+            ]
+        )
+
+        detail = manager.get_session_detail(session_id)
+
+        assert detail.timeline_total == total
+        assert len(detail.timeline) == DEFAULT_TIMELINE_PAGE_SIZE
+        assert detail.timeline_loaded_offset == 37
+        assert detail.timeline[0].id == "e-37"
+    finally:
+        manager.close()
+
+
+def test_session_timeline_index_is_lightweight_and_global(tmp_path: Path) -> None:
+    codex_home, manager_home = _make_homes(tmp_path)
+    session_id = "time-travel-index-session"
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id=session_id,
+                    cwd=str(tmp_path / "project_time_travel_index"),
+                    timeline=[
+                        SessionTimelineItem(
+                            id="user-big",
+                            type="message:user",
+                            timestamp="2026-01-15T10:00:00Z",
+                            text="x" * 10_000,
+                        ),
+                        SessionTimelineItem(
+                            id="tool-1",
+                            type="tool_call",
+                            timestamp="2026-01-15T10:00:01Z",
+                            tool_name="shell",
+                            summary="run compile",
+                            input="input should not be read into the index",
+                            output="output should not be read into the index",
+                        ),
+                    ],
+                )
+            ]
+        )
+
+        index = manager.get_session_timeline_index(session_id)
+
+        assert [item.ordinal for item in index] == [0, 1]
+        assert index[0].item_id == "user-big"
+        assert len(index[0].preview) == 240
+        assert index[1].tool_name == "shell"
+        assert index[1].preview == "run compile"
     finally:
         manager.close()
 

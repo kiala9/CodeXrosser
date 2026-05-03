@@ -108,6 +108,7 @@ from .sessions import (
     SessionDetail,
     SessionFilters,
     SessionRecord,
+    SessionTimelineIndexItem,
     SessionTimelineItem,
     SessionsManager,
 )
@@ -498,6 +499,14 @@ def _role_for_block(block: Any) -> str:
     return "tool"
 
 
+def _role_for_timeline_type(item_type: str) -> str:
+    if item_type == "message:user":
+        return "user"
+    if item_type == "message:assistant":
+        return "assistant"
+    return "tool"
+
+
 def _format_block_timestamp(item: SessionTimelineItem) -> str:
     """Parse the ISO timestamp string into a ``HH:MM`` display. Defensive
     against malformed timestamps — falls back to a substring slice and then
@@ -538,6 +547,26 @@ def _block_preview_text(block: Any, *, translator: Callable[[str], str], max_cha
     return ""
 
 
+def _index_preview_text(
+    item: SessionTimelineIndexItem,
+    *,
+    translator: Callable[[str], str],
+    max_chars: int = 120,
+) -> str:
+    if item.type == "tool_call":
+        name = item.tool_name or "unknown_tool"
+        summary = (item.preview or "").strip()
+        if summary and summary != name:
+            return f"{name}  —  {summary[:max_chars]}"
+        return name
+    text = (item.preview or "").strip()
+    if text:
+        return text[:max_chars]
+    if item.type == "message:user":
+        return translator("User prompt")
+    return translator("Assistant message")
+
+
 @dataclass(frozen=True)
 class _TimeTravelRow:
     """Precomputed row payload for the vertical view — built once per
@@ -549,6 +578,8 @@ class _TimeTravelRow:
     timestamp: str
     tool_name: str | None
     is_filtered_out: bool
+    jump_offset: int | None = None
+    item_id: str | None = None
 
 
 # ---- Vertical view -------------------------------------------------------
@@ -560,6 +591,8 @@ _TT_PREVIEW_ROLE = Qt.UserRole + 102
 _TT_TIMESTAMP_ROLE = Qt.UserRole + 103
 _TT_TOOL_NAME_ROLE = Qt.UserRole + 104
 _TT_FILTERED_OUT_ROLE = Qt.UserRole + 105
+_TT_JUMP_OFFSET_ROLE = Qt.UserRole + 106
+_TT_ITEM_ID_ROLE = Qt.UserRole + 107
 
 
 def _time_travel_row_background_path(
@@ -720,6 +753,31 @@ class _TimeTravelVerticalModel(QAbstractListModel):
         finally:
             self.endResetModel()
 
+    def refresh_index(self, items: list[SessionTimelineIndexItem]) -> None:
+        self.beginResetModel()
+        try:
+            self._rows = [
+                _TimeTravelRow(
+                    block_index=item.ordinal,
+                    role=_role_for_timeline_type(item.type),
+                    preview=_index_preview_text(item, translator=self._translator),
+                    timestamp=_format_block_timestamp(
+                        SessionTimelineItem(
+                            id=item.item_id,
+                            type=item.type,
+                            timestamp=item.timestamp,
+                        )
+                    ),
+                    tool_name=item.tool_name,
+                    is_filtered_out=False,
+                    jump_offset=item.ordinal,
+                    item_id=item.item_id,
+                )
+                for item in items
+            ]
+        finally:
+            self.endResetModel()
+
     # ----------------------------------------------------------- Qt API
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
@@ -743,6 +801,10 @@ class _TimeTravelVerticalModel(QAbstractListModel):
             return row.tool_name or ""
         if role == _TT_FILTERED_OUT_ROLE:
             return row.is_filtered_out
+        if role == _TT_JUMP_OFFSET_ROLE:
+            return row.jump_offset
+        if role == _TT_ITEM_ID_ROLE:
+            return row.item_id or ""
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
@@ -886,6 +948,7 @@ class _TimeTravelVerticalView(QWidget):
     """
 
     blockClicked = Signal(int)
+    offsetClicked = Signal(int, str)
 
     def __init__(
         self,
@@ -1005,6 +1068,19 @@ class _TimeTravelVerticalView(QWidget):
                 self._list.setCurrentIndex(proxy_index)
                 self._list.scrollTo(proxy_index, QAbstractItemView.PositionAtCenter)
 
+    def refresh_index(
+        self,
+        items: list[SessionTimelineIndexItem],
+        current_offset: int | None,
+    ) -> None:
+        self._model.refresh_index(items)
+        if current_offset is not None:
+            source_index = self._model.index(current_offset, 0)
+            proxy_index = self._proxy.mapFromSource(source_index)
+            if proxy_index.isValid():
+                self._list.setCurrentIndex(proxy_index)
+                self._list.scrollTo(proxy_index, QAbstractItemView.PositionAtCenter)
+
     def focus_search(self) -> None:
         self._search_input.setFocus()
         self._search_input.selectAll()
@@ -1033,6 +1109,11 @@ class _TimeTravelVerticalView(QWidget):
         if not index.isValid():
             return
         source_index = self._proxy.mapToSource(index)
+        jump_offset = source_index.data(_TT_JUMP_OFFSET_ROLE)
+        if isinstance(jump_offset, int):
+            item_id = source_index.data(_TT_ITEM_ID_ROLE)
+            self.offsetClicked.emit(jump_offset, item_id if isinstance(item_id, str) else "")
+            return
         block_index = source_index.data(_TT_BLOCK_INDEX_ROLE)
         if isinstance(block_index, int):
             self.blockClicked.emit(block_index)
@@ -1130,6 +1211,9 @@ class _TimeTravelPopup(_FrostedSurface):
     """Emitted with a physical block index when the user picks a row in
     the vertical view. The host wires this to ``_recenter_async`` and
     keeps the popup open."""
+    offsetJumpRequested = Signal(int, str)
+    """Emitted with a repository timeline offset and item id when the popup
+    is backed by the lightweight global index."""
 
     # Height bounds — the popup picks ``min(MAX, max(MIN, host * 0.7))``
     # so it stays usable on small windows but doesn't dominate large
@@ -1152,6 +1236,7 @@ class _TimeTravelPopup(_FrostedSurface):
 
         self._vertical = _TimeTravelVerticalView(translator, self)
         self._vertical.blockClicked.connect(self.blockJumpRequested.emit)
+        self._vertical.offsetClicked.connect(self.offsetJumpRequested.emit)
         outer.addWidget(self._vertical, 1)
 
         # Focus the search input on the next tick so the user can type
@@ -1173,6 +1258,13 @@ class _TimeTravelPopup(_FrostedSurface):
     ) -> None:
         del window_start, window_end  # accepted for API stability with the host
         self._vertical.refresh(blocks, filtered_indices, current_block)
+
+    def set_index_data(
+        self,
+        items: list[SessionTimelineIndexItem],
+        current_offset: int | None,
+    ) -> None:
+        self._vertical.refresh_index(items, current_offset)
 
     def preferred_height(self, host_height: int) -> int:
         """Recommended popup height for a given host SessionsPage height.
@@ -2896,6 +2988,15 @@ class SessionsPage(QWidget):
         self._detail_panel.older_history_requested.connect(
             self._request_older_timeline_page
         )
+        self._detail_panel.newer_history_requested.connect(
+            self._request_newer_timeline_page
+        )
+        self._detail_panel.time_travel_index_requested.connect(
+            self._request_time_travel_index
+        )
+        self._detail_panel.timeline_offset_requested.connect(
+            self._request_timeline_offset_page
+        )
 
         self._splitter = QSplitter(Qt.Horizontal, self)
         self._splitter.setObjectName("SessionsSplitter")
@@ -3363,6 +3464,122 @@ class SessionsPage(QWidget):
 
         def on_error(_ex: Exception) -> None:
             self._detail_panel.cancel_pending_older()
+
+        self._task_runner(action, on_success, on_error)
+
+    def _request_newer_timeline_page(
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+    ) -> None:
+        active_target = self._target
+        factory = self._sessions_manager_factory
+
+        def _deliver(page) -> None:
+            if self._active_session_id != session_id:
+                self._detail_panel.cancel_pending_newer()
+                return
+            self._detail_panel.append_newer_items(page.items, offset, page.total)
+
+        if self._task_runner is None:
+            try:
+                page = factory(active_target).get_session_timeline_page(
+                    session_id, offset=offset, limit=limit
+                )
+            except Exception:
+                self._detail_panel.cancel_pending_newer()
+                return
+            _deliver(page)
+            return
+
+        def action():
+            return factory(active_target).get_session_timeline_page(
+                session_id, offset=offset, limit=limit
+            )
+
+        def on_success(page) -> None:
+            _deliver(page)
+
+        def on_error(_ex: Exception) -> None:
+            self._detail_panel.cancel_pending_newer()
+
+        self._task_runner(action, on_success, on_error)
+
+    def _request_time_travel_index(self, session_id: str) -> None:
+        active_target = self._target
+        factory = self._sessions_manager_factory
+
+        def _deliver(items: list[SessionTimelineIndexItem]) -> None:
+            if self._active_session_id != session_id:
+                self._detail_panel.cancel_time_travel_index_request(session_id)
+                return
+            self._detail_panel.set_time_travel_index(session_id, items)
+
+        if self._task_runner is None:
+            try:
+                items = factory(active_target).get_session_timeline_index(session_id)
+            except Exception:
+                self._detail_panel.cancel_time_travel_index_request(session_id)
+                return
+            _deliver(items)
+            return
+
+        def action() -> list[SessionTimelineIndexItem]:
+            return factory(active_target).get_session_timeline_index(session_id)
+
+        def on_success(items: list[SessionTimelineIndexItem]) -> None:
+            _deliver(items)
+
+        def on_error(_ex: Exception) -> None:
+            self._detail_panel.cancel_time_travel_index_request(session_id)
+
+        self._task_runner(action, on_success, on_error)
+
+    def _request_timeline_offset_page(
+        self,
+        session_id: str,
+        offset: int,
+        limit: int,
+        focus_offset: int,
+        focus_item_id: str,
+    ) -> None:
+        active_target = self._target
+        factory = self._sessions_manager_factory
+
+        def _deliver(page) -> None:
+            if self._active_session_id != session_id:
+                self._detail_panel.cancel_timeline_offset_request(session_id)
+                return
+            self._detail_panel.replace_timeline_page(
+                page.items,
+                sql_offset=offset,
+                total=page.total,
+                focus_offset=focus_offset,
+                focus_item_id=focus_item_id,
+            )
+
+        if self._task_runner is None:
+            try:
+                page = factory(active_target).get_session_timeline_page(
+                    session_id, offset=offset, limit=limit
+                )
+            except Exception:
+                self._detail_panel.cancel_timeline_offset_request(session_id)
+                return
+            _deliver(page)
+            return
+
+        def action():
+            return factory(active_target).get_session_timeline_page(
+                session_id, offset=offset, limit=limit
+            )
+
+        def on_success(page) -> None:
+            _deliver(page)
+
+        def on_error(_ex: Exception) -> None:
+            self._detail_panel.cancel_timeline_offset_request(session_id)
 
         self._task_runner(action, on_success, on_error)
 
@@ -3842,6 +4059,9 @@ class _SessionDetailPanel(QFrame):
     # through its task_runner and feeds the result back via
     # ``prepend_older_items``. Args: (session_id, sql_offset, sql_limit).
     older_history_requested = Signal(str, int, int)
+    newer_history_requested = Signal(str, int, int)
+    time_travel_index_requested = Signal(str)
+    timeline_offset_requested = Signal(str, int, int, int, str)
 
     def __init__(self, translator: Callable[[str], str], parent: QWidget | None = None):
         super().__init__(parent)
@@ -3861,6 +4081,9 @@ class _SessionDetailPanel(QFrame):
         self._window_start = 0
         self._window_end = 0
         self._timeline_item_count = 0
+        self._time_travel_index_items = []
+        self._time_travel_index_pending = False
+        self._loading_newer = False
         # Raw timeline items (sorted ascending by ordinal) backing the
         # coalesced ``_all_blocks``. We keep them so prepended older
         # pages can be re-coalesced cleanly across the page boundary
@@ -3874,6 +4097,8 @@ class _SessionDetailPanel(QFrame):
         # currently-open session. Used for the status footer and to
         # let the minimap reason about unloaded ranges later.
         self._timeline_total: int = 0
+        self._time_travel_index_items: list[SessionTimelineIndexItem] = []
+        self._time_travel_index_pending = False
         # Session id we're currently rendering — needed so the older-
         # page fetch can address the right manager. Cleared by
         # ``discard_rendered_timeline`` so a stale fetch can't latch on
@@ -3884,6 +4109,7 @@ class _SessionDetailPanel(QFrame):
         # canceled (target switch / session change). Prevents the edge-
         # slide trigger from spamming the worker.
         self._loading_older: bool = False
+        self._loading_newer: bool = False
         # The user prompt whose section the viewport currently belongs to.
         # The window stays anchored on this block; the rail puts its dot at
         # the rail's center. Sliding/redraw only happens when this changes.
@@ -4413,7 +4639,11 @@ class _SessionDetailPanel(QFrame):
             self._time_travel_popup.blockJumpRequested.connect(
                 self._on_time_travel_jump
             )
+            self._time_travel_popup.offsetJumpRequested.connect(
+                self._on_time_travel_offset_jump
+            )
         self._push_time_travel_data()
+        self._ensure_time_travel_index()
         self._position_time_travel_popup()
         self._time_travel_popup.show()
         self._time_travel_popup.raise_()
@@ -4437,11 +4667,44 @@ class _SessionDetailPanel(QFrame):
         if self._time_travel_popup is not None and self._time_travel_popup.isVisible():
             QTimer.singleShot(0, self._time_travel_popup.activateWindow)
 
+    def _on_time_travel_offset_jump(self, offset: int, item_id: str) -> None:
+        if not self._loaded_session_id:
+            return
+        loaded_end = self._loaded_offset + len(self._all_timeline_items)
+        if self._loaded_offset <= offset < loaded_end:
+            local_index = offset - self._loaded_offset
+            local_id = item_id
+            if not local_id and 0 <= local_index < len(self._all_timeline_items):
+                local_id = self._all_timeline_items[local_index].id
+            block_index = self._block_for_anchor_id(local_id)
+            if block_index is None and self._all_blocks:
+                block_index = max(0, min(local_index, len(self._all_blocks) - 1))
+            if block_index is not None:
+                self._on_time_travel_jump(block_index)
+            return
+        page_size = self._OLDER_PAGE_SIZE
+        max_start = max(0, self._timeline_total - page_size)
+        page_offset = max(0, min(offset - page_size // 2, max_start))
+        self._show_timeline_overlay(self._translator("Loading timeline..."))
+        self.timeline_offset_requested.emit(
+            self._loaded_session_id,
+            page_offset,
+            page_size,
+            offset,
+            item_id or "",
+        )
+
     def _push_time_travel_data(self) -> None:
         """Snapshot the current panel state into the popup. Invoked on
         open and after every ``_refresh_minimap_impl`` so the rendered
         window indicator stays in sync."""
         if self._time_travel_popup is None:
+            return
+        if self._time_travel_index_items and self._needs_time_travel_index():
+            self._time_travel_popup.set_index_data(
+                self._time_travel_index_items,
+                self._current_timeline_offset(),
+            )
             return
         self._time_travel_popup.set_data(
             self._all_blocks,
@@ -4450,6 +4713,42 @@ class _SessionDetailPanel(QFrame):
             self._window_end,
             self._current_user_block,
         )
+
+    def _needs_time_travel_index(self) -> bool:
+        return bool(
+            self._loaded_session_id
+            and self._timeline_total > len(self._all_timeline_items)
+        )
+
+    def _ensure_time_travel_index(self) -> None:
+        if not self._needs_time_travel_index():
+            return
+        if self._time_travel_index_items or self._time_travel_index_pending:
+            return
+        if not self._loaded_session_id:
+            return
+        self._time_travel_index_pending = True
+        self.time_travel_index_requested.emit(self._loaded_session_id)
+
+    def set_time_travel_index(
+        self,
+        session_id: str,
+        items: list[SessionTimelineIndexItem],
+    ) -> None:
+        if session_id != self._loaded_session_id:
+            return
+        self._time_travel_index_pending = False
+        self._time_travel_index_items = list(items)
+        if self._time_travel_popup is not None:
+            self._push_time_travel_data()
+
+    def cancel_time_travel_index_request(self, session_id: str) -> None:
+        if session_id == self._loaded_session_id:
+            self._time_travel_index_pending = False
+
+    def cancel_timeline_offset_request(self, session_id: str) -> None:
+        if session_id == self._loaded_session_id:
+            self._hide_timeline_overlay()
 
     def _position_time_travel_popup(self) -> None:
         """Compute the popup geometry. Anchors above the clock button and
@@ -4860,6 +5159,9 @@ class _SessionDetailPanel(QFrame):
             self._timeline_item_count = 0
             self._loaded_offset = 0
             self._timeline_total = 0
+            self._time_travel_index_items = []
+            self._time_travel_index_pending = False
+            self._loading_newer = False
             self._loaded_session_id = None
             self._timeline_status.setText("")
             self._set_audit_text("")
@@ -4872,6 +5174,9 @@ class _SessionDetailPanel(QFrame):
         self._timeline_item_count = len(self._all_timeline_items)
         self._loaded_offset = max(0, getattr(detail, "timeline_loaded_offset", 0))
         self._timeline_total = max(0, detail.timeline_total)
+        self._time_travel_index_items = []
+        self._time_travel_index_pending = False
+        self._loading_newer = False
         self._loaded_session_id = detail.record.id
         # Keep user anchors for current-section detection; the minimap itself
         # is driven from every materialized block's widget geometry.
@@ -4918,6 +5223,9 @@ class _SessionDetailPanel(QFrame):
         self._timeline_item_count = 0
         self._loaded_offset = 0
         self._timeline_total = 0
+        self._time_travel_index_items = []
+        self._time_travel_index_pending = False
+        self._loading_newer = False
         self._loaded_session_id = None
         self._clear_timeline()
         self._timeline_status.setText("")
@@ -5098,6 +5406,7 @@ class _SessionDetailPanel(QFrame):
         next half-window of MATCHES, not raw blocks."""
         view_n = self._view_size()
         if self._window_end >= view_n:
+            self._maybe_request_newer()
             return
         next_end = min(self._window_end + _WINDOW_HALF, view_n)
         new_start = max(0, next_end - _WINDOW_SIZE)
@@ -5205,11 +5514,34 @@ class _SessionDetailPanel(QFrame):
             self._loaded_session_id, new_offset, page_limit
         )
 
+    def _loaded_end_offset(self) -> int:
+        return self._loaded_offset + len(self._all_timeline_items)
+
+    def _has_newer_history(self) -> bool:
+        return self._loaded_end_offset() < self._timeline_total
+
+    def _maybe_request_newer(self) -> None:
+        if self._loading_newer:
+            return
+        if not self._has_newer_history():
+            return
+        if not self._loaded_session_id:
+            return
+        offset = self._loaded_end_offset()
+        limit = min(self._OLDER_PAGE_SIZE, self._timeline_total - offset)
+        if limit <= 0:
+            return
+        self._loading_newer = True
+        self.newer_history_requested.emit(self._loaded_session_id, offset, limit)
+
     def cancel_pending_older(self) -> None:
         """Drop the in-flight older-page request without applying any
         result. Called by SessionsPage when the user navigates away or
         the manager surfaces an error."""
         self._loading_older = False
+
+    def cancel_pending_newer(self) -> None:
+        self._loading_newer = False
 
     def prepend_older_items(
         self,
@@ -5335,6 +5667,118 @@ class _SessionDetailPanel(QFrame):
         self._refresh_status_label()
         self._refresh_minimap()
 
+    def append_newer_items(
+        self,
+        items: list[SessionTimelineItem],
+        sql_offset: int,
+        total: int,
+    ) -> None:
+        """Merge a newer page after the current slice and continue sliding.
+
+        Time Travel can replace the tail with a middle page. Once the user
+        reaches that slice's bottom edge, this brings in the next repository
+        page so downward scrolling keeps working.
+        """
+        self._loading_newer = False
+        if not items:
+            self._timeline_total = max(self._timeline_total, total)
+            return
+        expected_offset = self._loaded_end_offset()
+        if sql_offset < expected_offset:
+            # Defensive against an overlapping worker result: keep only rows
+            # that begin after the slice we already hold.
+            skip = expected_offset - sql_offset
+            items = items[skip:]
+        if not items:
+            self._timeline_total = max(self._timeline_total, total)
+            return
+
+        old_view_size = self._view_size()
+        was_at_loaded_bottom = self._window_end >= old_view_size
+        self._all_timeline_items = self._all_timeline_items + list(items)
+        self._timeline_total = max(self._timeline_total, total)
+        self._timeline_item_count = len(self._all_timeline_items)
+        self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
+        self._user_anchor_blocks = [
+            i
+            for i, (kind, payload) in enumerate(self._all_blocks)
+            if kind == "single" and payload.type == "message:user"
+        ]
+        self._recompute_filtered_view()
+        if was_at_loaded_bottom and self._view_size() > old_view_size:
+            self._slide_window_down()
+        else:
+            self._refresh_status_label()
+            self._refresh_minimap()
+
+    def replace_timeline_page(
+        self,
+        items: list[SessionTimelineItem],
+        *,
+        sql_offset: int,
+        total: int,
+        focus_offset: int,
+        focus_item_id: str,
+    ) -> None:
+        """Replace the loaded slice with an arbitrary page for Time Travel.
+
+        This keeps detail-open cost bounded while preserving global jumps:
+        the popup emits a repository offset, SessionsPage fetches one page
+        around that offset, then the panel materializes only the usual window.
+        """
+        self._loading_older = False
+        self._loading_newer = False
+        self._all_timeline_items = list(items)
+        self._loaded_offset = max(0, sql_offset)
+        self._timeline_total = max(total, len(items))
+        self._timeline_item_count = len(self._all_timeline_items)
+        self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
+        self._user_anchor_blocks = [
+            i
+            for i, (kind, payload) in enumerate(self._all_blocks)
+            if kind == "single" and payload.type == "message:user"
+        ]
+        self._recompute_filtered_view()
+
+        focus_block = self._block_for_anchor_id(focus_item_id)
+        if focus_block is None:
+            local_index = focus_offset - self._loaded_offset
+            if 0 <= local_index < len(self._all_timeline_items):
+                focus_block = self._block_for_anchor_id(
+                    self._all_timeline_items[local_index].id
+                )
+        if focus_block is None and self._user_anchor_blocks:
+            focus_block = self._user_anchor_blocks[0]
+        if focus_block is None:
+            focus_block = 0 if self._all_blocks else None
+
+        self._current_user_block = focus_block
+        if focus_block is not None:
+            self._set_window_centered_on(focus_block)
+        else:
+            self._window_start = 0
+            self._window_end = 0
+        self._suppress_edge_slide = True
+        try:
+            self._clear_timeline()
+            self._build_window_widgets(
+                self._window_start, self._window_end, prepend=False
+            )
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+        finally:
+            self._suppress_edge_slide = False
+
+        if focus_block is not None:
+            QTimer.singleShot(
+                0,
+                lambda b=focus_block: self._scroll_to_block_center(b),
+            )
+        self._refresh_status_label()
+        self._refresh_minimap()
+        self._hide_timeline_overlay()
+        self._refresh_count_label()
+
     def _topmost_visible_widget(self) -> QWidget | None:
         """The first materialized bubble whose bottom edge sits below the
         viewport top — i.e. the one that visually anchors the user's
@@ -5421,6 +5865,14 @@ class _SessionDetailPanel(QFrame):
                 return getattr(payload, "id", None)
         return None
 
+    def _current_timeline_offset(self) -> int | None:
+        anchor_id = self._current_user_anchor_id()
+        if anchor_id:
+            for index, item in enumerate(self._all_timeline_items):
+                if item.id == anchor_id:
+                    return self._loaded_offset + index
+        return self._loaded_offset if self._all_timeline_items else None
+
     def _block_for_message_id(self, message_id: str | None) -> int | None:
         if not message_id:
             return None
@@ -5471,7 +5923,9 @@ class _SessionDetailPanel(QFrame):
             self._window_start > 0 or self._loaded_offset > 0
         ):
             self._slide_window_up()
-        elif (max_value - value) <= edge_px and self._window_end < self._view_size():
+        elif (max_value - value) <= edge_px and (
+            self._window_end < self._view_size() or self._has_newer_history()
+        ):
             self._slide_window_down()
 
     def _user_block_for_viewport(self) -> int | None:

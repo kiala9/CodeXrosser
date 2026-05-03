@@ -14,6 +14,7 @@ from .models import (
     CatalogSessionEntry,
     SessionFilters,
     SessionRecord,
+    SessionTimelineIndexItem,
     SessionTimelineItem,
     SessionTimelinePage,
 )
@@ -344,6 +345,26 @@ class SessionRepository:
             (session_id,),
         ).fetchone()
         return int(row["count"] if row else 0)
+
+    def list_timeline_index(self, session_id: str) -> list[SessionTimelineIndexItem]:
+        # Lightweight Time Travel source. Keep the result bounded to fields
+        # needed by the popup, and slice large message/tool payloads in SQLite
+        # so opening the popup does not materialize the full timeline bodies.
+        rows = self._connection.execute(
+            """
+            select ordinal, item_id, type, timestamp,
+                   case
+                     when type = 'tool_call' then substr(coalesce(summary, tool_name, ''), 1, 240)
+                     else substr(coalesce(text, ''), 1, 240)
+                   end as preview,
+                   tool_name
+            from timeline_items
+            where session_id = ?
+            order by ordinal asc
+            """,
+            (session_id,),
+        ).fetchall()
+        return [_map_timeline_index_row(row) for row in rows]
 
     def list_audit_entries(self, session_id: str) -> list[AuditEntry]:
         rows = self._connection.execute(
@@ -838,6 +859,25 @@ def _map_timeline_row(row: sqlite3.Row) -> SessionTimelineItem:
         timestamp=str(row["timestamp"]),
         text=str(row["text"] or ""),
         attachments=attachments,
+    )
+
+
+def _map_timeline_index_row(row: sqlite3.Row) -> SessionTimelineIndexItem:
+    item_type = str(row["type"])
+    normalized_type = (
+        "tool_call"
+        if item_type == "tool_call"
+        else "message:assistant"
+        if item_type == "message:assistant"
+        else "message:user"
+    )
+    return SessionTimelineIndexItem(
+        ordinal=int(row["ordinal"] or 0),
+        item_id=str(row["item_id"]),
+        type=normalized_type,  # type: ignore[arg-type]
+        timestamp=str(row["timestamp"]),
+        preview=str(row["preview"] or ""),
+        tool_name=row["tool_name"],
     )
 
 

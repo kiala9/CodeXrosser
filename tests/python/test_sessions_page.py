@@ -22,6 +22,7 @@ from codex_quota_viewer.sessions.models import (  # noqa: E402
     Attachment,
     SessionDetail,
     SessionRecord,
+    SessionTimelineIndexItem,
     SessionTimelineItem,
 )
 from codex_quota_viewer.sessions_page import (  # noqa: E402
@@ -31,6 +32,8 @@ from codex_quota_viewer.sessions_page import (  # noqa: E402
     _ImageCard,
     _MessageBubble,
     _SessionsTreeModel,
+    _TT_JUMP_OFFSET_ROLE,
+    _WINDOW_SIZE,
     _build_workfolder_groups,
     _decode_data_uri,
     _extract_markdown_attachments,
@@ -579,6 +582,24 @@ def test_refresh_if_stale_only_refetches_when_marked_stale() -> None:
     page.mark_stale()
     page.refresh_if_stale()
     assert manager.list_sessions.call_count == initial_calls + 1
+
+
+def test_initial_sessions_refresh_reads_catalog_without_rescan() -> None:
+    QApplication.instance() or QApplication([])
+    factory = _make_manager_factory([_record("a")])
+    page = SessionsPage(
+        sessions_manager_factory=factory,
+        confirm_real_action=Mock(return_value=True),
+        task_runner=_sync_task_runner,
+    )
+    manager = factory.return_value
+
+    page.refresh_if_stale()
+
+    manager.list_sessions.assert_called_once()
+    manager.rescan.assert_not_called()
+    assert page._tree_model.session_count() == 1
+    assert page._is_stale is False
 
 
 def _sync_task_runner(action, on_success, on_error):
@@ -1368,6 +1389,40 @@ def test_stale_detail_result_dropped_when_selection_changes() -> None:
     page._set_detail.assert_called_once_with(b_detail)
 
 
+def test_selecting_session_shows_placeholder_before_detail_worker_returns() -> None:
+    QApplication.instance() or QApplication([])
+    rec = _record("deferred-detail")
+    factory = _make_manager_factory([rec])
+    captured: list[tuple[Any, Any, Any]] = []
+
+    def capture_runner(action, on_success, on_error):
+        captured.append((action, on_success, on_error))
+
+    page = SessionsPage(
+        sessions_manager_factory=factory,
+        confirm_real_action=Mock(return_value=True),
+        task_runner=_sync_task_runner,
+    )
+    page.refresh_if_stale()
+    page._task_runner = capture_runner
+    page._detail_panel.show_loading_placeholder = Mock()  # type: ignore[method-assign]
+    page._set_detail = Mock()  # type: ignore[assignment]
+    index = page._tree_model.match(  # type: ignore[attr-defined]
+        page._tree_model.index(0, 0),
+        Qt.UserRole,
+        rec.id,
+        1,
+        Qt.MatchRecursive,
+    )[0]
+
+    page._tree.setCurrentIndex(index)
+    page._on_row_changed(index, QModelIndex())
+
+    page._detail_panel.show_loading_placeholder.assert_called_once_with(rec)
+    page._set_detail.assert_not_called()
+    assert captured
+
+
 # --- char-count chip on tool bubbles -----------------------------------------
 
 
@@ -1780,6 +1835,7 @@ def _open_time_travel_for_test(panel: Any) -> Any:
     popup = _TimeTravelPopup(panel._translator, host)
     popup.dismiss_requested.connect(panel._dismiss_time_travel_popup)
     popup.blockJumpRequested.connect(panel._on_time_travel_jump)
+    popup.offsetJumpRequested.connect(panel._on_time_travel_offset_jump)
     panel._time_travel_popup = popup
     panel._push_time_travel_data()
     return popup
@@ -1874,6 +1930,215 @@ def test_time_travel_jump_clamps_to_block_range() -> None:
     panel._on_time_travel_jump(-1)
     panel._on_time_travel_jump(99999)
     assert captured == []
+    panel.close()
+
+
+def test_time_travel_global_index_replaces_loaded_slice_rows() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"tail {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    rec = _record("tt-global-index")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+    index_items = [
+        SessionTimelineIndexItem(
+            ordinal=i,
+            item_id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            preview=f"global {i}",
+        )
+        for i in range(1000)
+    ]
+
+    panel.set_time_travel_index(rec.id, index_items)
+
+    assert popup._vertical._model.rowCount() == 1000
+    assert popup._vertical._model.index(100, 0).data(_TT_JUMP_OFFSET_ROLE) == 100
+    panel.close()
+
+
+def test_time_travel_offset_jump_requests_page_for_unloaded_offset() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"tail {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    rec = _record("tt-offset-request")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    captured: list[Any] = []
+    panel.timeline_offset_requested.connect(lambda *args: captured.append(args))
+
+    panel._on_time_travel_offset_jump(100, "e-100")
+
+    assert captured == [(rec.id, 0, 200, 100, "e-100")]
+    assert not panel._timeline_overlay.isHidden()
+    panel.close()
+
+
+def test_time_travel_offset_page_replaces_slice_and_centers_focus() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("tt-offset-apply")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=[
+            SessionTimelineItem(
+                id=f"e-{i}",
+                type="message:user" if i % 2 == 0 else "message:assistant",
+                timestamp="2026-01-01T00:00:00Z",
+                text=f"tail {i}",
+            )
+            for i in range(800, 1000)
+        ],
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    page_items = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"page {i}",
+        )
+        for i in range(0, 200)
+    ]
+
+    panel.replace_timeline_page(
+        page_items,
+        sql_offset=0,
+        total=1000,
+        focus_offset=100,
+        focus_item_id="e-100",
+    )
+
+    focus_block = panel._block_for_anchor_id("e-100")
+    assert panel._loaded_offset == 0
+    assert panel._timeline_total == 1000
+    assert focus_block is not None
+    assert panel._window_start <= focus_block < panel._window_end
+    rendered = panel._timeline_layout.count() - 1
+    assert rendered <= _WINDOW_SIZE
+    panel.close()
+
+
+def test_time_travel_middle_page_requests_newer_at_bottom_edge() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("tt-newer-request")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=[
+            SessionTimelineItem(
+                id=f"e-{i}",
+                type="message:user" if i % 2 == 0 else "message:assistant",
+                timestamp="2026-01-01T00:00:00Z",
+                text=f"page {i}",
+            )
+            for i in range(200, 400)
+        ],
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=200,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._recenter_window(len(panel._all_blocks) - 1)
+    captured: list[Any] = []
+    panel.newer_history_requested.connect(lambda *args: captured.append(args))
+
+    panel._slide_window_down()
+
+    assert captured == [(rec.id, 400, 200)]
+    assert panel._loading_newer is True
+    panel._slide_window_down()
+    assert captured == [(rec.id, 400, 200)]
+    panel.close()
+
+
+def test_appending_newer_items_continues_downward_window_after_time_travel() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("tt-newer-append")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=[
+            SessionTimelineItem(
+                id=f"e-{i}",
+                type="message:user" if i % 2 == 0 else "message:assistant",
+                timestamp="2026-01-01T00:00:00Z",
+                text=f"page {i}",
+            )
+            for i in range(200, 400)
+        ],
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=200,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._recenter_window(len(panel._all_blocks) - 1)
+    old_end = panel._window_end
+    newer = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"newer {i}",
+        )
+        for i in range(400, 600)
+    ]
+
+    panel.append_newer_items(newer, 400, 1000)
+
+    assert panel._loading_newer is False
+    assert len(panel._all_timeline_items) == 400
+    assert panel._window_end > old_end
+    rendered = panel._timeline_layout.count() - 1
+    assert rendered <= _WINDOW_SIZE
     panel.close()
 
 

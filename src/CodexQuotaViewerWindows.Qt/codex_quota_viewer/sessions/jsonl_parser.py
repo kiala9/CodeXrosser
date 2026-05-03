@@ -28,7 +28,9 @@ except ImportError:
     _json_loads = json.loads
 
 
-DEFAULT_TIMELINE_PAGE_SIZE = 100000
+# Detail views should never default to a near-full timeline load. The UI seeds
+# the panel from a bounded tail page and pages older rows on demand.
+DEFAULT_TIMELINE_PAGE_SIZE = 200
 MAX_TIMELINE_PAGE_SIZE = 500
 _PARSER_CACHE_LIMIT = 128
 _EPOCH_TIMESTAMP = "1970-01-01T00:00:00.000Z"
