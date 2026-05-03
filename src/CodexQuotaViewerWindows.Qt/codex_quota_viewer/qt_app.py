@@ -537,11 +537,30 @@ class StatusPopupFrame(QFrame):
         self.setFrameShape(QFrame.NoFrame)
         self.setLineWidth(0)
         self.setMidLineWidth(0)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_NoSystemBackground, True)
         if as_window:
+            # Top-level: real HWND alpha + acrylic compositor. Buffer
+            # blit replaces the surface with CompositionMode_Source in
+            # paintEvent so the rounded fill is exact.
+            self.setAttribute(Qt.WA_TranslucentBackground, True)
+            self.setAttribute(Qt.WA_NoSystemBackground, True)
             self.setAttribute(Qt.WA_ShowWithoutActivating, True)
             self.setFocusPolicy(Qt.NoFocus)
+        else:
+            # Embedded child (e.g. the title-bar pill): WA_TranslucentBackground
+            # is unreliable for child widgets on Windows — the rounded
+            # path's corner ears get replaced with transparent by the
+            # CompositionMode_Source blit, but child-widget alpha
+            # doesn't propagate to the parent's surface, so those
+            # corners render as Qt's default fill (visible as dark
+            # squares around the pill). Instead, lean on
+            # ``WA_StyledBackground`` + the ``QFrame#StatusFooter``
+            # QSS rule (``background: transparent``) so Qt's QSS
+            # engine itself paints the parent's pixel data through
+            # the corner ears, and switch the paintEvent's final
+            # blit to ``CompositionMode_SourceOver`` so we draw the
+            # rounded surface *on top of* that QSS fill instead of
+            # replacing it.
+            self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAutoFillBackground(False)
 
     def set_native_acrylic(self, enabled: bool) -> None:
@@ -595,7 +614,16 @@ class StatusPopupFrame(QFrame):
         painter.end()
 
         target = QPainter(self)
-        target.setCompositionMode(QPainter.CompositionMode_Source)
+        # Top-level windows have real HWND alpha — replace the surface
+        # with our buffer (corners go transparent → desktop / acrylic
+        # backdrop shows through). Embedded children don't get that
+        # alpha propagation reliably; SourceOver leaves the QSS-painted
+        # parent fill in place at the corners and only stamps our
+        # rounded shape on top.
+        if self.isWindow():
+            target.setCompositionMode(QPainter.CompositionMode_Source)
+        else:
+            target.setCompositionMode(QPainter.CompositionMode_SourceOver)
         target.drawImage(0, 0, buffer)
         target.end()
 

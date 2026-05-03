@@ -233,8 +233,26 @@ def _install_acrylic_blur_for_popup(window: QWidget, *, tint_alpha: int = 58) ->
         return False
 
 
-def _install_dialog_chrome_for_popup(window: QWidget) -> None:
-    """Win11 rounded corners + transparent border for frameless windows."""
+def _install_dialog_chrome_for_popup(
+    window: QWidget,
+    *,
+    corner_preference: int = 2,
+) -> None:
+    """Win11 rounded corners + transparent border for frameless windows.
+
+    ``corner_preference`` maps to the DWMWCP_* constants:
+
+      * ``0`` = ``DWMWCP_DEFAULT`` (system decides)
+      * ``1`` = ``DWMWCP_DONOTROUND`` — keep the HWND rectangular and
+        let the caller's ``paintEvent`` own all corner rounding.
+        Use this when the painted corner radius is larger than Win11's
+        ~8px default rounding, otherwise the DWM clip leaves a thin
+        ring between the two radii where the system drop shadow shows
+        through (visible as a soft "shadow on the top corners" on
+        compact toolbars).
+      * ``2`` = ``DWMWCP_ROUND`` (default, Win11 large radius ≈ 8px)
+      * ``3`` = ``DWMWCP_ROUNDSMALL`` (Win11 small radius)
+    """
     try:
         import sys
         if sys.platform != "win32":
@@ -243,11 +261,10 @@ def _install_dialog_chrome_for_popup(window: QWidget) -> None:
         from ctypes import wintypes
 
         DWMWA_WINDOW_CORNER_PREFERENCE = 33
-        DWMWCP_ROUND = 2
         DWMWA_BORDER_COLOR = 34
         DWMWA_COLOR_NONE = 0xFFFFFFFE
         hwnd = wintypes.HWND(int(window.winId()))
-        value = ctypes.c_int(DWMWCP_ROUND)
+        value = ctypes.c_int(int(corner_preference))
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
             hwnd,
             ctypes.c_int(DWMWA_WINDOW_CORNER_PREFERENCE),
@@ -552,6 +569,118 @@ class _ScrollJumpButton(QWidget):
         super().mouseReleaseEvent(event)
 
 
+class _SessionsFloatingActionBar(QFrame):
+    """Frosted-glass floating action bar.
+
+    Built as a top-level ``Qt.Tool`` translucent window (same recipe as
+    ``_SessionsSearchPopup`` and ``_ScrollJumpButton``) so the host
+    page can install Windows native acrylic blur on it. An embedded
+    child widget can't host ``SetWindowCompositionAttribute`` — the
+    OS only blurs at the HWND boundary — so a previous attempt that
+    layered tint + highlight on a child QFrame still read as a flat
+    translucent rectangle next to the search/filter popups, which is
+    exactly the gap the user reported.
+
+    Lifecycle is owned by ``SessionsPage``: the page reparents the bar
+    on construction (so destruction is automatic), shows/hides it on
+    page show/hide, and repositions it whenever the host window moves
+    or its list container resizes (top-level ``Qt.Tool`` windows do
+    NOT follow their Qt parent's screen position automatically, so
+    every layout-affecting event has to fire ``mapToGlobal`` and
+    ``move``).
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(
+            parent,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.NoDropShadowWindowHint
+            | Qt.WindowDoesNotAcceptFocus,
+        )
+        self.setObjectName("SessionsFloatingActions")
+        self.setFrameShape(QFrame.NoFrame)
+        self.setLineWidth(0)
+        self.setMidLineWidth(0)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.NoFocus)
+        # Toggled by the host once Windows acrylic blur is verified to
+        # have taken effect on this HWND. Drops the painted base alpha
+        # so the OS-level blurred backdrop shows through cleanly,
+        # matching the search/filter popup behaviour.
+        self._native_acrylic = False
+
+    def set_native_acrylic(self, enabled: bool) -> None:
+        if self._native_acrylic == enabled:
+            return
+        self._native_acrylic = enabled
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        del event
+        dpr = self.devicePixelRatioF()
+        buffer = QImage(
+            max(1, int(self.width() * dpr)),
+            max(1, int(self.height() * dpr)),
+            QImage.Format_ARGB32_Premultiplied,
+        )
+        buffer.setDevicePixelRatio(dpr)
+        buffer.fill(Qt.transparent)
+
+        # Painted radius matched to Win11's DWM ROUND clip radius
+        # (~8px) so the rounded fill reaches the same arc that DWM
+        # masks the HWND with. With our previous 12px fill against an
+        # 8px DWM clip, the 4px ring at each corner — DWM-visible but
+        # outside our painted curve — was transparent and leaked the
+        # acrylic backdrop's dark tint, reading as a faint shadow on
+        # the top corners. The search popup gets away with 14px paint
+        # because its taller body visually swallows the same ring;
+        # the wide-flat toolbar makes the artifact stand out.
+        # 8px outer fill, 7.5 border (1px stroke pixel-aligned at 0.5
+        # offset), 6.5 inner highlight (1px stroke at 1.5 offset).
+        rect = QRectF(self.rect())
+        path = QPainterPath()
+        path.addRoundedRect(rect, 8.0, 8.0)
+
+        painter = QPainter(buffer)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setClipPath(path)
+
+        # Info-style surface — same colours as ``_SessionsSearchPopup``
+        # and the info-severity ``StatusPopupFrame`` so the three
+        # frosted Sessions surfaces read as one family.
+        base = QColor(18, 39, 54, 222)
+        border = QColor(10, 132, 255, 165)
+        tint = QColor(10, 132, 255, 30)
+        if self._native_acrylic:
+            base.setAlpha(46)
+            tint.setAlpha(14)
+        painter.fillPath(path, base)
+        painter.fillPath(path, tint)
+        painter.setClipping(False)
+
+        border_rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        border_path = QPainterPath()
+        border_path.addRoundedRect(border_rect, 7.5, 7.5)
+        painter.setPen(QPen(border, 1.0))
+        painter.drawPath(border_path)
+
+        inner = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        inner_path = QPainterPath()
+        inner_path.addRoundedRect(inner, 6.5, 6.5)
+        painter.setPen(QPen(QColor(255, 255, 255, 18), 1.0))
+        painter.drawPath(inner_path)
+        painter.end()
+
+        target = QPainter(self)
+        target.setCompositionMode(QPainter.CompositionMode_Source)
+        target.drawImage(0, 0, buffer)
+        target.end()
+
+
 class _SessionsTreeModel(QStandardItemModel):
     """Tree model organized by workfolder.
 
@@ -711,7 +840,7 @@ class _SessionsTreeModel(QStandardItemModel):
             title_item.setFont(compact_font)
         else:
             title_item.setForeground(QColor(244, 246, 250))
-        title_item.setSizeHint(QSize(0, 82 if not compact else 66))
+        title_item.setSizeHint(QSize(0, 90 if not compact else 66))
 
         time_item = QStandardItem(_format_started_at(record.started_at))
         time_item.setEditable(False)
@@ -755,7 +884,13 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
 
     _GROUP_HEIGHT = 56
     _COMPACTION_HEIGHT = 46
-    _RECORD_HEIGHT = 84
+    # Record row height tuned so the meta line (drawn at y=58–78 from
+    # the row top) has comfortable breathing room above the card's
+    # rounded bottom border on the last visible row of an expanded
+    # workfolder. With 84 the meta line sat ~6px above the card edge
+    # and the selected overlay's inner border was within 2px of it,
+    # which read as content "stuck to the bottom".
+    _RECORD_HEIGHT = 92
     _COMPACT_RECORD_HEIGHT = 66
 
     # Card chrome — values track design_tokens.py. Inlined as QColor here
@@ -773,6 +908,8 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
     _CARD_VGAP = 4.0
     # Horizontal inset so the painted border isn't clipped at viewport edges.
     _CARD_HINSET = 2.0
+    # Extra breathing room between the session cards and the vertical scroller.
+    _CARD_RIGHT_HINSET = 16.0
 
     def __init__(self, view: QTreeView):
         super().__init__(view)
@@ -1111,7 +1248,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             card_rect = QRectF(option.rect).adjusted(
                 self._CARD_HINSET,
                 self._CARD_VGAP,
-                -self._CARD_HINSET,
+                -self._CARD_RIGHT_HINSET,
                 0.0,
             )
             self._paint_card_segment(
@@ -1131,7 +1268,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             is_last = self._is_last_in_card(index)
             card_rect = QRectF(option.rect).adjusted(
                 self._CARD_HINSET, 0.0,
-                -self._CARD_HINSET, 0.0,
+                -self._CARD_RIGHT_HINSET, 0.0,
             )
             self._paint_card_segment(
                 painter,
@@ -1176,7 +1313,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         text_left = left + 76
         count = index.data(_GROUP_COUNT_ROLE)
         pill_w = max(26, len(str(count or "")) * 8 + 14)
-        text_right = option.rect.right() - pill_w - 18
+        text_right = card_rect.right() - pill_w - 18
         title = index.data(Qt.DisplayRole) or ""
         elided = painter.fontMetrics().elidedText(str(title), Qt.ElideRight, max(20, text_right - text_left))
         painter.drawText(
@@ -1186,7 +1323,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         )
 
         if count is not None:
-            pill = QRectF(option.rect.right() - pill_w - 10, center_y - 13, pill_w, 26)
+            pill = QRectF(card_rect.right() - pill_w - 10, center_y - 13, pill_w, 26)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(55, 121, 190, 80) if highlighted else QColor(255, 255, 255, 14))
             painter.drawRoundedRect(pill, 7, 7)
@@ -1212,7 +1349,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         card_fill, card_border = self._card_colors(active=parent_active, hover=False)
         card_rect = QRectF(option.rect).adjusted(
             self._CARD_HINSET, 0.0,
-            -self._CARD_HINSET, 0.0,
+            -self._CARD_RIGHT_HINSET, 0.0,
         )
         self._paint_card_segment(
             painter,
@@ -1255,7 +1392,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             self._draw_message_icon(painter, icon_x, icon_y, message_color, selected)
 
         text_left = icon_x + 44
-        text_right = option.rect.right() - 14
+        text_right = card_rect.right() - 14
         title = str(index.data(Qt.DisplayRole) or "")
         subtitle = str(index.data(_RECORD_SUBTITLE_ROLE) or "")
         started = str(index.data(_RECORD_STARTED_ROLE) or "")
@@ -1614,6 +1751,30 @@ class SessionsPage(QWidget):
         # times.
         self._pending_expansion_toggles: dict[tuple[int, ...], bool] = {}
         self._expansion_flush_scheduled = False
+
+        # ---- floating action bar lifecycle ------------------------------
+        # The bar is now a top-level Qt.Tool window so Windows acrylic
+        # blur applies to its HWND (matches the search/filter popups).
+        # That trades self-following-the-page for a small bookkeeping
+        # tax: install the host-window event filter on first show,
+        # install acrylic the same way on first show, and explicitly
+        # mirror our show/hide into the bar (Qt.Tool windows do NOT
+        # auto-follow their Qt parent's visibility when the parent is
+        # hidden via stack-widget swap, only when the parent's window
+        # itself is hidden).
+        self._floating_actions_window_filter_installed = False
+        self._floating_actions_acrylic_installed = False
+        # Set in showEvent and cleared by either the tree viewport's
+        # first paint after show (preferred — see ``eventFilter``) or
+        # a fallback timer (in case the tree never paints, e.g. an
+        # empty model). Whichever wins triggers
+        # ``_show_floating_actions_after_layout``. This gates the bar's
+        # appearance on the page actually being on screen — a plain
+        # ``QTimer.singleShot(0)`` after showEvent fires before Qt has
+        # finished the children's first paint pass, so the bar
+        # otherwise visually leads the rest of the page during a tab
+        # switch.
+        self._floating_actions_pending_show = False
 
         self._build()
         self._set_record_count_text(self._translator("Loading sessions..."))
@@ -2086,9 +2247,14 @@ class SessionsPage(QWidget):
         # frosted-glass panel with a tinted border. Parented to the list
         # card (not the tree's viewport) so QTreeView's scroll/repaint cycle
         # cannot paint over or clip it during list scrolling.
-        self._floating_actions = QFrame(list_container)
-        self._floating_actions.setObjectName("SessionsFloatingActions")
-        self._floating_actions.setAttribute(Qt.WA_StyledBackground, True)
+        self._floating_actions = _SessionsFloatingActionBar(list_container)
+        # The bar is a top-level Qt.Tool window — QSS does NOT propagate
+        # from the Qt parent's stylesheet (that only works within a
+        # single window's widget tree), so re-apply the list-card sheet
+        # on the bar itself. The non-matching rules in it are inert;
+        # the matching ones (``QPushButton[floatingAction="true"]``
+        # and friends) are the only ones we need.
+        self._floating_actions.setStyleSheet(_LIST_CARD_QSS)
         floating_layout = QHBoxLayout(self._floating_actions)
         floating_layout.setContentsMargins(8, 6, 8, 6)
         floating_layout.setSpacing(6)
@@ -2683,6 +2849,16 @@ class SessionsPage(QWidget):
         ):
             self._reposition_list_overlay()
             self._reposition_floating_actions()
+        # Drive the deferred floating-bar show off the tree viewport's
+        # first paintEvent after a page show — see ``showEvent`` for
+        # the rationale.
+        if (
+            self._floating_actions_pending_show
+            and tree is not None
+            and obj is tree.viewport()
+            and event.type() == QEvent.Paint
+        ):
+            self._show_floating_actions_after_layout()
         if (
             obj is getattr(self, "_list_container", None)
             and event.type() == QEvent.Resize
@@ -2691,6 +2867,12 @@ class SessionsPage(QWidget):
             popup = getattr(self, "_search_popup", None)
             if popup is not None and popup.isVisible():
                 self._position_search_popup()
+        # The floating bar is a top-level Qt.Tool window in *global*
+        # screen coordinates, so it doesn't follow the host window
+        # automatically — every move/resize of the host has to fire a
+        # reposition.
+        if obj is self.window() and event.type() in (QEvent.Move, QEvent.Resize):
+            self._reposition_floating_actions()
         return super().eventFilter(obj, event)
 
     def hideEvent(self, event):  # noqa: N802 - Qt naming
@@ -2702,12 +2884,53 @@ class SessionsPage(QWidget):
         # complained about as "loses my progress".
         #
         # The popup overlays still get hidden — they're top-level
-        # windows that shouldn't outlive the page being visible.
+        # windows that shouldn't outlive the page being visible. Same
+        # rule applies to the floating action bar (also a Qt.Tool
+        # window now): it would otherwise stay pinned over whatever
+        # tab the user navigated to.
         self._search_popup.hide()
+        bar = getattr(self, "_floating_actions", None)
+        if bar is not None:
+            bar.hide()
+        # Reset the pending-show flag so a stale fallback timer or
+        # paint event from the previous show cycle doesn't pop the
+        # bar back up after the page has been hidden.
+        self._floating_actions_pending_show = False
         super().hideEvent(event)
 
     def showEvent(self, event):  # noqa: N802 - Qt naming
         super().showEvent(event)
+        # Floating-bar lifecycle. Guard on ``self.isVisible()`` so unit
+        # tests that synthesise showEvent (``page.showEvent(QShowEvent())``)
+        # without actually mapping the page don't promote the bar to a
+        # visible top-level Qt.Tool window — that previously leaked as a
+        # leftover ``topLevelWidgets()`` entry across pytest runs and
+        # broke the qt_app suite's "all top-levels are hidden" assertion.
+        # Inside the running app this guard is a no-op: by the time
+        # showEvent fires for a tab-switch or window show, the page IS
+        # visible.
+        if self.isVisible():
+            # Lazily install the host-window event filter on first show
+            # so window Move/Resize can drive the floating bar's
+            # screen-coord reposition. The parent chain isn't ready in
+            # __init__.
+            if not self._floating_actions_window_filter_installed:
+                host = self.window()
+                if host is not None and host is not self:
+                    host.installEventFilter(self)
+                    self._floating_actions_window_filter_installed = True
+            # Gate the bar's first appearance on the tree viewport's
+            # first paintEvent after this show — the tree is the heaviest
+            # child and the last to settle, so by the time it paints the
+            # rest of the page is already on screen. A single
+            # ``QTimer.singleShot(0)`` isn't enough: it fires before Qt
+            # has flushed the parent's queued paint pass, so the bar
+            # visibly leads the page. The 200ms fallback handles the
+            # corner case where the tree never paints (e.g. an empty
+            # model) so the bar still appears.
+            self._floating_actions_pending_show = True
+            QTimer.singleShot(200, self._show_floating_actions_after_layout)
+
         # Lightweight freshness check. The panel's state is preserved
         # across hide/show, so by default we do nothing — Qt restores
         # scroll position automatically. The one case where the cached
@@ -2805,9 +3028,16 @@ class SessionsPage(QWidget):
     def _reposition_floating_actions(self) -> None:
         """Center the floating action bar over the visible session list.
 
-        The bar truly floats: it overlays the tree's viewport without
-        shrinking it, so mid-scroll rows pass under the bar (image 2). To
-        avoid the very last row being permanently hidden behind the bar,
+        The bar is now a top-level ``Qt.Tool`` window (so Windows
+        acrylic compositor can blur the content behind it). That means
+        positioning has to happen in *global screen* coordinates — top-
+        level windows do not follow their Qt parent's screen position
+        automatically. We compute the desired position in the list
+        container's local frame, then translate via ``mapToGlobal``.
+
+        The bar still truly floats: it overlays the tree's viewport
+        without shrinking it, so mid-scroll rows pass under the bar.
+        To avoid the very last row being permanently hidden behind it,
         extra scroll-past-end space is added by extending the vertical
         scrollbar's maximum — see ``_extend_tree_scroll_range``.
         """
@@ -2825,9 +3055,10 @@ class SessionsPage(QWidget):
         # The panel border is what the user perceives as "the list", so
         # center the bar relative to it.
         centered_x = (container.width() - bar_size.width()) // 2
-        x = max(margin, min(centered_x, container.width() - bar_size.width() - margin))
-        y = max(margin, container.height() - bar_size.height() - margin)
-        bar.move(x, y)
+        local_x = max(margin, min(centered_x, container.width() - bar_size.width() - margin))
+        local_y = max(margin, container.height() - bar_size.height() - margin)
+        global_origin = container.mapToGlobal(QPoint(0, 0))
+        bar.move(global_origin.x() + local_x, global_origin.y() + local_y)
         bar.raise_()
         # Scroll-past-end allowance — sized so the last row lands just above
         # the floating bar instead of being covered by it. The bar overlaps
@@ -2844,6 +3075,57 @@ class SessionsPage(QWidget):
         # (e.g. translator-driven tooltip pass changed nothing here, but the
         # very first reposition after construction needs the extension).
         self._extend_tree_scroll_range()
+
+    def _show_floating_actions_after_layout(self) -> None:
+        """Reposition + show the bar + install acrylic. Called by
+        whichever fires first: the tree viewport's first paint event
+        after a show (preferred), or the 200ms fallback timer.
+        Idempotent — clears ``_floating_actions_pending_show`` so the
+        loser is a no-op."""
+        if not self._floating_actions_pending_show:
+            return
+        self._floating_actions_pending_show = False
+        if not self.isVisible():
+            return
+        bar = getattr(self, "_floating_actions", None)
+        if bar is None:
+            return
+        self._reposition_floating_actions()
+        bar.show()
+        bar.raise_()
+        # Acrylic install needs a real HWND, which only exists after
+        # the bar has actually been mapped — i.e. after this show()
+        # has rolled through Qt's window-system layer. Schedule one
+        # more tick.
+        QTimer.singleShot(0, self._install_floating_actions_acrylic)
+
+    def _install_floating_actions_acrylic(self) -> None:
+        """Apply Windows native acrylic blur + DWM rounded corners +
+        transparent border to the floating bar's HWND. Idempotent —
+        only runs once. Mirrors the install path used by the search
+        popup so all three frosted Sessions surfaces feel consistent.
+
+        Earlier we tried ``DWMWCP_DONOTROUND`` thinking it would erase
+        a small painted-vs-clipped corner shadow; instead it left the
+        HWND rectangular and the acrylic backdrop bled into the
+        rectangular corner "ears" outside our 12px painted rounding,
+        producing a much louder blue glow. The default DWM ROUND clip
+        is the right call here even with a small radius mismatch —
+        the OS handles all the corner pixels itself.
+        """
+        if self._floating_actions_acrylic_installed:
+            return
+        bar = getattr(self, "_floating_actions", None)
+        if bar is None:
+            return
+        # The HWND only exists once the window has been shown at least
+        # once; ``winId()`` would create a top-level proxy too early.
+        if not bar.isVisible():
+            return
+        if _install_acrylic_blur_for_popup(bar, tint_alpha=58):
+            bar.set_native_acrylic(True)
+            _install_dialog_chrome_for_popup(bar)
+        self._floating_actions_acrylic_installed = True
 
     def _capture_expansion(self) -> set[tuple[str, str]]:
         expanded: set[tuple[str, str]] = set()
@@ -6382,14 +6664,11 @@ QToolButton#SessionsSearchButton[hasQuery="true"] {{
     background: {PRIMARY_GHOST};
     border-color: {PRIMARY_BAND};
 }}
-/* Floating action bar — frosted-glass surface mirroring the bottom status
-   notification toast. Hosts the Locate button plus the four batch actions
-   as icon-only chips. */
-QFrame#SessionsFloatingActions {{
-    background: {SURFACE_FROSTED};
-    border: 1px solid {SURFACE_FROSTED_BORDER};
-    border-radius: 12px;
-}}
+/* Floating action bar surface chrome is handled by the
+   ``_SessionsFloatingActionBar.paintEvent`` (top-level Qt.Tool window
+   so Windows acrylic compositor can blur the content behind it). The
+   button styling stays here because the bar applies this sheet to
+   itself for its descendants. */
 QToolButton[floatingAction="true"],
 QPushButton[floatingAction="true"] {{
     background: transparent;
