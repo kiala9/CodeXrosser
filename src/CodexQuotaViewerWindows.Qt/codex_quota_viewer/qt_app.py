@@ -567,6 +567,57 @@ class StatusDetailsPopup(StatusPopupFrame):
         super().__init__(parent, as_window=True)
         self.setProperty("severity", "info")
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt naming
+        # Absorb double-click events on the pill's empty padding so they
+        # don't bubble up to the parent ``TitleBar``'s
+        # ``mouseDoubleClickEvent`` (which toggles maximize). Children
+        # of the pill — e.g. StatusBanner, the close/details buttons —
+        # still process their own double-clicks first; only the
+        # leftover empty area lands here. Pressing or dragging still
+        # propagates so the user can drag the window from the pill.
+        event.accept()
+
+
+class StatusDetailsPopup(StatusPopupFrame):
+    """Frosted-glass dropdown anchored under the title-bar status pill,
+    exposing the full cleaned message text. Mirrors the search/filter
+    popup pattern from sessions_page (top-level Qt.Tool window with a
+    custom paintEvent) so all three frosted popovers feel like the
+    same UI primitive. ESC and click-outside dismiss."""
+
+    dismiss_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None):
+        # Build the window flag set ourselves because the base class's
+        # ``as_window=True`` path also installs ``WindowDoesNotAcceptFocus``
+        # / ``Qt.NoFocus``, which would block ESC-to-dismiss.
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setProperty("severity", "info")
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.key() == Qt.Key_Escape:
+            event.accept()
+            self.dismiss_requested.emit()
+            return
+        super().keyPressEvent(event)
+
+    def event(self, event) -> bool:
+        # Click-outside dismissal: when the popup loses window focus the
+        # user has clicked elsewhere, so dismiss without spawning a
+        # separate transparent click-catcher.
+        if event.type() == QEvent.WindowDeactivate and self.isVisible():
+            self.dismiss_requested.emit()
+        return super().event(event)
+
 
 class QuotaRingWidget(QWidget):
     def __init__(self, parent: QWidget | None = None):

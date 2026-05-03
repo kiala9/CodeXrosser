@@ -4197,6 +4197,24 @@ class _SessionDetailPanel(QFrame):
                 anchor_block_index = candidate
                 anchor_offset = raw_scroll - top_widget.y()
 
+        # Capture the topmost-visible bubble's blockIndex + viewport
+        # offset so we can land scroll precisely after layout. Using
+        # ``widget.sizeHint().height()`` summed across freshly-inserted
+        # widgets undercounts (word-wrap height-for-width isn't computed
+        # before a layout pass), which made setValue(prev + added_height)
+        # land far above the user's prior view — the "scrolling up jumps"
+        # symptom.
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        raw_scroll = scrollbar.value()
+        top_widget = self._topmost_visible_widget()
+        anchor_block_index: int | None = None
+        anchor_offset = 0
+        if top_widget is not None:
+            candidate = top_widget.property("blockIndex")
+            if isinstance(candidate, int):
+                anchor_block_index = candidate
+                anchor_offset = raw_scroll - top_widget.y()
+
         drop_count = self._window_end - new_end
         if drop_count > 0:
             tail_first = self._timeline_layout.count() - 2  # before stretch
