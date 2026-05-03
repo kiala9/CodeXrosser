@@ -627,15 +627,19 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         (matches Accounts: only the current account is blue)
     """
 
-    _GROUP_HEIGHT = 56
+    # Workfolder header height — sized so the 28x28 folder icon has
+    # ~10px breathing room above and below. Previously 56px with a
+    # 34x34 icon, but the icon was bigger than the record row's own
+    # 30x30 chip icons, which made the header card feel heavier than
+    # the records below it.
+    _GROUP_HEIGHT = 48
     _COMPACTION_HEIGHT = 46
-    # Record row height tuned so the meta line (drawn at y=58–78 from
-    # the row top) has comfortable breathing room above the card's
-    # rounded bottom border on the last visible row of an expanded
-    # workfolder. With 84 the meta line sat ~6px above the card edge
-    # and the selected overlay's inner border was within 2px of it,
-    # which read as content "stuck to the bottom".
-    _RECORD_HEIGHT = 92
+    # Record row height. Was 92, picked when the group header was 56:
+    # at that ratio the matching ~14px bottom margin felt right. With
+    # the now-compact 48px header, 92 felt too airy. 80 keeps the row
+    # dense while the delegate centers the icon and text stack against
+    # the actual painted card segment, not the raw item rect.
+    _RECORD_HEIGHT = 80
     _COMPACT_RECORD_HEIGHT = 66
 
     # Card chrome — values track design_tokens.py. Inlined as QColor here
@@ -648,6 +652,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
     _CARD_FILL_IDLE = QColor(255, 255, 255, 12)      # SURFACE_PANEL
     _CARD_BORDER_IDLE = QColor(255, 255, 255, 28)    # SURFACE_PANEL_BORDER
     _CARD_RADIUS = 12.0
+    _CARD_PADDING_BOTTOM = 4.0
     # Top + bottom inset of the painted card within ``option.rect`` —
     # creates a vertical gap between consecutive top-level cards.
     _CARD_VGAP = 4.0
@@ -671,12 +676,6 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         # is invalidated on the *minimal* set of signals that can change
         # its answer — see _invalidate_* hooks below.
         #
-        # _last_path_cache: top-level row -> tuple encoding the row chain
-        # (top_row, child_row, ...) to that card's rightmost visible
-        # descendant. Used by _is_last_in_card so a row only checks
-        # equality against a precomputed tuple instead of re-walking the
-        # DFS path on every paint.
-        self._last_path_cache: dict[int, tuple[int, ...]] = {}
         # _active_top_row: row of the top-level workfolder that owns the
         # focused selection (active card), or None. Recomputed only when
         # selection changes, so paint-time becomes a single int compare.
@@ -688,14 +687,10 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         self._svg_cache: dict[tuple[str, str], QSvgRenderer] = {}
 
         # ---- cache invalidation hooks -----------------------------------
-        view.expanded.connect(self._on_view_expansion_changed)
-        view.collapsed.connect(self._on_view_expansion_changed)
         model = view.model()
         if model is not None:
             model.modelReset.connect(self._invalidate_all_caches)
             model.layoutChanged.connect(self._invalidate_all_caches)
-            model.rowsInserted.connect(self._invalidate_path_cache)
-            model.rowsRemoved.connect(self._invalidate_path_cache)
         sel_model = view.selectionModel()
         if sel_model is not None:
             sel_model.currentChanged.connect(self._invalidate_active_cache)
@@ -703,28 +698,16 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
 
     # ---- cache helpers --------------------------------------------------
 
-    def _on_view_expansion_changed(self, _index) -> None:
-        # Expand/collapse only affects which row caps each card, not which
-        # workfolder is active.
-        self._last_path_cache.clear()
-
-    def _invalidate_path_cache(self, *_args) -> None:
-        self._last_path_cache.clear()
-
     def _invalidate_active_cache(self, *_args) -> None:
         self._active_top_row_dirty = True
 
     def _invalidate_all_caches(self, *_args) -> None:
-        self._last_path_cache.clear()
         self._active_top_row_dirty = True
 
     def _last_path_for_top(self, top_row: int) -> tuple[int, ...]:
         """Encoded row chain to the rightmost visible leaf under the
-        top-level row ``top_row``. Cached; rebuilt on expand/collapse or
-        model change."""
-        cached = self._last_path_cache.get(top_row)
-        if cached is not None:
-            return cached
+        top-level row ``top_row``. Computed on the fly since max depth is ~3
+        and caching can be stale during QTreeView layout passes."""
         model = self._view.model()
         if model is None:
             return ()
@@ -740,9 +723,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
                 break
             cur = model.index(n - 1, 0, cur)
             chain.append(cur.row())
-        result = tuple(chain)
-        self._last_path_cache[top_row] = result
-        return result
+        return tuple(chain)
 
     def _resolve_active_top_row(self) -> int | None:
         if not self._active_top_row_dirty:
@@ -788,8 +769,9 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         extra = self._first_row_extra(index)
         if self._is_last_in_card(index):
             # Reserve a 4px gap below the last visible row of each
-            # top-level card so the next card has breathing room.
-            extra += int(self._CARD_VGAP)
+            # top-level card so the next card has breathing room, plus
+            # internal padding so the content doesn't hug the bottom border.
+            extra += int(self._CARD_VGAP + self._CARD_PADDING_BOTTOM)
         if index.data(_GROUP_KIND_ROLE) == "workfolder":
             return QSize(option.rect.width(), self._GROUP_HEIGHT + extra)
         if index.data(_GROUP_KIND_ROLE) == "compaction":
@@ -855,6 +837,19 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         if hover:
             return self._CARD_FILL_HOVER, self._CARD_BORDER_HOVER
         return self._CARD_FILL_IDLE, self._CARD_BORDER_IDLE
+
+    def _card_right_inset(self) -> float:
+        """Right inset adjusted so card edges stay fixed when a vertical
+        scrollbar takes part of the viewport width."""
+        inset = self._CARD_RIGHT_HINSET
+        view = self._view
+        if view is None:
+            return inset
+        scrollbar = view.verticalScrollBar()
+        if scrollbar is None or not scrollbar.isVisible():
+            return inset
+        gutter = max(0, view.width() - view.viewport().width())
+        return max(self._CARD_HINSET, inset - float(gutter))
 
     def _paint_card_segment(
         self,
@@ -984,6 +979,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             # card has no expanded children (collapsed standalone).
             active = self._is_active_workfolder(index)
             fill, border = self._card_colors(active=active, hover=hover)
+            right_inset = self._card_right_inset()
             # Bottom inset is always 0 here: paint() has already
             # shrunk option.rect by CARD_VGAP for collapsed standalone
             # groups (via _is_last_in_card → True), so card.bottom()
@@ -993,7 +989,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             card_rect = QRectF(option.rect).adjusted(
                 self._CARD_HINSET,
                 self._CARD_VGAP,
-                -self._CARD_RIGHT_HINSET,
+                -right_inset,
                 0.0,
             )
             self._paint_card_segment(
@@ -1011,9 +1007,10 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             parent_active = self._parent_card_active(index)
             fill, border = self._card_colors(active=parent_active, hover=False)
             is_last = self._is_last_in_card(index)
+            right_inset = self._card_right_inset()
             card_rect = QRectF(option.rect).adjusted(
                 self._CARD_HINSET, 0.0,
-                -self._CARD_RIGHT_HINSET, 0.0,
+                -right_inset, 0.0,
             )
             self._paint_card_segment(
                 painter,
@@ -1023,11 +1020,20 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
                 has_top=False,
                 has_bottom=is_last,
             )
+            
+            nominal_height = self._COMPACTION_HEIGHT
+            content_rect = QRectF(option.rect.left(), option.rect.top(), option.rect.width(), nominal_height).adjusted(
+                self._CARD_HINSET, 0.0,
+                -right_inset, 0.0,
+            )
             # Hover overlay for compaction rows.
-            if hover and not parent_active:
+            if hover:
+                inner = content_rect.adjusted(
+                    8.0, 4.0, -8.0, -4.0 if is_last else 0.0
+                )
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(self._CARD_FILL_HOVER)
-                painter.drawRect(card_rect)
+                painter.drawRoundedRect(inner, 8, 8)
 
         # ---- inner content (chevron + folder + title + count pill) ----
         # "Highlighted" content style now follows the active rule for
@@ -1038,7 +1044,14 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             highlighted = self._parent_card_active(index)
 
         left = option.rect.left() + (8 if kind == "workfolder" else 30)
-        center_y = option.rect.center().y()
+        if kind == "workfolder" and is_top_level:
+            center_y = int(round(card_rect.center().y()))
+            text_rect_top = card_rect.top()
+            text_rect_height = card_rect.height()
+        else:
+            center_y = int(round(content_rect.center().y()))
+            text_rect_top = content_rect.top()
+            text_rect_height = content_rect.height()
         accent = QColor("#55adff") if highlighted else QColor(165, 178, 195)
         text_color = QColor("#56adff") if kind == "workfolder" and highlighted else QColor(220, 227, 238)
         if kind == "compaction":
@@ -1046,7 +1059,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             accent = QColor(130, 138, 150)
 
         self._draw_chevron(painter, left + 9, center_y, chevron_expanded, accent)
-        self._draw_folder(painter, left + 31, center_y - 16, accent, highlighted)
+        self._draw_folder(painter, left + 31, center_y - 14, accent, highlighted)
 
         font = QFont(option.font)
         font.setPointSizeF(font.pointSizeF() + (1.0 if kind == "workfolder" else -0.5))
@@ -1055,23 +1068,24 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         painter.setFont(font)
         painter.setPen(text_color)
 
-        text_left = left + 76
+        text_left = left + 70
         count = index.data(_GROUP_COUNT_ROLE)
-        pill_w = max(26, len(str(count or "")) * 8 + 14)
+        pill_w = max(22, len(str(count or "")) * 8 + 12)
         text_right = card_rect.right() - pill_w - 18
         title = index.data(Qt.DisplayRole) or ""
         elided = painter.fontMetrics().elidedText(str(title), Qt.ElideRight, max(20, text_right - text_left))
         painter.drawText(
-            QRectF(text_left, option.rect.top(), max(20, text_right - text_left), option.rect.height()),
+            QRectF(text_left, text_rect_top, max(20, text_right - text_left), text_rect_height),
             Qt.AlignLeft | Qt.AlignVCenter,
             elided,
         )
 
         if count is not None:
-            pill = QRectF(card_rect.right() - pill_w - 10, center_y - 13, pill_w, 26)
+            rect_to_use = card_rect if (kind == "workfolder" and is_top_level) else content_rect
+            pill = QRectF(rect_to_use.right() - pill_w - 10, center_y - 11, pill_w, 22)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(55, 121, 190, 80) if highlighted else QColor(255, 255, 255, 14))
-            painter.drawRoundedRect(pill, 7, 7)
+            painter.drawRoundedRect(pill, 6, 6)
             painter.setPen(QColor("#74bdff") if highlighted else QColor(160, 170, 185))
             count_font = QFont(option.font)
             count_font.setPointSizeF(max(count_font.pointSizeF() - 0.5, 8.5))
@@ -1089,12 +1103,13 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         compact = bool(index.data(_RECORD_COMPACT_ROLE))
         parent_active = self._parent_card_active(index)
         is_last = self._is_last_in_card(index)
+        right_inset = self._card_right_inset()
 
         # Continue the parent card's chrome through this row.
         card_fill, card_border = self._card_colors(active=parent_active, hover=False)
         card_rect = QRectF(option.rect).adjusted(
             self._CARD_HINSET, 0.0,
-            -self._CARD_RIGHT_HINSET, 0.0,
+            -right_inset, 0.0,
         )
         self._paint_card_segment(
             painter,
@@ -1105,6 +1120,12 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             has_bottom=is_last,
         )
 
+        nominal_height = self._COMPACT_RECORD_HEIGHT if compact else self._RECORD_HEIGHT
+        content_rect = QRectF(option.rect.left(), option.rect.top(), option.rect.width(), nominal_height).adjusted(
+            self._CARD_HINSET, 0.0,
+            -right_inset, 0.0,
+        )
+
         # Inner overlays. Selected row mirrors the Accounts page's
         # "current account" card recipe — PRIMARY_GHOST fill + 1px
         # PRIMARY_BAND border — so the focused session reads the same
@@ -1112,18 +1133,19 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         # an already-active parent card. Hover is just a faint white
         # tint (selected wins when both apply).
         if selected:
-            inner = card_rect.adjusted(8.0, 4.0, -8.0, -4.0 if is_last else 0.0)
+            inner = content_rect.adjusted(8.0, 4.0, -8.0, -4.0 if is_last else 0.0)
             painter.setPen(QPen(self._CARD_BORDER_ACTIVE, 1))
             painter.setBrush(self._CARD_FILL_ACTIVE)
             painter.drawRoundedRect(inner, 8, 8)
         elif hover:
-            inner = card_rect.adjusted(8.0, 2.0, -8.0, -2.0 if is_last else 0.0)
+            inner = content_rect.adjusted(8.0, 2.0, -8.0, -2.0 if is_last else 0.0)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(255, 255, 255, 16))
             painter.drawRoundedRect(inner, 8, 8)
 
+        record_center_y = content_rect.center().y()
         icon_x = option.rect.left() + 38
-        icon_y = option.rect.top() + 13
+        icon_y = int(round(record_center_y - 15))
         status = str(index.data(_RECORD_STATUS_ROLE) or "")
         # Status-driven icon: archived sessions get the amber Archive chip,
         # everything else gets the default MessageSquare. Both glyphs use
@@ -1137,7 +1159,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             self._draw_message_icon(painter, icon_x, icon_y, message_color, selected)
 
         text_left = icon_x + 44
-        text_right = card_rect.right() - 14
+        text_right = content_rect.right() - 14
         title = str(index.data(Qt.DisplayRole) or "")
         subtitle = str(index.data(_RECORD_SUBTITLE_ROLE) or "")
         started = str(index.data(_RECORD_STARTED_ROLE) or "")
@@ -1150,7 +1172,20 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         title_font.setItalic(compact)
         painter.setFont(title_font)
         painter.setPen(QColor(238, 243, 250) if selected else QColor(210, 216, 226))
-        title_y = option.rect.top() + (10 if not compact else 9)
+        # Subtitle and meta use 18px-tall rects (vs 20 for title) because
+        # they're smaller fonts (italic 9.75pt, regular 9pt) — the extra
+        # 2px the larger rect contributed was just dead padding around
+        # already-vcentered text. Trimming 2px each gives 4px back to the
+        # bottom margin so the meta line doesn't read as flush against
+        # the card's rounded bottom border on the last visible row.
+        if compact:
+            title_y = int(round(record_center_y - 24))
+            subtitle_y = title_y + 22
+            meta_y = int(round(record_center_y + 3))
+        else:
+            title_y = int(round(record_center_y - 30))
+            subtitle_y = title_y + 22
+            meta_y = title_y + 40
         painter.drawText(
             QRectF(text_left, title_y, max(24, text_right - text_left), 22),
             Qt.AlignLeft | Qt.AlignVCenter,
@@ -1164,7 +1199,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             painter.setFont(subtitle_font)
             painter.setPen(QColor(140, 149, 163) if not selected else QColor(185, 210, 230))
             painter.drawText(
-                QRectF(text_left, option.rect.top() + 34, max(24, text_right - text_left), 20),
+                QRectF(text_left, subtitle_y, max(24, text_right - text_left), 18),
                 Qt.AlignLeft | Qt.AlignVCenter,
                 painter.fontMetrics().elidedText(subtitle, Qt.ElideRight, max(24, text_right - text_left)),
             )
@@ -1179,9 +1214,8 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         if status_label:
             meta = f"{meta}    {status_label}"
         painter.setPen(QColor(165, 177, 193) if not selected else QColor(210, 230, 245))
-        meta_y = option.rect.top() + (58 if not compact else 36)
         painter.drawText(
-            QRectF(text_left, meta_y, max(24, text_right - text_left), 20),
+            QRectF(text_left, meta_y, max(24, text_right - text_left), 18),
             Qt.AlignLeft | Qt.AlignVCenter,
             painter.fontMetrics().elidedText(meta, Qt.ElideRight, max(24, text_right - text_left)),
         )
@@ -1210,16 +1244,16 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         color: QColor,
         active: bool,
     ) -> None:
-        outer = QRectF(x, y, 34, 34)
+        outer = QRectF(x, y, 28, 28)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(40, 95, 150, 105) if active else QColor(255, 255, 255, 18))
-        painter.drawRoundedRect(outer, 8, 8)
-        painter.setPen(QPen(color, 1.7))
+        painter.drawRoundedRect(outer, 7, 7)
+        painter.setPen(QPen(color, 1.6))
         painter.setBrush(Qt.NoBrush)
-        painter.drawRoundedRect(QRectF(x + 8, y + 12, 18, 12), 2, 2)
-        painter.drawLine(x + 10, y + 12, x + 14, y + 8)
-        painter.drawLine(x + 14, y + 8, x + 21, y + 8)
-        painter.drawLine(x + 21, y + 8, x + 24, y + 12)
+        painter.drawRoundedRect(QRectF(x + 7, y + 10, 14, 10), 2, 2)
+        painter.drawLine(x + 9, y + 10, x + 12, y + 7)
+        painter.drawLine(x + 12, y + 7, x + 17, y + 7)
+        painter.drawLine(x + 17, y + 7, x + 20, y + 10)
 
     # ---- record-row glyphs ------------------------------------------------
     # The tree shows one of these 30×30 chip icons per record row, picked by
@@ -1958,9 +1992,12 @@ class SessionsPage(QWidget):
         # above the bar; the guard flag prevents the resulting rangeChanged
         # signal from re-entering the handler.
         self._scroll_past_end_extra = 0
+        self._scroll_past_end_natural_max = 0
+        self._scroll_past_end_applied_extra = 0
+        self._scroll_past_end_extended_max: int | None = None
         self._extending_scroll_range = False
         self._tree.verticalScrollBar().rangeChanged.connect(
-            lambda _mn, _mx: self._extend_tree_scroll_range()
+            lambda _mn, mx: self._extend_tree_scroll_range(mx)
         )
 
         # Loading overlay parented to the tree's viewport so it sits centered
@@ -2375,6 +2412,13 @@ class SessionsPage(QWidget):
                     item.setData(None, _PENDING_EXPANSION_ROLE)
                 if self._tree.isExpanded(index) != target:
                     self._tree.setExpanded(index, target)
+                    # Force the view to re-evaluate the size hint for this
+                    # row (and its parent card) because delegate heights and
+                    # bottom-border painting depend on isLastInCard, which
+                    # keys off the view's expanded state — not model data.
+                    # Without this, Qt reuses the cached pre-fold rect and
+                    # the card bottom gets clipped.
+                    model.dataChanged.emit(index, index)
 
     def _on_row_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
         if not current.isValid():
@@ -2727,29 +2771,42 @@ class SessionsPage(QWidget):
         self._record_count_label.setText(text)
         self._reposition_record_count_label()
 
-    def _extend_tree_scroll_range(self) -> None:
+    def _extend_tree_scroll_range(self, reported_max: int | None = None) -> None:
         """Bump the tree's vertical scrollbar maximum by ``_scroll_past_end_extra``.
 
         QAbstractItemView re-derives the scrollbar range from the model on
         every layout/expand/collapse, so we hook ``rangeChanged`` and add the
-        same overscroll padding back. The guard prevents recursion since
-        ``setMaximum`` itself emits ``rangeChanged``.
+        same overscroll padding back. Manual callers may run while the range
+        is already extended, so track the last natural maximum separately and
+        avoid adding the padding repeatedly. The guard prevents recursion
+        since ``setMaximum`` itself emits ``rangeChanged``.
         """
         tree = getattr(self, "_tree", None)
         if tree is None:
             return
-        extra = getattr(self, "_scroll_past_end_extra", 0)
-        if extra <= 0:
-            return
         if getattr(self, "_extending_scroll_range", False):
             return
+        extra = getattr(self, "_scroll_past_end_extra", 0)
         sb = tree.verticalScrollBar()
-        natural_max = sb.maximum()
-        if natural_max <= 0:
+        current_max = sb.maximum()
+        extended_max = getattr(self, "_scroll_past_end_extended_max", None)
+        if reported_max is not None:
+            natural_max = reported_max
+        elif extended_max is not None and current_max == extended_max:
+            natural_max = getattr(self, "_scroll_past_end_natural_max", 0)
+        else:
+            natural_max = current_max
+        if extra <= 0 or natural_max <= 0:
             # Empty / non-scrollable list: nothing to extend.
+            self._scroll_past_end_natural_max = max(0, natural_max)
+            self._scroll_past_end_applied_extra = 0
+            self._scroll_past_end_extended_max = None
             return
         desired = natural_max + extra
-        if sb.maximum() == desired:
+        self._scroll_past_end_natural_max = natural_max
+        self._scroll_past_end_applied_extra = extra
+        self._scroll_past_end_extended_max = desired
+        if current_max == desired:
             return
         self._extending_scroll_range = True
         try:
@@ -3016,6 +3073,12 @@ class _SessionDetailPanel(QFrame):
         self._render_token = 0
         self._all_blocks: list[Any] = []
         self._user_anchor_blocks: list[int] = []  # block indexes of user prompts
+        # Filtered view: when non-None, holds physical block indices that
+        # pass the active chip+search filter. The window then indexes this
+        # list (so matched bubbles pack contiguously and the slide can keep
+        # advancing through them). None ⇒ no filter active and the window
+        # indexes _all_blocks directly. Rebuilt by _recompute_filtered_view().
+        self._filtered_block_indices: list[int] | None = None
         self._window_start = 0
         self._window_end = 0
         self._timeline_item_count = 0
@@ -3299,13 +3362,16 @@ class _SessionDetailPanel(QFrame):
         anchored under the filter trigger button. Inside the popup the
         reset button is always visible — discoverability beats
         conditional hiding once the user has explicitly opened the
-        filter sheet.
+        filter sheet — but it sits as a base-less icon button next to
+        the count chip rather than a full-width labeled action, so the
+        popup reads as count + chips rather than count + chips + CTA.
         """
         body = QVBoxLayout(self._filter_popup)
         body.setContentsMargins(14, 12, 14, 12)
         body.setSpacing(10)
 
-        # Count chip: filter icon + ``matched / total``.
+        # Count row: filter icon + ``matched / total`` on the left,
+        # base-less reset icon button on the right.
         count_row = QHBoxLayout()
         count_row.setContentsMargins(0, 0, 0, 0)
         count_row.setSpacing(6)
@@ -3315,6 +3381,15 @@ class _SessionDetailPanel(QFrame):
         count_row.addWidget(self._count_icon_label, 0, Qt.AlignVCenter)
         count_row.addWidget(self._count_label, 0, Qt.AlignVCenter)
         count_row.addStretch(1)
+        self._reset_button = QPushButton()
+        self._reset_button.setObjectName("SessionsDetailResetButton")
+        self._reset_button.setIcon(_reset_icon())
+        self._reset_button.setIconSize(QSize(14, 14))
+        self._reset_button.setFixedSize(22, 22)
+        self._reset_button.setCursor(Qt.PointingHandCursor)
+        self._reset_button.setToolTip(self._translator("Reset filters"))
+        self._reset_button.clicked.connect(self._on_reset_filters)
+        count_row.addWidget(self._reset_button, 0, Qt.AlignVCenter)
         body.addLayout(count_row)
 
         # Filter chips — one per kind, each a checkable QPushButton with
@@ -3347,24 +3422,6 @@ class _SessionDetailPanel(QFrame):
             self._chip_buttons[kind] = chip
             chip_grid.addWidget(chip, index // 2, index % 2)
         body.addLayout(chip_grid)
-
-        # Reset button — always visible inside the popover. Outside the
-        # popover, the trigger button's ``hasActiveFilter`` property
-        # already telegraphs whether a non-default state is in effect, so
-        # the reset action does not need a second status-contingent
-        # affordance.
-        reset_row = QHBoxLayout()
-        reset_row.setContentsMargins(0, 0, 0, 0)
-        reset_row.addStretch(1)
-        self._reset_button = QPushButton(self._translator("Reset filters"))
-        self._reset_button.setObjectName("SessionsDetailResetButton")
-        self._reset_button.setIcon(_reset_icon())
-        self._reset_button.setIconSize(QSize(14, 14))
-        self._reset_button.setCursor(Qt.PointingHandCursor)
-        self._reset_button.setToolTip(self._translator("Reset filters"))
-        self._reset_button.clicked.connect(self._on_reset_filters)
-        reset_row.addWidget(self._reset_button)
-        body.addLayout(reset_row)
 
         self._filter_popup.hide()
 
@@ -3569,6 +3626,71 @@ class _SessionDetailPanel(QFrame):
             return query in self._block_searchable_id(block).lower()
         return query in self._block_searchable_text(block).lower()
 
+    # ------------------------------------------------- filtered view helpers
+    #
+    # When a filter narrows the visible set, the sliding window must operate
+    # over the *filtered* index list, not _all_blocks, so matched bubbles
+    # pack contiguously and the slide can advance through later matches even
+    # when the rendered viewport is tiny (the previous behaviour froze at
+    # the initial window because the unfiltered scrollbar wasn't movable).
+
+    def _recompute_filtered_view(self) -> None:
+        """Refresh self._filtered_block_indices from the current filter
+        state. Sets it to None when filters are at default (no indirection
+        on the common path); otherwise to the list of physical block
+        indices that pass _block_passes_filter."""
+        if self._filters_at_default():
+            self._filtered_block_indices = None
+            return
+        self._filtered_block_indices = [
+            i for i, blk in enumerate(self._all_blocks)
+            if self._block_passes_filter(blk)
+        ]
+
+    def _view_size(self) -> int:
+        if self._filtered_block_indices is not None:
+            return len(self._filtered_block_indices)
+        return len(self._all_blocks)
+
+    def _block_index_for_view(self, pos: int) -> int:
+        """Map a window-position (view coordinate) to a physical
+        _all_blocks index. Caller is responsible for bounds."""
+        if self._filtered_block_indices is not None:
+            return self._filtered_block_indices[pos]
+        return pos
+
+    def _view_pos_for_block(self, physical_index: int) -> int | None:
+        """Map a physical block index to its position in the filtered view,
+        or None if it is not in the view. Linear scan — only called from
+        anchor-jump paths (rare)."""
+        if self._filtered_block_indices is None:
+            if 0 <= physical_index < len(self._all_blocks):
+                return physical_index
+            return None
+        try:
+            return self._filtered_block_indices.index(physical_index)
+        except ValueError:
+            return None
+
+    def _count_matched_items(self) -> int:
+        """Total raw timeline ITEMS (not blocks) in the current filtered
+        set — a tool_group block contributes len(payload). Shared by the
+        popover count chip and the filtered footer."""
+        if not self._all_blocks:
+            return 0
+        matched = 0
+        if self._filtered_block_indices is not None:
+            for idx in self._filtered_block_indices:
+                kind, payload = self._all_blocks[idx]
+                matched += len(payload) if kind == "tool_group" else 1
+            return matched
+        for block in self._all_blocks:
+            if not self._block_passes_filter(block):
+                continue
+            kind, payload = block
+            matched += len(payload) if kind == "tool_group" else 1
+        return matched
+
     def _refresh_count_label(self) -> None:
         total = self._timeline_item_count
         # Counting matched ITEMS (not blocks) keeps the display intuitive
@@ -3576,22 +3698,34 @@ class _SessionDetailPanel(QFrame):
         if total <= 0 or not self._all_blocks:
             self._count_label.setText("0 / 0")
             return
-        matched = 0
-        for block in self._all_blocks:
-            if not self._block_passes_filter(block):
-                continue
-            kind, payload = block
-            matched += len(payload) if kind == "tool_group" else 1
-        self._count_label.setText(f"{matched} / {total}")
+        self._count_label.setText(f"{self._count_matched_items()} / {total}")
 
     def _apply_filters(self) -> None:
+        # Filter changes always reset the window to the top of the (newly
+        # recomputed) view. Sliding-in-place inside the previous window's
+        # bounds was the original design, but it left late matches
+        # unreachable when the rendered viewport collapsed (no scroll →
+        # no edge trigger → no slide). Top-reset keeps the popover count
+        # chip ("32 / 2595") truthful: the user sees the first N matches
+        # immediately and can scroll through the rest.
+        self._recompute_filtered_view()
         self._refresh_count_label()
         self._sync_filter_button_state()
-        # Rebuild the visible window in place. We don't change the window
-        # bounds — only the materialized widgets — so scroll position and
-        # window-edge sliding stay stable across filter changes.
-        self._clear_timeline()
-        self._build_window_widgets(self._window_start, self._window_end, prepend=False)
+        view_n = self._view_size()
+        self._window_start = 0
+        self._window_end = min(_WINDOW_SIZE, view_n)
+        self._suppress_edge_slide = True
+        try:
+            self._clear_timeline()
+            self._build_window_widgets(
+                self._window_start, self._window_end, prepend=False
+            )
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+        finally:
+            self._suppress_edge_slide = False
+        self._timeline_scroll.verticalScrollBar().setValue(0)
+        self._refresh_status_label()
         self._schedule_minimap_refresh()
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
@@ -3772,6 +3906,7 @@ class _SessionDetailPanel(QFrame):
             self._all_blocks = []
             self._all_timeline_items = []
             self._user_anchor_blocks = []
+            self._filtered_block_indices = None
             self._current_user_block = None
             self._window_start = 0
             self._window_end = 0
@@ -3803,6 +3938,11 @@ class _SessionDetailPanel(QFrame):
             self._current_user_block = self._user_anchor_blocks[0]
         else:
             self._current_user_block = 0 if self._all_blocks else None
+        # Filters persist across session swaps (the popover state isn't
+        # reset on session change); recompute the filtered view against
+        # the new block list before sizing the window so a left-over
+        # search term still applies in the new session.
+        self._recompute_filtered_view()
         # Build the window centered on the current user anchor.
         self._set_window_centered_on(self._current_user_block or 0)
         self._build_window_widgets(self._window_start, self._window_end, prepend=False)
@@ -3852,14 +3992,36 @@ class _SessionDetailPanel(QFrame):
 
     def _set_window_centered_on(self, focus_block: int) -> None:
         """Update self._window_start/_end to a window centered on focus_block,
-        clamped to [0, total]. Does NOT touch widgets — caller is expected
-        to do the rebuild."""
-        total = len(self._all_blocks)
+        clamped to [0, view_size). ``focus_block`` is always a *physical*
+        block index (callers — minimap clicks, jump-to-prompt, prepend
+        anchor restore — all reason in physical coordinates). With a
+        filter active, the focus is translated to its view position.
+        If the focus block is not in the filtered view we clear the
+        filter and re-aim — silently navigating to a hidden block would
+        feel broken (minimap clicks must always land somewhere).
+        Does NOT touch widgets — caller is expected to do the rebuild."""
+        total = self._view_size()
         if total == 0:
             self._window_start = 0
             self._window_end = 0
             return
-        start = max(0, focus_block - _WINDOW_HALF)
+        if self._filtered_block_indices is not None:
+            focus_pos = self._view_pos_for_block(focus_block)
+            if focus_pos is None:
+                # Drop the filter; this also recomputes the view (to None)
+                # and re-runs _apply_filters, so the window/widgets are
+                # already rebuilt at top. We then re-centre below using
+                # focus_block directly as the view position.
+                self._on_reset_filters()
+                total = self._view_size()
+                if total == 0:
+                    self._window_start = 0
+                    self._window_end = 0
+                    return
+                focus_pos = max(0, min(focus_block, total - 1))
+        else:
+            focus_pos = focus_block
+        start = max(0, focus_pos - _WINDOW_HALF)
         end = min(total, start + _WINDOW_SIZE)
         # If we hit the bottom, shift start back so window keeps full size.
         start = max(0, end - _WINDOW_SIZE)
@@ -3875,10 +4037,11 @@ class _SessionDetailPanel(QFrame):
         *,
         prepend: bool,
     ) -> int:
-        """Materialize blocks [start, end) as widgets. When `prepend=True` the
-        widgets are inserted at the top (preserving order); otherwise appended
-        before the trailing stretch. Returns the total height of newly added
-        widgets (useful for scroll compensation on top slides)."""
+        """Materialize the slice [start, end) of the current view as widgets.
+        ``start`` / ``end`` are *view positions* (offsets into
+        _filtered_block_indices when a filter is active, otherwise direct
+        _all_blocks indices). Returns the total height of newly added widgets
+        (useful for scroll compensation on top slides)."""
         if start >= end:
             return 0
         added_height = 0
@@ -3894,15 +4057,17 @@ class _SessionDetailPanel(QFrame):
                 # forcing a sizing pass on a freshly-inserted child can trigger
                 # Qt to promote it to a top-level window for measurement, causing
                 # the brief white-popup flashes the user observed on huge sessions.
-                for block_index in range(end - 1, start - 1, -1):
-                    widget = self._build_window_widget(block_index)
+                for view_pos in range(end - 1, start - 1, -1):
+                    physical = self._block_index_for_view(view_pos)
+                    widget = self._build_window_widget(physical)
                     if widget is None:
                         continue
                     self._timeline_layout.insertWidget(0, widget)
                     added_height += widget.sizeHint().height() + self._timeline_layout.spacing()
             else:
-                for block_index in range(start, end):
-                    widget = self._build_window_widget(block_index)
+                for view_pos in range(start, end):
+                    physical = self._block_index_for_view(view_pos)
+                    widget = self._build_window_widget(physical)
                     if widget is None:
                         continue
                     # Insert before the trailing stretch.
@@ -3913,14 +4078,13 @@ class _SessionDetailPanel(QFrame):
 
     def _build_window_widget(self, block_index: int) -> QWidget | None:
         block = self._all_blocks[block_index]
-        # Filter at materialization time: blocks whose chip kinds don't
-        # intersect the active filter set, or whose searchable content
-        # doesn't include the current query, are simply not rendered.
-        # Window indices stay in _all_blocks coordinates so scroll
-        # compensation and edge-slide arithmetic remain trivial; only the
-        # visual density changes.
-        if not self._block_passes_filter(block):
-            return None
+        # Filtering happens upstream now: when a chip/search filter is
+        # active the caller already resolved the view position to a
+        # physical block via _block_index_for_view, so every block
+        # reaching this method belongs in the materialized window. The
+        # block_index recorded on the widget stays *physical* — anchor
+        # restoration, perf logs, prepend-anchor lookup, and minimap
+        # labels all key off the _all_blocks index.
         # Pre-marker so a hang inside bubble construction is visible in
         # the perf log — _perf_timer's exit line never prints if Qt
         # never returns from the constructor.
@@ -3979,10 +4143,13 @@ class _SessionDetailPanel(QFrame):
     def _slide_window_down(self) -> None:
         """Edge slide: append the next half-window of blocks and drop the
         same number from the top, with pixel-level scroll compensation so
-        the user's visible content stays put."""
-        if self._window_end >= len(self._all_blocks):
+        the user's visible content stays put. ``_window_end`` is in *view*
+        coordinates — when a filter is active this slides through the
+        next half-window of MATCHES, not raw blocks."""
+        view_n = self._view_size()
+        if self._window_end >= view_n:
             return
-        next_end = min(self._window_end + _WINDOW_HALF, len(self._all_blocks))
+        next_end = min(self._window_end + _WINDOW_HALF, view_n)
         new_start = max(0, next_end - _WINDOW_SIZE)
 
         drop_count = new_start - self._window_start
@@ -4004,11 +4171,13 @@ class _SessionDetailPanel(QFrame):
         if self._window_start <= 0:
             # Reached the loaded edge. Try to page in older history from
             # the manager; once it lands, prepend_older_items will rebuild
-            # the window and the user can keep scrolling up.
+            # the window and the user can keep scrolling up. Older-history
+            # fetch is independent of the active filter — it just brings
+            # in more raw items, which the view recompute then re-filters.
             self._maybe_request_older()
             return
         new_start = max(0, self._window_start - _WINDOW_HALF)
-        new_end = min(len(self._all_blocks), new_start + _WINDOW_SIZE)
+        new_end = min(self._view_size(), new_start + _WINDOW_SIZE)
 
         # Capture the topmost-visible bubble's blockIndex + viewport
         # offset so we can land scroll precisely after layout. Using
@@ -4143,6 +4312,42 @@ class _SessionDetailPanel(QFrame):
             for i, (kind, payload) in enumerate(self._all_blocks)
             if kind == "single" and payload.type == "message:user"
         ]
+        # Older items prepended → indices into _all_blocks shifted; the
+        # cached filtered view is stale and must be rebuilt before any
+        # window-positioning math runs.
+        self._recompute_filtered_view()
+
+        # Track which user section we're in for the minimap highlight —
+        # the user-prompt id may have shifted to a new block index.
+        new_user_block = self._block_for_message_id(fallback_user_id)
+        if new_user_block is not None:
+            self._current_user_block = new_user_block
+
+        if self._filtered_block_indices is not None:
+            # Filter is active. The pixel-anchor restoration below assumes
+            # the anchor block is in the materialized window, but with a
+            # filter the anchor's view position depends on how many MATCHES
+            # precede it — remapping a pixel offset through that is fragile
+            # and the user's mental model is "I'm scrolling matches" anyway.
+            # Reset to the top of the (newly-larger) filtered view; the
+            # newly-prepended older matches sit at the front of it.
+            view_n = self._view_size()
+            self._window_start = 0
+            self._window_end = min(_WINDOW_SIZE, view_n)
+            self._suppress_edge_slide = True
+            try:
+                self._clear_timeline()
+                self._build_window_widgets(
+                    self._window_start, self._window_end, prepend=False
+                )
+                self._timeline_container.adjustSize()
+                self._timeline_container.layout().activate()
+            finally:
+                self._suppress_edge_slide = False
+            self._timeline_scroll.verticalScrollBar().setValue(0)
+            self._refresh_status_label()
+            self._refresh_minimap()
+            return
 
         new_anchor_block = self._block_for_anchor_id(anchor_item_id)
         if new_anchor_block is None:
@@ -4155,12 +4360,6 @@ class _SessionDetailPanel(QFrame):
             new_anchor_block = self._user_anchor_blocks[0]
         if new_anchor_block is None:
             new_anchor_block = 0 if self._all_blocks else None
-
-        # Track which user section we're in for the minimap highlight —
-        # the user-prompt id may have shifted to a new block index.
-        new_user_block = self._block_for_message_id(fallback_user_id)
-        if new_user_block is not None:
-            self._current_user_block = new_user_block
 
         focus = new_anchor_block if new_anchor_block is not None else 0
         self._set_window_centered_on(focus)
@@ -4322,7 +4521,7 @@ class _SessionDetailPanel(QFrame):
             self._window_start > 0 or self._loaded_offset > 0
         ):
             self._slide_window_up()
-        elif (max_value - value) <= edge_px and self._window_end < len(self._all_blocks):
+        elif (max_value - value) <= edge_px and self._window_end < self._view_size():
             self._slide_window_down()
 
     def _user_block_for_viewport(self) -> int | None:
@@ -4540,6 +4739,35 @@ class _SessionDetailPanel(QFrame):
         total_blocks = len(self._all_blocks)
         if self._timeline_item_count == 0:
             self._timeline_status.setText(self._translator("No timeline items recorded."))
+            return
+        # Filtered branch: footer reports matched-set progress so the user
+        # can see whether the rendered slice covers the whole match set or
+        # just a window of it (and how many raw items those matches map to).
+        if self._filtered_block_indices is not None:
+            matched_blocks = self._view_size()
+            matched_items = self._count_matched_items()
+            if matched_blocks <= _WINDOW_SIZE:
+                self._timeline_status.setText(
+                    self._translator(
+                        "{matched} matched block(s) · {matched_items} / {items} items matched"
+                    ).format(
+                        matched=matched_blocks,
+                        matched_items=matched_items,
+                        items=self._timeline_item_count,
+                    )
+                )
+                return
+            self._timeline_status.setText(
+                self._translator(
+                    "Window {start}-{end} of {matched} matched blocks · {matched_items} / {items} items matched"
+                ).format(
+                    start=self._window_start + 1,
+                    end=self._window_end,
+                    matched=matched_blocks,
+                    matched_items=matched_items,
+                    items=self._timeline_item_count,
+                )
+            )
             return
         if total_blocks <= _WINDOW_SIZE:
             self._timeline_status.setText(
@@ -6718,27 +6946,23 @@ QPushButton#SessionsDetailFilterChip:checked:hover {{
     background: {PRIMARY_BAND};
 }}
 
-/* Reset filters button — labeled action inside the filter popover
-   (was a bare-icon affordance that hid itself when filters were at
-   default). Inside the popover it is always visible because the
-   popover is opt-in: you only see it when you clicked Filter, so
-   hiding the reset would just make people hunt for it. */
+/* Reset filters button — base-less icon button anchored next to the
+   count chip in the filter popover. Always visible inside the popover
+   (the popover is opt-in, so hiding the reset would just make people
+   hunt for it); the trigger button's ``hasActiveFilter`` property
+   already telegraphs filter status with the popover closed. Hover and
+   press add a faint surface so the button still reads as clickable. */
 QPushButton#SessionsDetailResetButton {{
-    background: rgba(255, 255, 255, 14);
-    border: 1px solid rgba(255, 255, 255, 28);
-    border-radius: 8px;
-    color: rgba(220, 226, 236, 220);
-    padding: 5px 12px;
-    font-size: 12px;
-    min-height: 26px;
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+    padding: 0;
 }}
 QPushButton#SessionsDetailResetButton:hover {{
-    background: rgba(255, 255, 255, 28);
-    border-color: rgba(255, 255, 255, 50);
+    background: rgba(255, 255, 255, 22);
 }}
 QPushButton#SessionsDetailResetButton:pressed {{
     background: {PRIMARY_SOFT};
-    border-color: {PRIMARY_BAND};
 }}
 
 /* Filter trigger button — the toolbar button that opens the filter
