@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import html
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +28,7 @@ from PySide6.QtCore import (
     QSortFilterProxyModel,
     Qt,
     QTimer,
+    QUrl,
     Signal,
 )
 from PySide6.QtSvg import QSvgRenderer
@@ -33,6 +36,7 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QCursor,
+    QDesktopServices,
     QFont,
     QFontMetrics,
     QGuiApplication,
@@ -52,7 +56,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
-    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -1123,11 +1126,11 @@ class _TimeTravelVerticalView(QWidget):
         self.setObjectName("TimeTravelVerticalView")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._translator = translator
-        # Active kind set drives the chip filter. The "tool" chip toggles
-        # both single tool_call AND coalesced tool_group blocks because
-        # that distinction is internal coalescing — to the user they're
-        # the same conceptual category.
-        self._active_kinds: set[str] = set(_TT_ALL_KINDS)
+        # Active kind set drives the chip filter. Tool calls / commands are
+        # noisy in Time Travel, so the default view is conversation-only; the
+        # "Tool" chip can be enabled on demand and covers both single
+        # tool_call rows and coalesced tool_group rows.
+        self._active_kinds: set[str] = set(_TT_DEFAULT_KINDS)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 12)
@@ -1141,7 +1144,7 @@ class _TimeTravelVerticalView(QWidget):
         # Kind chips. Three buttons (User / Assistant / Tool) using the
         # same QSS hook as the detail panel's filter chips so they pick
         # up identical styling once _DETAIL_PANEL_QSS is re-applied to
-        # the popup. Default: all checked → no rows filtered out by kind.
+        # the popup. Default: conversation rows only; Tool is opt-in.
         self._kind_chips: dict[str, QPushButton] = {}
         chip_specs: list[tuple[str, str, QIcon]] = [
             ("user", translator("User"), _user_icon()),
@@ -1154,7 +1157,7 @@ class _TimeTravelVerticalView(QWidget):
             chip.setIcon(icon)
             chip.setIconSize(QSize(14, 14))
             chip.setCheckable(True)
-            chip.setChecked(True)
+            chip.setChecked(kind in _TT_DEFAULT_CHIP_KINDS)
             chip.setCursor(Qt.PointingHandCursor)
             chip.setProperty("kind", kind)
             chip.toggled.connect(
@@ -1193,6 +1196,7 @@ class _TimeTravelVerticalView(QWidget):
         self._model.set_translator(translator)
         self._proxy = _TimeTravelFilterProxy(self)
         self._proxy.setSourceModel(self._model)
+        self._proxy.set_active_kinds(self._active_kinds)
         self._delegate = _TimeTravelRowDelegate(self)
 
         self._list = QListView(self)
@@ -1284,6 +1288,8 @@ class _TimeTravelVerticalView(QWidget):
 
 
 _TT_ALL_KINDS: frozenset[str] = frozenset({"user", "assistant", "tool", "tool_group"})
+_TT_DEFAULT_CHIP_KINDS: frozenset[str] = frozenset({"user", "assistant"})
+_TT_DEFAULT_KINDS: frozenset[str] = frozenset({"user", "assistant"})
 
 
 class _TimeTravelFilterProxy(QSortFilterProxyModel):
@@ -4227,6 +4233,42 @@ class _RenderedWidgetSnapshot:
     item_ids: tuple[str, ...]
 
 
+class _FocusForwardingLineEdit(QLineEdit):
+    """QLineEdit that mirrors its focus state onto sibling widgets as a
+    ``focused`` Qt property so they can re-style on input focus. Qt QSS
+    has no ``:focus-within`` selector — toggling a property + repolishing
+    is the standard workaround. Multiple targets are supported so e.g.
+    a wrapper frame and a divider widget can both react to the same focus.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._focus_targets: list[QWidget] = []
+
+    def set_focus_target(self, widget: QWidget) -> None:
+        self._focus_targets = [widget] if widget is not None else []
+
+    def add_focus_target(self, widget: QWidget) -> None:
+        if widget is not None and widget not in self._focus_targets:
+            self._focus_targets.append(widget)
+
+    def focusInEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().focusInEvent(event)
+        self._sync_targets(True)
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().focusOutEvent(event)
+        self._sync_targets(False)
+
+    def _sync_targets(self, focused: bool) -> None:
+        for target in self._focus_targets:
+            target.setProperty("focused", "true" if focused else "false")
+            style = target.style()
+            if style is not None:
+                style.unpolish(target)
+                style.polish(target)
+
+
 class _SessionDetailPanel(QFrame):
     """Detail panel that materializes only a sliding window of timeline blocks.
 
@@ -4488,12 +4530,9 @@ class _SessionDetailPanel(QFrame):
         self._time_travel_button.clicked.connect(self._on_time_travel_clicked)
         row.addWidget(self._time_travel_button)
 
-        # Search-target toggle: 内容 vs 工具ID. Two checkable buttons in a
-        # mutually-exclusive group, styled as a segmented control. The two
-        # segments live inside their own QHBoxLayout with zero spacing so
-        # they butt up flush against each other — the parent row's 8px
-        # spacing only applies between the *segment group* and its
-        # neighbours, not within the group.
+        # Search-target toggle (Content / Tool ID) + search input merged
+        # into a single combined wrapper. This connects the scope toggle
+        # visually to the input it affects.
         self._search_target_group = QButtonGroup(self)
         self._search_target_group.setExclusive(True)
         self._search_target_content_btn = QPushButton(self._translator("Content"))
@@ -4515,27 +4554,45 @@ class _SessionDetailPanel(QFrame):
         self._search_target_id_btn.toggled.connect(
             lambda checked: self._on_search_target_changed("tool_id") if checked else None
         )
-        segment_box = QHBoxLayout()
-        segment_box.setContentsMargins(0, 0, 0, 0)
-        segment_box.setSpacing(0)
-        segment_box.addWidget(self._search_target_content_btn)
-        segment_box.addWidget(self._search_target_id_btn)
-        row.addLayout(segment_box)
 
-        # Search input — debounced apply on text change so typing isn't
-        # janky on huge sessions.
-        self._detail_search = QLineEdit()
+        # Borderless inside the combined wrapper. The subclass forwards
+        # focus events to the wrapper's ``focused`` Qt property so the
+        # wrapper can re-style on input focus (Qt QSS lacks ``:focus-within``).
+        self._detail_search = _FocusForwardingLineEdit()
         self._detail_search.setObjectName("SessionsDetailSearchInput")
         self._detail_search.setPlaceholderText(self._translator("Search bubbles..."))
         self._detail_search.setClearButtonEnabled(True)
-        self._detail_search.setMinimumHeight(32)
         self._detail_search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._detail_search_debounce = QTimer(self)
         self._detail_search_debounce.setSingleShot(True)
         self._detail_search_debounce.setInterval(180)
         self._detail_search_debounce.timeout.connect(self._on_search_query_committed)
         self._detail_search.textChanged.connect(self._on_search_text_changed)
-        row.addWidget(self._detail_search, 1)
+
+        self._search_combined = QFrame()
+        self._search_combined.setObjectName("SessionsDetailSearchCombined")
+        self._search_combined.setMinimumHeight(36)
+        self._search_combined.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._search_combined.setProperty("focused", "false")
+        combined_layout = QHBoxLayout(self._search_combined)
+        # Segments sit flush against the wrapper's left/top/bottom edges
+        # so the segmented control reads as one half of the composite
+        # rather than a chip floating inside it. Right side keeps 8px
+        # padding so the search input doesn't crash into the wrapper's
+        # rounded corner. The wrapper's transparent 1px border reserves
+        # space for the focused-state PRIMARY_BAND ring.
+        combined_layout.setContentsMargins(0, 0, 8, 0)
+        combined_layout.setSpacing(0)
+        combined_layout.addWidget(self._search_target_content_btn)
+        # Tool ID owns its right border in QSS — grey by default, switching
+        # to PRIMARY_BAND on :checked. That's the segmented control's
+        # selection-driven separator, not a focus indicator. 10px gap to
+        # the input keeps the search field from crashing into it.
+        combined_layout.addWidget(self._search_target_id_btn)
+        combined_layout.addSpacing(10)
+        combined_layout.addWidget(self._detail_search, 1)
+        self._detail_search.set_focus_target(self._search_combined)
+        row.addWidget(self._search_combined, 1)
 
         # Export trigger — opens a frosted action menu. Screenshot moved
         # into that menu so capture/export actions are grouped together.
@@ -8513,21 +8570,6 @@ def _file_icon() -> QIcon:
     )
 
 
-def _x_icon() -> QIcon:
-    """Lucide X — close action for the image zoom dialog."""
-    return _icon_from_svg(
-        """
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-          <g fill="none" stroke="#c6d3e1" stroke-width="2.25"
-             stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" x2="6" y1="6" y2="18"/>
-            <line x1="6" x2="18" y1="6" y2="18"/>
-          </g>
-        </svg>
-        """
-    )
-
-
 def _reset_icon() -> QIcon:
     """Lucide RotateCcw — reset/undo action (clears the active filters)."""
     return _icon_from_svg(
@@ -9172,6 +9214,204 @@ class _AttachmentCard(QFrame):
         painter.end()
 
 
+class _ImageOpenOverlay(_FrostedSurface):
+    """Frosted-glass veil + spinner shown while the OS image viewer launches.
+
+    Subclasses ``_FrostedSurface`` (per CLAUDE.md UI principle 5: every
+    translucent surface goes through the canonical primitive) running in
+    embedded-child mode. Embedded children can't use the Win32
+    ``SetWindowCompositionAttribute`` acrylic blur (that needs a real
+    HWND), so we synthesise the blur ourselves: capture the parent card
+    via ``QWidget.grab()`` at trigger time, run a cheap
+    downsample/upsample Gaussian-ish blur, and paint that as the overlay
+    backdrop with a white tint on top. The result reads with the same
+    "underlying content is dimmed AND blurred" feel as the native
+    acrylic popups elsewhere in the app (search / filter / status pill).
+
+    Sized to cover the *entire* host card (header chrome + image body)
+    so the veil reads as a coherent loading state, not a band over just
+    the image.
+
+    Cold-launching Photos / IrfanView / etc. on Windows can take a couple
+    of seconds; we show this overlay the moment the click registers and
+    dismiss it early when our window loses focus to the viewer (or as a
+    fallback after ~3 s if the focus signal never fires).
+    """
+
+    # Pure Gaussian blur — no white veil. The blur alone obscures
+    # detail enough that the user reads "loading" without the card
+    # looking washed out. Border / inner highlight stay at zero alpha
+    # so the overlay is invisible apart from the blur effect itself
+    # (which already has the rounded clip path applied).
+    RADIUS = 12.0
+    BORDER_RADIUS = 11.5
+    INNER_RADIUS = 10.5
+    BASE_COLOR = QColor(0, 0, 0, 0)
+    TINT_COLOR = QColor(0, 0, 0, 0)
+    BORDER_COLOR = QColor(0, 0, 0, 0)
+    INNER_COLOR = QColor(0, 0, 0, 0)
+
+    _MAX_VISIBLE_MS = 3000
+    # Higher values = stronger blur. 14× downsample blends out text and
+    # image detail while keeping rough colour blocks recognisable.
+    _BLUR_DOWNSAMPLE = 14
+
+    def __init__(self, parent: QWidget, *, radius: float = 12.0) -> None:
+        super().__init__(parent=parent, as_window=False)
+        # Allow per-card radius override (image cards keep the default 12,
+        # but other consumers could subclass `_AttachmentCard` with a
+        # different radius and reuse this overlay).
+        self.RADIUS = radius
+        self.BORDER_RADIUS = max(0.0, radius - 0.5)
+        self.INNER_RADIUS = max(0.0, radius - 1.5)
+        self._spinner = _LoadingSpinner(self)
+        self._fallback_timer = QTimer(self)
+        self._fallback_timer.setSingleShot(True)
+        self._fallback_timer.setInterval(self._MAX_VISIBLE_MS)
+        self._fallback_timer.timeout.connect(self.dismiss)
+        self._focus_hook_connected = False
+        self._blurred_backdrop: QPixmap | None = None
+        self.hide()
+
+    def trigger(self) -> bool:
+        """Show the overlay. Returns ``False`` if it was already visible
+        (caller should treat the click as debounced)."""
+        if self.isVisible():
+            return False
+        # Capture and blur the parent BEFORE showing. Overlay is still
+        # hidden, so the grab does not include itself.
+        self._refresh_backdrop()
+        self.show()
+        self.raise_()
+        self._spinner.start()
+        self._fallback_timer.start()
+        app = QApplication.instance()
+        if app is not None and not self._focus_hook_connected:
+            app.focusWindowChanged.connect(self._on_focus_window_changed)
+            self._focus_hook_connected = True
+        return True
+
+    def dismiss(self) -> None:
+        if self._focus_hook_connected:
+            app = QApplication.instance()
+            if app is not None:
+                try:
+                    app.focusWindowChanged.disconnect(self._on_focus_window_changed)
+                except (TypeError, RuntimeError):
+                    pass
+            self._focus_hook_connected = False
+        self._fallback_timer.stop()
+        self._spinner.stop()
+        self._blurred_backdrop = None
+        self.hide()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        size = self._spinner.size()
+        self._spinner.move(
+            (self.width() - size.width()) // 2,
+            (self.height() - size.height()) // 2,
+        )
+        # Card resized while overlay is visible → recapture so the
+        # backdrop matches the new geometry.
+        if self.isVisible():
+            self._refresh_backdrop()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt naming
+        # Override _FrostedSurface's buffered paint so we can layer the
+        # captured blur backdrop UNDER the base + tint + strokes. The
+        # base class composition path is for transparent-corner top-
+        # level windows; embedded children paint directly.
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            rect = QRectF(self.rect())
+            path = QPainterPath()
+            path.addRoundedRect(rect, self.RADIUS, self.RADIUS)
+            painter.setClipPath(path)
+
+            backdrop = self._blurred_backdrop
+            if backdrop is not None and not backdrop.isNull():
+                painter.drawPixmap(0, 0, backdrop)
+
+            # Tint / border / inner-highlight are skipped when their
+            # alpha is zero — keeps the paint cycle cheap when the
+            # subclass picked "pure blur" and lets future tweaks bump
+            # any of them back up without changing this method.
+            if self.BASE_COLOR.alpha() > 0:
+                painter.fillPath(path, self.BASE_COLOR)
+            if self.TINT_COLOR.alpha() > 0:
+                painter.fillPath(path, self.TINT_COLOR)
+            painter.setClipping(False)
+
+            if self.BORDER_COLOR.alpha() > 0:
+                border_rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+                border_path = QPainterPath()
+                border_path.addRoundedRect(
+                    border_rect, self.BORDER_RADIUS, self.BORDER_RADIUS
+                )
+                painter.setPen(QPen(self.BORDER_COLOR, 1.0))
+                painter.drawPath(border_path)
+
+            if self.INNER_COLOR.alpha() > 0:
+                inner = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+                inner_path = QPainterPath()
+                inner_path.addRoundedRect(
+                    inner, self.INNER_RADIUS, self.INNER_RADIUS
+                )
+                painter.setPen(QPen(self.INNER_COLOR, 1.0))
+                painter.drawPath(inner_path)
+        finally:
+            painter.end()
+
+    def _refresh_backdrop(self) -> None:
+        """Capture the region of the parent the overlay covers and apply
+        a cheap Gaussian-ish blur via downsample/upsample."""
+        parent = self.parentWidget()
+        if parent is None or self.width() <= 0 or self.height() <= 0:
+            self._blurred_backdrop = None
+            return
+        try:
+            full = parent.grab(QRect(self.x(), self.y(), self.width(), self.height()))
+        except RuntimeError:
+            self._blurred_backdrop = None
+            return
+        if full.isNull():
+            self._blurred_backdrop = None
+            return
+        image = full.toImage()
+        if image.isNull():
+            self._blurred_backdrop = None
+            return
+        downsample = max(2, self._BLUR_DOWNSAMPLE)
+        small_w = max(1, image.width() // downsample)
+        small_h = max(1, image.height() // downsample)
+        small = image.scaled(
+            small_w,
+            small_h,
+            Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        blurred = small.scaled(
+            image.width(),
+            image.height(),
+            Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self._blurred_backdrop = QPixmap.fromImage(blurred)
+
+    def _on_focus_window_changed(self, focus_window) -> None:
+        # Top-level window lost focus → OS viewer (or any other app) took
+        # over → user got their feedback, dismiss early.
+        try:
+            host = self.window()
+        except RuntimeError:
+            return
+        host_handle = host.windowHandle() if host is not None else None
+        if focus_window is None or focus_window is not host_handle:
+            self.dismiss()
+
+
 class _ImageBody(QLabel):
     """Click-to-zoom image surface inside an ``_ImageCard``.
 
@@ -9196,11 +9436,13 @@ class _ImageBody(QLabel):
 class _ImageCard(_AttachmentCard):
     """Attachment card showing a single image with zoom + download chrome.
 
-    Mirrors the Claude History Viewer pattern from the user's reference:
-    header strip with image icon + 图像 label + zoom + download buttons,
-    body shows the pixmap scaled into the card width. Click the image to
-    open ``_ImageZoomDialog`` at full resolution; click download to save
-    via ``QFileDialog``.
+    Header strip with image icon + 图像 label + open + download buttons,
+    body shows the pixmap scaled into the card width. Clicking the image
+    or the open button hands the bytes to the OS via
+    ``QDesktopServices.openUrl`` so the user's preferred image viewer
+    (Photos, IrfanView, etc.) provides the full-resolution / pan / zoom
+    experience — we don't reimplement those affordances in-app. Download
+    button still saves via ``QFileDialog``.
     """
 
     def __init__(self, attachment: Attachment, parent: QWidget) -> None:
@@ -9209,6 +9451,13 @@ class _ImageCard(_AttachmentCard):
         self._body_label: QLabel | None = None
         self._image_index: int = 0
         super().__init__(attachment, parent)
+        # Overlay covers the whole card (header chrome + body) so the
+        # launching state reads as one coherent dim rather than a band
+        # over just the image. Created here, after super().__init__ has
+        # built the header / body, so it's the topmost child and natural
+        # ``raise_()`` keeps it above siblings.
+        self._open_overlay = _ImageOpenOverlay(self, radius=self._RADIUS)
+        self._open_overlay.setGeometry(self.rect())
 
     def set_image_index(self, index: int) -> None:
         # Used to disambiguate save filenames when a single bubble carries
@@ -9224,13 +9473,13 @@ class _ImageCard(_AttachmentCard):
         return _t("Image")
 
     def _build_action_buttons(self) -> list[QToolButton]:
-        zoom_button = QToolButton(self)
-        zoom_button.setObjectName("SessionsAttachmentToolButton")
-        zoom_button.setIcon(_zoom_in_icon())
-        zoom_button.setIconSize(QSize(14, 14))
-        zoom_button.setCursor(QCursor(Qt.PointingHandCursor))
-        zoom_button.setToolTip(_t("Zoom image"))
-        zoom_button.clicked.connect(self._open_zoom_dialog)
+        open_button = QToolButton(self)
+        open_button.setObjectName("SessionsAttachmentToolButton")
+        open_button.setIcon(_zoom_in_icon())
+        open_button.setIconSize(QSize(14, 14))
+        open_button.setCursor(QCursor(Qt.PointingHandCursor))
+        open_button.setToolTip(_t("Open in system viewer"))
+        open_button.clicked.connect(self._open_in_system_viewer)
 
         download_button = QToolButton(self)
         download_button.setObjectName("SessionsAttachmentToolButton")
@@ -9239,10 +9488,10 @@ class _ImageCard(_AttachmentCard):
         download_button.setCursor(QCursor(Qt.PointingHandCursor))
         download_button.setToolTip(_t("Download image"))
         download_button.clicked.connect(self._save_image)
-        return [zoom_button, download_button]
+        return [open_button, download_button]
 
     def _build_body(self) -> QWidget | None:
-        body = _ImageBody(self._open_zoom_dialog, self)
+        body = _ImageBody(self._open_in_system_viewer, self)
         body.setObjectName("SessionsAttachmentImageBody")
         body.setMinimumHeight(120)
         body.setMaximumHeight(360)
@@ -9273,6 +9522,8 @@ class _ImageCard(_AttachmentCard):
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         super().resizeEvent(event)
         self._update_pixmap_for_width()
+        if self._open_overlay is not None:
+            self._open_overlay.setGeometry(self.rect())
 
     def _show_failure_placeholder(self) -> None:
         body = self._body_label
@@ -9309,12 +9560,33 @@ class _ImageCard(_AttachmentCard):
 
     # ----- Actions ---------------------------------------------------------
 
-    def _open_zoom_dialog(self) -> None:
-        if self._image is None:
+    def _open_in_system_viewer(self) -> None:
+        overlay = self._open_overlay
+        # Debounce: if the spinner is already up the user is impatient and
+        # the OS is still spawning the viewer — silently swallow re-clicks.
+        if overlay is not None and not overlay.trigger():
             return
-        dialog = _ImageZoomDialog(self._image, self._attachment, self)
-        dialog.show()
-        dialog.install_dwm_chrome_after_show()
+        path = _materialize_attachment_for_external_open(self._attachment, self._image)
+        if path is None:
+            if overlay is not None:
+                overlay.dismiss()
+            QMessageBox.warning(
+                self,
+                _t("Open in system viewer"),
+                _t("Failed to save image: {error}").format(error=str(self._attachment.mime)),
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            # Shell refused (no associated handler / permission denied).
+            # Drop the overlay immediately so the user isn't left staring
+            # at a spinner that will never resolve to a viewer window.
+            if overlay is not None:
+                overlay.dismiss()
+            QMessageBox.warning(
+                self,
+                _t("Open in system viewer"),
+                _t("Failed to save image: {error}").format(error=str(path)),
+            )
 
     def _save_image(self) -> None:
         if self._image is None:
@@ -9408,105 +9680,49 @@ def _decode_data_uri_to_bytes(data_uri: str) -> bytes | None:
         return None
 
 
-class _ImageZoomDialog(_FrostedSurface):
-    """Frosted full-resolution image viewer.
+def _materialize_attachment_for_external_open(
+    attachment: Attachment, decoded_image: QImage | None
+) -> Path | None:
+    """Resolve an attachment to an absolute path the OS shell can open.
 
-    Subclass of ``_FrostedSurface`` (per CLAUDE.md UI principle 5: any new
-    floating popup goes through the canonical primitive) — gives us the
-    acrylic blur, DWM-rounded corners, and ESC dismissal for free. The
-    body is a ``QScrollArea`` so very tall screenshots can still pan.
+    For markdown image links that already point at a local file we just
+    return that path. For data-URI payloads we cache the decoded bytes
+    in ``%TEMP%/cqv-image-cache/<sha256>.<ext>`` and return that path —
+    deterministic naming means re-opening the same image reuses the
+    cache hit instead of piling up duplicates, and the OS-managed temp
+    directory takes care of eventual cleanup.
     """
-
-    RADIUS = 14.0
-    DISMISS_ON_ESCAPE = True
-    DISMISS_ON_DEACTIVATE = False
-    ACCEPT_FOCUS = True
-
-    def __init__(
-        self,
-        image: QImage,
-        attachment: Attachment,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent=parent, as_window=True)
-        self._image = image
-        self._attachment = attachment
-        self.setWindowTitle(_t("Image"))
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 14, 16, 16)
-        outer.setSpacing(10)
-
-        header = QHBoxLayout()
-        header.setSpacing(8)
-        title_icon = _make_chip_icon(_image_icon(), size=14)
-        header.addWidget(title_icon, 0, Qt.AlignVCenter)
-        title_label = QLabel(_t("Image"))
-        title_label.setObjectName("SessionsAttachmentHeaderLabel")
-        header.addWidget(title_label, 0, Qt.AlignVCenter)
-        header.addStretch(1)
-        save_button = QPushButton(_t("Save image"), self)
-        save_button.setCursor(QCursor(Qt.PointingHandCursor))
-        save_button.clicked.connect(self._save)
-        header.addWidget(save_button, 0, Qt.AlignVCenter)
-        close_button = QToolButton(self)
-        close_button.setObjectName("SessionsAttachmentToolButton")
-        close_button.setStyleSheet(_ATTACHMENT_CARD_QSS)
-        close_button.setIcon(_x_icon())
-        close_button.setIconSize(QSize(14, 14))
-        close_button.setCursor(QCursor(Qt.PointingHandCursor))
-        close_button.setToolTip(_t("Close"))
-        close_button.clicked.connect(self.close)
-        header.addWidget(close_button, 0, Qt.AlignVCenter)
-        outer.addLayout(header)
-
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        canvas = QLabel(self)
-        canvas.setAlignment(Qt.AlignCenter)
-        canvas.setPixmap(QPixmap.fromImage(image))
-        canvas.setStyleSheet("background: transparent;")
-        scroll.setWidget(canvas)
-        outer.addWidget(scroll, 1)
-
-        target_w = min(image.width() + 40, 1280)
-        target_h = min(image.height() + 110, 900)
-        self.resize(max(target_w, 480), max(target_h, 360))
-
-    def install_dwm_chrome_after_show(self) -> None:
-        # Per ``frosted_surface.py`` — DWM chrome must be installed AFTER
-        # ``show()`` because the call requires a valid native HWND. The
-        # caller invokes this right after ``show()``.
-        try:
-            self.install_dwm_chrome()
-        except Exception:
-            # DWM is best-effort; on failure the window still renders, just
-            # without acrylic. Don't let a chrome miss break the dialog.
-            pass
-
-    def _save(self) -> None:
-        suffix = _suffix_for_mime(self._attachment.mime)
-        default_name = f"cqv-image-001{suffix}"
-        filter_label = _t("Image files ({extensions})").format(
-            extensions="*.png *.jpg *.jpeg *.gif *.webp *.bmp"
-        )
-        all_files = _t("All files (*)")
-        save_path, _selected = QFileDialog.getSaveFileName(
-            self,
-            _t("Save image as..."),
-            default_name,
-            f"{filter_label};;{all_files}",
-        )
-        if not save_path:
-            return
-        if not self._image.save(save_path):
-            QMessageBox.warning(
-                self,
-                _t("Save image"),
-                _t("Failed to save image: {error}").format(error=save_path),
-            )
+    if attachment.path:
+        candidate = Path(attachment.path)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        if candidate.exists():
+            return candidate
+    if attachment.data_uri:
+        decoded = _decode_data_uri_to_bytes(attachment.data_uri)
+        if decoded is None:
+            return None
+        cache_dir = Path(tempfile.gettempdir()) / "cqv-image-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(decoded).hexdigest()[:32]
+        suffix = _suffix_for_mime(attachment.mime)
+        path = cache_dir / f"{digest}{suffix}"
+        if not path.exists():
+            try:
+                path.write_bytes(decoded)
+            except OSError:
+                return None
+        return path
+    if decoded_image is not None and not decoded_image.isNull():
+        # Last-resort path: re-encode the in-memory pixmap to PNG. Hits
+        # only when the attachment had neither a usable path nor a
+        # decodable data URI, which today shouldn't happen.
+        cache_dir = Path(tempfile.gettempdir()) / "cqv-image-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / f"fallback-{id(decoded_image):x}.png"
+        if decoded_image.save(str(path), "PNG"):
+            return path
+    return None
 
 
 def _path_segments(value: str) -> list[str]:
@@ -9919,18 +10135,66 @@ QPushButton#SessionsTimeTravelButton:pressed {{
     border-color: {PRIMARY_BAND};
 }}
 
-/* Search-target segmented toggle (内容 / 工具ID). Two buttons that look
-   like a single control: shared border radius pattern, blue fill on
-   the checked one. */
+/* Combined search bar — wraps the type-toggle (Content / Tool ID), a 1px
+   vertical divider, and the query input in one rounded chrome so they
+   read as a single component. Palette mirrors ``QLineEdit#SessionsListSearch``
+   so the two search surfaces feel like one family. The ``focused`` Qt
+   property is toggled by ``_FocusForwardingLineEdit`` when the inner
+   QLineEdit gains/loses focus — Qt QSS has no ``:focus-within`` selector. */
+QFrame#SessionsDetailSearchCombined {{
+    background: rgba(255, 255, 255, 14);
+    /* PRIMARY_BAND (alpha 130) blue outline by default — the wrapper
+       acts as a single composite frame around the segmented control +
+       divider + input, matching the focused-state look of
+       ``QLineEdit#SessionsDetailFilterInput``. Keeping this constant
+       (no separate focused state) gives the bar a strong, identifiable
+       chrome on the toolbar without flickering visuals on focus. */
+    border: 1px solid {PRIMARY_BAND};
+    border-radius: 8px;
+}}
+QFrame#SessionsDetailSearchCombined[focused="true"] {{
+    border-color: {PRIMARY_STRONG};
+}}
+
+/* Search-target segments (Content / Tool ID) acting as a segmented control
+   inside the combined wrapper. Visual recipe mirrors ``SessionsEnvTab``
+   (Sandbox/Real) — same neutral light bg as the wrapper, same 1px subtle
+   border, same PRIMARY_GHOST + PRIMARY_BAND on ``:checked``, same
+   font-weight 600. Sized down vs. SessionsEnvTab (28px tall vs 36) since
+   this lives in a content toolbar, not a section title strip. The two
+   segments butt up flush via ``border-right: none`` on the first plus
+   complementary corner radii, so the shared edge reads as a single 1px
+   divider between them. */
+/* Segments are a direct port of ``SessionsEnvTab`` (Sandbox/Real)'s
+   visual recipe — same neutral light bg, same 1px border, same
+   PRIMARY_GHOST + PRIMARY_BAND on ``:checked``, same 600 weight. The
+   only differences are size (28px tall vs 36px since this lives in
+   a content toolbar) and radius (6px vs 8px, scaled with height).
+   Because the wrapper has no visible border, the segments' own
+   borders are the only chrome — no z-order fight, no overlap hacks. */
 QPushButton#SessionsDetailToolbarSegment {{
     background: rgba(255, 255, 255, 14);
-    border: 1px solid rgba(255, 255, 255, 28);
+    /* Transparent default border — the wrapper's PRIMARY_BAND outline is
+       the outer chrome. Reserving 1px keeps :checked's PRIMARY_BAND ring
+       from shifting layout. The inter-segment divider is provided by
+       the [position="last"] rule below (only the segment edge that
+       doesn't touch the wrapper's outer border stays visible). */
+    border: 1px solid transparent;
     color: rgba(220, 226, 236, 200);
-    padding: 4px 12px;
+    padding: 0 14px;
     font-size: 12px;
-    min-height: 24px;
+    font-weight: 600;
+    /* Filled to wrapper's inner height (wrapper minHeight 36 minus the
+       1px border on top + bottom = 34) so segments touch the wrapper's
+       top/bottom edges with no visible gap. */
+    min-height: 34px;
+    max-height: 34px;
 }}
 QPushButton#SessionsDetailToolbarSegment[position="first"] {{
+    /* Left corners match the wrapper's 8px outer radius so the segment's
+       curve aligns with the wrapper's curve (the 1px wrapper border sits
+       between but matched bg color hides the seam). border-right: none
+       lets the next segment's left border act as the inter-segment seam. */
     border-top-left-radius: 8px;
     border-bottom-left-radius: 8px;
     border-top-right-radius: 0;
@@ -9938,35 +10202,49 @@ QPushButton#SessionsDetailToolbarSegment[position="first"] {{
     border-right: none;
 }}
 QPushButton#SessionsDetailToolbarSegment[position="last"] {{
-    border-top-right-radius: 8px;
-    border-bottom-right-radius: 8px;
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
+    /* All four corners sharp — Tool ID isn't at the wrapper's right edge
+       (input follows it), so rounded-right would float weirdly inside
+       the wrapper's curved chrome. The PRIMARY_BAND left border is the
+       inter-segment divider against Content (same blue as the wrapper
+       outline). The grey right border acts as Tool ID's separator from
+       the input area; it switches to PRIMARY_BAND on :checked so the
+       segmented control's selection state drives the indicator. */
+    border-radius: 0;
+    border-left-color: {PRIMARY_BAND};
+    border-right-color: rgba(255, 255, 255, 30);
+}}
+QPushButton#SessionsDetailToolbarSegment[position="last"]:checked {{
+    /* When Tool ID is the active filter, its right separator lights up
+       PRIMARY_BAND — visual confirmation that the segment is selected. */
+    border-right-color: {PRIMARY_BAND};
 }}
 QPushButton#SessionsDetailToolbarSegment:hover {{
     background: rgba(255, 255, 255, 28);
 }}
 QPushButton#SessionsDetailToolbarSegment:checked {{
-    /* Same selected-state pair as ``SessionsEnvTab:checked`` (and
-       NavButton, current-card, selected table row) per CLAUDE.md UI
-       principle 1 — every "this is selected" surface in the app uses
-       PRIMARY_GHOST fill + PRIMARY_BAND border. */
+    /* Selected state is bg-only fill — no border ring on the segment so
+       the wrapper's PRIMARY_BAND outline stays the single outermost
+       chrome (button effectively sits "under" the wrapper border). */
     background: {PRIMARY_GHOST};
-    border-color: {PRIMARY_BAND};
     color: #ffffff;
 }}
 
+/* 1px vertical divider between the segmented type prefix and the query
+   input. Same alpha as the wrapper border so it reads as part of the
+   shared chrome. */
+/* The search input drops all of its own chrome — the wrapper owns the
+   rounded edge and the focus feedback is forwarded to the wrapper via
+   ``_FocusForwardingLineEdit``. */
 QLineEdit#SessionsDetailSearchInput {{
-    background: rgba(255, 255, 255, 20);
-    border: 1px solid rgba(255, 255, 255, 36);
-    border-radius: 8px;
-    color: #ffffff;
-    padding: 4px 10px;
+    background: transparent;
+    border: 0;
+    color: rgba(245, 248, 252, 230);
+    padding: 2px 0;
     font-size: 12px;
     selection-background-color: {PRIMARY_BAND};
 }}
-QLineEdit#SessionsDetailSearchInput:focus {{
-    border-color: {PRIMARY_STRONG};
+QLineEdit#SessionsDetailSearchInput::placeholder {{
+    color: rgba(255, 255, 255, 100);
 }}
 
 /* Bubble-count chip (filter icon + ``matched / total``). Sits at the

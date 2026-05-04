@@ -46,6 +46,7 @@ from codex_quota_viewer.sessions_page import (  # noqa: E402
     _index_preview_text,
     _index_matches_viewport_position,
     _looks_like_markdown,
+    _materialize_attachment_for_external_open,
     _normalize_preview_text,
 )
 
@@ -394,6 +395,106 @@ def test_message_bubble_handles_malformed_data_uri_with_placeholder() -> None:
     # presence with a non-decodable URI is the regression we care about:
     # parser must hand it through without crashing.
     assert len(image_cards) == 1
+
+
+def test_materialize_attachment_writes_data_uri_to_temp_cache(tmp_path) -> None:
+    """A data-URI attachment is decoded once into the temp cache; opening
+    the same image again hits the cached file instead of re-writing it."""
+    QApplication.instance() or QApplication([])
+    attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri=_TEST_PNG_DATA_URI,
+        source="payload",
+    )
+    first = _materialize_attachment_for_external_open(attachment, None)
+    assert first is not None
+    assert first.exists()
+    assert first.suffix == ".png"
+    assert first.read_bytes()  # non-empty
+
+    # Same data URI → identical hash-based filename, no rewrite needed.
+    second = _materialize_attachment_for_external_open(attachment, None)
+    assert second == first
+
+
+def test_materialize_attachment_returns_existing_path_for_local_file(tmp_path) -> None:
+    """A markdown image link to an existing file is returned verbatim —
+    no temp copy needed."""
+    QApplication.instance() or QApplication([])
+    asset = tmp_path / "diagram.png"
+    asset.write_bytes(b"\x89PNG\r\n\x1a\n")  # arbitrary bytes — exists check only
+    attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        path=str(asset),
+        source="markdown",
+    )
+    resolved = _materialize_attachment_for_external_open(attachment, None)
+    assert resolved == asset
+
+
+def test_materialize_attachment_returns_none_for_unresolvable(tmp_path) -> None:
+    QApplication.instance() or QApplication([])
+    bogus = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri="data:image/png;base64,xxxxx-not-base64",
+        source="payload",
+    )
+    assert _materialize_attachment_for_external_open(bogus, None) is None
+
+
+def test_image_card_overlay_debounces_repeated_clicks(monkeypatch) -> None:
+    """Clicking the image while the launch spinner is already up should
+    NOT re-trigger ``QDesktopServices.openUrl`` — the user is impatient,
+    the OS is still spawning the viewer, and a second launch creates a
+    duplicate viewer window."""
+    QApplication.instance() or QApplication([])
+    attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri=_TEST_PNG_DATA_URI,
+        source="payload",
+    )
+    item = SessionTimelineItem(
+        id="m-debounce",
+        type="message:user",
+        timestamp="2026-04-28T05:10:14Z",
+        text="x",
+        attachments=(attachment,),
+    )
+    bubble = _MessageBubble(
+        "user", item.timestamp, item.text, parent=None, attachments=item.attachments
+    )
+    card = bubble.findChildren(_ImageCard)[0]
+    # showEvent does the lazy decode; force it by showing the bubble.
+    bubble.show()
+    QApplication.processEvents()
+
+    open_calls: list[str] = []
+    monkeypatch.setattr(
+        "codex_quota_viewer.sessions_page.QDesktopServices.openUrl",
+        lambda url: open_calls.append(url.toLocalFile()) or True,
+    )
+
+    card._open_in_system_viewer()
+    card._open_in_system_viewer()
+    card._open_in_system_viewer()
+
+    assert len(open_calls) == 1, "subsequent clicks while spinner is up should be swallowed"
+
+    # Manual dismiss simulates the OS viewer taking focus.
+    overlay = card._open_overlay
+    assert overlay is not None
+    assert overlay.isVisible()
+    # Overlay covers the whole card, not just the image body, so its
+    # rect should match the card's rect once laid out.
+    assert overlay.size() == card.size()
+    overlay.dismiss()
+    assert not overlay.isVisible()
+
+    bubble.hide()
 
 
 def test_message_bubble_renders_file_card_for_file_attachment() -> None:
@@ -3117,6 +3218,9 @@ def test_time_travel_vertical_list_pins_dark_viewport() -> None:
     assert view._list.objectName() == "TimeTravelVerticalList"
     assert view._list.viewport().styleSheet() == "background: transparent;"
     assert view._kind_chips["user"].objectName() == "SessionsDetailFilterChip"
+    assert view._kind_chips["user"].isChecked()
+    assert view._kind_chips["assistant"].isChecked()
+    assert not view._kind_chips["tool"].isChecked()
     assert "QListView#TimeTravelVerticalList" in _DETAIL_PANEL_QSS
     assert "selection-color: #ffffff" in _DETAIL_PANEL_QSS
 
@@ -3198,6 +3302,10 @@ def test_time_travel_vertical_view_chip_toggles_filter_rows() -> None:
 
     view = _TimeTravelVerticalView(translator=lambda s: s)
     view.refresh(blocks, None, None)
+    default_total = view._proxy.rowCount()
+    assert 0 < default_total < len(blocks)
+
+    view._kind_chips["tool"].setChecked(True)
     total = view._proxy.rowCount()
     assert total == len(blocks)
 
@@ -3244,6 +3352,10 @@ def test_time_travel_vertical_view_tool_chip_covers_tool_group_too() -> None:
 
     view = _TimeTravelVerticalView(translator=lambda s: s)
     view.refresh(blocks, None, None)
+    assert not view._kind_chips["tool"].isChecked()
+    assert view._proxy.rowCount() < len(blocks)
+
+    view._kind_chips["tool"].setChecked(True)
     total = view._proxy.rowCount()
     assert total == len(blocks)
 
@@ -3276,6 +3388,7 @@ def test_time_travel_vertical_view_chip_and_text_filters_compose() -> None:
 
     view = _TimeTravelVerticalView(translator=lambda s: s)
     view.refresh(blocks, None, None)
+    view._kind_chips["tool"].setChecked(True)
 
     # Just the search "tool_" → matches tool rows only.
     view._proxy.set_filter_text("tool_")

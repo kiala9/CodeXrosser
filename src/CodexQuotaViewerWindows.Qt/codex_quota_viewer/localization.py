@@ -184,12 +184,10 @@ ZH_HANS: dict[str, str] = {
     "Image failed to load": "图像加载失败",
     "Save image": "保存图像",
     "Save image as...": "图像另存为...",
-    "Zoom image": "放大图像",
+    "Open in system viewer": "在系统查看器中打开",
     "Download image": "下载图像",
-    "Close": "关闭",
     "Image saved to {path}": "图像已保存到 {path}",
     "Failed to save image: {error}": "保存图像失败：{error}",
-    "Open file": "打开文件",
     "Image files ({extensions})": "图像文件（{extensions}）",
     "All files (*)": "所有文件 (*)",
 }
