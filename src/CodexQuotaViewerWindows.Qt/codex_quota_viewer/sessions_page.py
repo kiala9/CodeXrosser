@@ -2286,6 +2286,7 @@ class _TimeTravelPopup(_FrostedSurface):
         # flag is reset by ``set_full_attachments`` so a second
         # session-swap-then-back triggers a fresh request.
         self._full_attachments_requested: bool = False
+        self._full_attachments_rows_id: int | None = None
 
         # Focus the search input on the next tick so the user can type
         # immediately after the popup appears. ``QTimer.singleShot(0,
@@ -2346,6 +2347,7 @@ class _TimeTravelPopup(_FrostedSurface):
         OR the host can call ``set_full_attachments`` with a SQL-loaded
         full list to replace this sliced view entirely.
         """
+        self._full_attachments_rows_id = None
         self._attachments.refresh(blocks, filtered_indices, ordinal_map)
         self._mode_bar.set_attachment_count(self._attachments.attachment_count())
 
@@ -2356,6 +2358,10 @@ class _TimeTravelPopup(_FrostedSurface):
         ``attachment_index``, ``attachment``). Updates the count badge
         to reflect the true session-wide total. Called by the host
         after the lazy worker job comes back."""
+        rows_id = id(rows)
+        if self._full_attachments_rows_id == rows_id:
+            return
+        self._full_attachments_rows_id = rows_id
         self._attachments.refresh_full(rows)
         self._mode_bar.set_attachment_count(self._attachments.attachment_count())
 
@@ -2365,6 +2371,7 @@ class _TimeTravelPopup(_FrostedSurface):
         click. Called by the host when the cached full list is
         invalidated (e.g. session swap)."""
         self._full_attachments_requested = False
+        self._full_attachments_rows_id = None
 
     def _on_mode_changed(self, mode_id: int) -> None:
         """Hook into the mode bar to fire ``fullAttachmentsRequested``
@@ -5413,6 +5420,10 @@ class _SessionDetailPanel(QFrame):
         # twice if the user rapidly toggles the Attachments tab while
         # the first fetch is still pending.
         self._full_attachments_pending: set[str] = set()
+        self._time_travel_ordinal_map_cache_key: tuple[
+            int | None, int, tuple[str, ...]
+        ] | None = None
+        self._time_travel_ordinal_map_cache: dict[str, int] = {}
         self._export_popup = _SessionsExportPopup(self)
         self._export_popup.setStyleSheet(_DETAIL_PANEL_QSS)
         self._export_popup.dismiss_requested.connect(self._dismiss_export_popup)
@@ -6096,8 +6107,9 @@ class _SessionDetailPanel(QFrame):
         self._full_attachments_pending.discard(session_id)
         if session_id != self._loaded_session_id:
             return
-        self._full_attachments_cache[session_id] = list(rows)
-        self._apply_full_attachments(session_id, rows)
+        cached_rows = list(rows)
+        self._full_attachments_cache[session_id] = cached_rows
+        self._apply_full_attachments(session_id, cached_rows)
 
     def cancel_full_session_attachments_request(self, session_id: str) -> None:
         """Drop the in-flight marker so a future tab click can re-fire.
@@ -6175,12 +6187,26 @@ class _SessionDetailPanel(QFrame):
 
         Returns an empty dict when neither source is populated; the
         delegate then falls back to the local block index."""
+        loaded_ids = tuple(
+            item_id
+            for item in self._all_timeline_items
+            if isinstance((item_id := getattr(item, "id", None)), str) and item_id
+        )
         if self._time_travel_index_items:
-            return {
-                item.item_id: item.ordinal
-                for item in self._time_travel_index_items
-                if item.item_id
-            }
+            cache_key = (id(self._time_travel_index_items), self._loaded_offset, loaded_ids)
+            if cache_key == self._time_travel_ordinal_map_cache_key:
+                return self._time_travel_ordinal_map_cache
+            needed = set(loaded_ids)
+            ordinal_map: dict[str, int] = {}
+            if needed:
+                for item in self._time_travel_index_items:
+                    if item.item_id in needed:
+                        ordinal_map[item.item_id] = item.ordinal
+                        if len(ordinal_map) >= len(needed):
+                            break
+            self._time_travel_ordinal_map_cache_key = cache_key
+            self._time_travel_ordinal_map_cache = ordinal_map
+            return ordinal_map
         ordinal_map: dict[str, int] = {}
         base = self._loaded_offset
         for position, item in enumerate(self._all_timeline_items):
@@ -6188,6 +6214,10 @@ class _SessionDetailPanel(QFrame):
             if isinstance(item_id, str) and item_id:
                 ordinal_map[item_id] = base + position
         return ordinal_map
+
+    def _clear_time_travel_ordinal_map_cache(self) -> None:
+        self._time_travel_ordinal_map_cache_key = None
+        self._time_travel_ordinal_map_cache = {}
 
     def _needs_time_travel_index(self) -> bool:
         return bool(
@@ -6214,6 +6244,7 @@ class _SessionDetailPanel(QFrame):
             return
         self._time_travel_index_pending = False
         self._time_travel_index_items = list(items)
+        self._clear_time_travel_ordinal_map_cache()
         if self._time_travel_popup is not None:
             self._push_time_travel_data()
 
@@ -6890,6 +6921,7 @@ class _SessionDetailPanel(QFrame):
             self._time_travel_index_pending = False
             self._loading_newer = False
             self._loaded_session_id = None
+            self._clear_time_travel_ordinal_map_cache()
             self._timeline_status.setText("")
             self._set_audit_text("")
             self._clear_minimap()
@@ -6905,6 +6937,7 @@ class _SessionDetailPanel(QFrame):
         self._time_travel_index_pending = False
         self._loading_newer = False
         self._loaded_session_id = detail.record.id
+        self._clear_time_travel_ordinal_map_cache()
         # Keep user anchors for current-section detection; the minimap itself
         # is driven from every materialized block's widget geometry.
         self._user_anchor_blocks = [
@@ -6972,6 +7005,7 @@ class _SessionDetailPanel(QFrame):
         self._time_travel_index_items = []
         self._time_travel_index_pending = False
         self._loaded_session_id = None
+        self._clear_time_travel_ordinal_map_cache()
         self._clear_timeline()
         self._timeline_status.setText("")
         self._set_audit_text("")

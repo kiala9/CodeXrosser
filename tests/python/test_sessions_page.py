@@ -4934,6 +4934,53 @@ def test_time_travel_attachments_use_global_ordinal_in_index_mode() -> None:
     panel.close()
 
 
+def test_time_travel_ordinal_map_cache_reuses_index_lookup() -> None:
+    """Once the loaded slice's id -> ordinal map is built from the full
+    lightweight index, later minimap refreshes should reuse it instead
+    of scanning the full session index again."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    class CountingIndexItems(list):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    loaded_item = SessionTimelineItem(
+        id="e-900",
+        type="message:user",
+        timestamp="2026-01-01T00:00:00Z",
+        text="has attachment",
+    )
+    panel._loaded_offset = 800
+    panel._all_timeline_items = [loaded_item]
+    panel._time_travel_index_items = CountingIndexItems(
+        [
+            SessionTimelineIndexItem(
+                ordinal=i,
+                item_id=f"e-{i}",
+                type="message:user",
+                timestamp="2026-01-01T00:00:00Z",
+                preview=f"item {i}",
+            )
+            for i in range(1000)
+        ]
+    )
+
+    first = panel._build_time_travel_ordinal_map()
+    second = panel._build_time_travel_ordinal_map()
+
+    assert first == {"e-900": 900}
+    assert second is first
+    assert panel._time_travel_index_items.iterations == 1
+    panel.close()
+
+
 def test_time_travel_attachments_ordinal_falls_back_to_block_index() -> None:
     """When no ordinal_map is provided (small session, tests, etc.),
     the model surfaces ``ordinal=None`` so the delegate falls back to
@@ -5344,12 +5391,22 @@ def test_time_travel_full_attachments_survive_subsequent_data_push() -> None:
     panel.set_full_session_attachments(panel._loaded_session_id, full_rows)
     assert popup._attachments._model.rowCount() == 5
 
+    refresh_calls: list[int] = []
+    real_refresh_full = popup._attachments.refresh_full
+
+    def spy_refresh_full(rows: list[Any]) -> None:
+        refresh_calls.append(len(rows))
+        real_refresh_full(rows)
+
+    popup._attachments.refresh_full = spy_refresh_full  # type: ignore[method-assign]
+
     # Simulate a later refresh — the kind of trigger that previously
     # blew the grid away.
     panel._push_time_travel_data()
 
     assert popup._attachments._model.rowCount() == 5
     assert "(5)" in popup._mode_bar._attachments_button.text()
+    assert refresh_calls == []
     panel._dismiss_time_travel_popup()
     panel.close()
 
