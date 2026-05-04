@@ -33,6 +33,7 @@ from .models import (
     ParsedSessionCatalog,
     RestoreMode,
     RestoreResult,
+    SessionAttachmentRow,
     SessionDetail,
     SessionFilters,
     SessionRecord,
@@ -141,6 +142,9 @@ class SessionsManager:
     def get_session_timeline_index(self, session_id: str) -> list[SessionTimelineIndexItem]:
         self._require_session(session_id)
         return self.repository.list_timeline_index(session_id)
+
+    def list_session_attachments(self, session_id: str) -> list[SessionAttachmentRow]:
+        return self.repository.list_session_attachments(session_id)
 
     def archive_session(self, session_id: str) -> SessionRecord:
         with self._mutation_lock:

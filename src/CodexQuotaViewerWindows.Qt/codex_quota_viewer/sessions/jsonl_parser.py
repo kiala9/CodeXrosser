@@ -49,6 +49,7 @@ _GENERIC_DATA_URI_MIME_RE = re.compile(r"^data:([a-z0-9.+\-]+/[a-z0-9.+\-]+);bas
 # adjacency to a real ``input_image`` part — see
 # ``_read_response_message_content``).
 _IMAGE_OPEN_BRACKET_RE = re.compile(r"^<image\b[^>]*>$", re.IGNORECASE)
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)\)")
 
 
 # Codex Desktop serialises @-file mentions as a single ``input_text``
@@ -219,6 +220,11 @@ def parse_session_catalog(file_path: Path) -> ParsedSessionCatalog | None:
                     cleaned_message = message
                     if payload_type == "user_message":
                         cleaned_message, extracted_attachments = _extract_files_mentioned(message)
+                    cleaned_message, markdown_attachments = _extract_markdown_image_attachments(
+                        cleaned_message
+                    )
+                    if markdown_attachments:
+                        extracted_attachments = extracted_attachments + markdown_attachments
                     fallback_messages.append(
                         _TimelineDraft(
                             id=f"event-{sequence + 1}",
@@ -540,6 +546,9 @@ def _read_response_message_content(
     text_value, mention_attachments = _extract_files_mentioned(text_value)
     if mention_attachments:
         attachments.extend(mention_attachments)
+    text_value, markdown_attachments = _extract_markdown_image_attachments(text_value)
+    if markdown_attachments:
+        attachments.extend(markdown_attachments)
     return text_value, tuple(attachments)
 
 
@@ -592,6 +601,59 @@ def _extract_files_mentioned(text: str) -> tuple[str, tuple[Attachment, ...]]:
     if not attachments:
         return text, ()
     return request_body, tuple(attachments)
+
+
+def _extract_markdown_image_attachments(text: str) -> tuple[str, tuple[Attachment, ...]]:
+    """Lift local markdown image links into ``Attachment`` entries.
+
+    Local file paths and ``data:image/...`` data URIs become
+    ``Attachment(kind="image", source="markdown")`` records and the
+    original ``![]()`` fragment is stripped from the displayed text.
+    Remote ``http(s)://`` images stay in the text so Qt can render them
+    inline without a download/zoom card.
+    """
+    if not text or "![" not in text:
+        return text, ()
+    attachments: list[Attachment] = []
+
+    def replace(match: re.Match[str]) -> str:
+        src = match.group("src").strip()
+        alt = match.group("alt") or ""
+        if not src:
+            return match.group(0)
+        if src.startswith("data:"):
+            mime_match = _GENERIC_DATA_URI_MIME_RE.match(src)
+            mime = mime_match.group(1).lower() if mime_match else "image/octet-stream"
+            attachments.append(
+                Attachment(
+                    kind="image",
+                    mime=mime,
+                    data_uri=src,
+                    alt=alt or None,
+                    source="markdown",
+                )
+            )
+            return ""
+        lowered = src.lower()
+        if lowered.startswith(("http://", "https://")):
+            return match.group(0)
+        suffix = Path(src).suffix.lower()
+        mime = _FILE_EXTENSION_MIME.get(suffix)
+        if mime is not None and mime.startswith("image/"):
+            attachments.append(
+                Attachment(
+                    kind="image",
+                    mime=mime,
+                    path=src,
+                    alt=alt or None,
+                    source="markdown",
+                )
+            )
+            return ""
+        return match.group(0)
+
+    rewritten = _MARKDOWN_IMAGE_RE.sub(replace, text)
+    return rewritten, tuple(attachments)
 
 
 def _is_image_part(part: dict[str, Any]) -> bool:

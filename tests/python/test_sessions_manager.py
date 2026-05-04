@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src" / "CodexQuotaViewerWindows.Qt"))
 
 from codex_quota_viewer.sessions import (  # noqa: E402
+    Attachment,
     CatalogSessionEntry,
     SessionError,
     SessionFileSummary,
@@ -19,6 +20,7 @@ from codex_quota_viewer.sessions import (  # noqa: E402
     SessionTimelineItem,
     SessionsManager,
 )
+from codex_quota_viewer.sessions import jsonl_parser as sessions_jsonl_parser  # noqa: E402
 from codex_quota_viewer.sessions.helpers import build_fallback_relative_path  # noqa: E402
 from codex_quota_viewer.sessions.jsonl_parser import (  # noqa: E402
     DEFAULT_TIMELINE_PAGE_SIZE,
@@ -737,6 +739,61 @@ def test_jsonl_parser_extracts_bracketed_image_payload(tmp_path: Path) -> None:
     assert attachment.data_uri.startswith("data:image/png;base64,")
 
 
+def test_jsonl_parser_extracts_markdown_image_attachments_at_parse_time(tmp_path: Path) -> None:
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_session_jsonl(
+        codex_home / "sessions",
+        session_id="aaaa0000-1111-2222-3333-444444444444",
+        started_at="2026-04-28T05:30:00Z",
+        cwd=str(tmp_path),
+        user_message="please inspect ![screenshot](C:/tmp/screenshot.png)",
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    assert "![" not in item.text
+    assert "please inspect" in item.text
+    assert len(item.attachments) == 1
+    attachment = item.attachments[0]
+    assert attachment.kind == "image"
+    assert attachment.mime == "image/png"
+    assert attachment.path == "C:/tmp/screenshot.png"
+    assert attachment.alt == "screenshot"
+    assert attachment.source == "markdown"
+
+
+def test_jsonl_parser_payload_and_markdown_attachments_concat_at_parse(
+    tmp_path: Path,
+) -> None:
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="aaaa1111-1111-2222-3333-444444444444",
+        started_at="2026-04-28T05:40:00Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": "payload first, markdown second ![diagram](C:/tmp/diagram.webp)",
+            },
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI, "detail": "high"},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    assert "![" not in item.text
+    assert len(item.attachments) == 2
+    payload_attachment, markdown_attachment = item.attachments
+    assert payload_attachment.source == "payload"
+    assert payload_attachment.data_uri == _PNG_1X1_DATA_URI
+    assert markdown_attachment.source == "markdown"
+    assert markdown_attachment.path == "C:/tmp/diagram.webp"
+
+
 def test_jsonl_parser_handles_jpeg_mime(tmp_path: Path) -> None:
     codex_home, _ = _make_homes(tmp_path)
     target = _write_image_session(
@@ -918,6 +975,60 @@ def test_jsonl_parser_extracts_files_mentioned_markdown(tmp_path: Path) -> None:
     assert a.source == "markdown"
     assert b.name == "API-account.svg"
     assert b.path == "E:/Download/API-account.svg"
+
+
+def test_jsonl_parser_files_mentioned_header_works_with_markdown_image(
+    tmp_path: Path,
+) -> None:
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="ffffffff-2222-3333-4444-555555555555",
+        started_at="2026-04-29T17:27:00Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": (
+                    "# Files mentioned by the user:\n\n"
+                    "## notes.md: C:/tmp/notes.md\n\n"
+                    "## My request for Codex:\n"
+                    "compare this with ![capture](C:/tmp/capture.jpg)\n"
+                ),
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    assert "Files mentioned by the user" not in item.text
+    assert "notes.md" not in item.text
+    assert "![" not in item.text
+    assert "compare this with" in item.text
+    assert len(item.attachments) == 2
+    file_attachment, image_attachment = item.attachments
+    assert file_attachment.kind == "file"
+    assert file_attachment.name == "notes.md"
+    assert file_attachment.path == "C:/tmp/notes.md"
+    assert image_attachment.kind == "image"
+    assert image_attachment.path == "C:/tmp/capture.jpg"
+    assert image_attachment.source == "markdown"
+
+
+def test_parser_version_changes_when_parser_source_changes(monkeypatch) -> None:
+    original_version = sessions_jsonl_parser.PARSER_VERSION
+    original_read_bytes = Path.read_bytes
+    parser_path = Path(sessions_jsonl_parser.__file__).resolve()
+
+    def fake_read_bytes(path: Path) -> bytes:
+        data = original_read_bytes(path)
+        if path.resolve() == parser_path:
+            return data + b"\n# source changed for parser version test\n"
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+    assert sessions_jsonl_parser._compute_parser_version() != original_version
 
 
 def test_jsonl_parser_files_mentioned_no_request_body(tmp_path: Path) -> None:
@@ -1105,6 +1216,173 @@ def test_repository_round_trips_attachments(tmp_path: Path) -> None:
         assert attachments[0].kind == "image"
         assert attachments[0].mime == "image/png"
         assert attachments[0].data_uri == _PNG_1X1_DATA_URI
+    finally:
+        manager.close()
+
+
+def test_repository_list_session_attachments_returns_only_attachment_bearing_rows(
+    tmp_path: Path,
+) -> None:
+    repository = SessionRepository(tmp_path / "index.db")
+    session_id = "attach-list-session"
+    timestamp = "2026-04-30T10:00:00Z"
+    try:
+        repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id=session_id,
+                    cwd=str(tmp_path),
+                    timeline=[
+                        SessionTimelineItem(
+                            id="item-0",
+                            type="message:user",
+                            timestamp=timestamp,
+                            text="plain",
+                        ),
+                        SessionTimelineItem(
+                            id="item-1",
+                            type="message:user",
+                            timestamp=timestamp,
+                            text="has image",
+                            attachments=(
+                                Attachment(
+                                    kind="image",
+                                    mime="image/png",
+                                    path="C:/tmp/a.png",
+                                    alt="a",
+                                    source="markdown",
+                                ),
+                            ),
+                        ),
+                        SessionTimelineItem(
+                            id="item-2",
+                            type="message:assistant",
+                            timestamp=timestamp,
+                            text="plain reply",
+                        ),
+                        SessionTimelineItem(
+                            id="item-3",
+                            type="message:user",
+                            timestamp=timestamp,
+                            text="has file",
+                            attachments=(
+                                Attachment(
+                                    kind="file",
+                                    mime="text/plain",
+                                    path="C:/tmp/readme.txt",
+                                    name="readme.txt",
+                                    source="markdown",
+                                ),
+                            ),
+                        ),
+                        SessionTimelineItem(
+                            id="item-4",
+                            type="message:assistant",
+                            timestamp=timestamp,
+                            text="done",
+                        ),
+                    ],
+                )
+            ]
+        )
+        rows = repository.list_session_attachments(session_id)
+        assert len(rows) == 2
+        assert [row.ordinal for row in rows] == [1, 3]
+        assert [row.item_id for row in rows] == ["item-1", "item-3"]
+        assert [row.attachment_index for row in rows] == [0, 0]
+        assert rows[0].attachment.path == "C:/tmp/a.png"
+        assert rows[1].attachment.name == "readme.txt"
+    finally:
+        repository.close()
+
+
+def test_repository_list_session_attachments_picks_up_legacy_markdown_text(
+    tmp_path: Path,
+) -> None:
+    repository = SessionRepository(tmp_path / "index.db")
+    session_id = "legacy-markdown-session"
+    timestamp = "2026-04-30T11:00:00Z"
+    try:
+        repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id=session_id,
+                    cwd=str(tmp_path),
+                    timeline=[
+                        SessionTimelineItem(
+                            id="plain",
+                            type="message:user",
+                            timestamp=timestamp,
+                            text="plain old text",
+                        ),
+                        SessionTimelineItem(
+                            id="legacy",
+                            type="message:user",
+                            timestamp=timestamp,
+                            text="legacy ![capture](C:/tmp/capture.png) row",
+                        ),
+                    ],
+                )
+            ]
+        )
+        rows = repository.list_session_attachments(session_id)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.ordinal == 1
+        assert row.item_id == "legacy"
+        assert row.attachment_index == 0
+        assert row.attachment.kind == "image"
+        assert row.attachment.path == "C:/tmp/capture.png"
+        assert row.attachment.alt == "capture"
+        assert row.attachment.source == "markdown"
+    finally:
+        repository.close()
+
+
+def test_repository_list_session_attachments_uses_partial_index(tmp_path: Path) -> None:
+    repository = SessionRepository(tmp_path / "index.db")
+    try:
+        plan = repository._connection.execute(  # noqa: SLF001
+            """
+            explain query plan
+            select ordinal, item_id, type, timestamp, attachments_json, NULL as text
+            from timeline_items
+            where session_id = ? and attachments_json is not null
+            union all
+            select ordinal, item_id, type, timestamp, NULL as attachments_json, text
+            from timeline_items
+            where session_id = ?
+              and attachments_json is null
+              and text is not null
+              and instr(text, '![') > 0
+            order by ordinal asc
+            """,
+            ("any-session", "any-session"),
+        ).fetchall()
+        details = " ".join(str(row["detail"]) for row in plan)
+        assert "idx_timeline_items_session_attachments" in details
+    finally:
+        repository.close()
+
+
+def test_sessions_manager_list_session_attachments_proxy(tmp_path: Path) -> None:
+    codex_home, manager_home = _make_homes(tmp_path)
+    session_id = "manager-attachments-session"
+    _write_image_session(
+        codex_home / "sessions",
+        session_id=session_id,
+        started_at="2026-04-30T12:00:00Z",
+        content=[
+            {"type": "input_text", "text": "see ![mockup](C:/tmp/mockup.png)"},
+        ],
+    )
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.rescan()
+        rows = manager.list_session_attachments(session_id)
+        assert len(rows) == 1
+        assert rows[0].item_id.startswith("message-")
+        assert rows[0].attachment.path == "C:/tmp/mockup.png"
     finally:
         manager.close()
 

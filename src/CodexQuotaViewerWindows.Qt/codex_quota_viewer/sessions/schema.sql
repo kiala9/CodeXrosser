@@ -70,3 +70,6 @@ create index if not exists idx_sessions_started_at
   on sessions(started_at desc);
 create index if not exists idx_timeline_items_session_ordinal
   on timeline_items(session_id, ordinal asc);
+create index if not exists idx_timeline_items_session_attachments
+  on timeline_items(session_id, ordinal)
+  where attachments_json is not null;

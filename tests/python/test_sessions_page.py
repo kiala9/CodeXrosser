@@ -3490,6 +3490,15 @@ def test_clearing_search_restores_unfiltered_view() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Smallest possible decodable PNG (1x1 transparent) used by Time Travel
+# attachment tests so the delegate's image decode path actually exercises
+# QImage.loadFromData without needing fixture image files on disk.
+_TT_TINY_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+)
+
+
 def _make_time_travel_detail(
     record_id: str,
     *,
@@ -3497,24 +3506,54 @@ def _make_time_travel_detail(
     asst_per_user: int = 1,
     tool_per_user: int = 0,
     tool_group_size: int = 0,
+    attachments_per_user: int = 0,
+    file_attachment_per_user: bool = False,
 ) -> Any:
     """Build a SessionDetail with a known shape for Time Travel tests.
 
     Each "turn" is: 1 user message + ``asst_per_user`` assistant messages
     + ``tool_per_user`` isolated tool calls + (if tool_group_size > 1)
-    a coalesced tool_group of that size. Returns the SessionDetail.
+    a coalesced tool_group of that size. When ``attachments_per_user``
+    is positive each user message carries that many image attachments
+    (a 1×1 PNG via ``_TT_TINY_PNG_DATA_URI``); when
+    ``file_attachment_per_user`` is true each user message also gets one
+    ``application/json`` file attachment. Returns the SessionDetail.
     """
-    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions.models import (
+        Attachment,
+        SessionDetail,
+        SessionTimelineItem,
+    )
 
     items: list[SessionTimelineItem] = []
     counter = 0
     for u in range(user_count):
+        user_attachments: list[Attachment] = []
+        for a_idx in range(attachments_per_user):
+            user_attachments.append(
+                Attachment(
+                    kind="image",
+                    mime="image/png",
+                    data_uri=_TT_TINY_PNG_DATA_URI,
+                    name=f"shot_{u}_{a_idx}.png",
+                )
+            )
+        if file_attachment_per_user:
+            user_attachments.append(
+                Attachment(
+                    kind="file",
+                    mime="application/json",
+                    data_uri="data:application/json;base64,e30=",
+                    name=f"data_{u}.json",
+                )
+            )
         items.append(
             SessionTimelineItem(
                 id=f"u-{u}",
                 type="message:user",
                 timestamp=f"2026-01-01T0{u}:00:00Z",
                 text=f"user prompt {u}",
+                attachments=tuple(user_attachments),
             )
         )
         for a in range(asst_per_user):
@@ -4441,3 +4480,950 @@ def test_time_travel_vertical_view_chip_and_text_filters_compose() -> None:
     # Now also disable Tool chip — combined filter must drop to zero.
     view._kind_chips["tool"].setChecked(False)
     assert view._proxy.rowCount() == 0
+
+
+def test_time_travel_mode_bar_starts_in_messages_mode() -> None:
+    """The popup defaults to the Messages page so existing behaviour
+    (open → start typing in search) is preserved when the user hasn't
+    explicitly clicked the Attachments tab."""
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TimeTravelModeBar,
+    )
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-mode-default"), CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    assert popup._stack.currentIndex() == _TimeTravelModeBar.MODE_MESSAGES
+    assert popup._mode_bar.current_mode() == _TimeTravelModeBar.MODE_MESSAGES
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_mode_bar_switches_to_attachments() -> None:
+    """Clicking the Attachments tab routes the inner QStackedWidget to
+    page index 1 — the popup keeps the same height (no resize jitter)."""
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TimeTravelModeBar,
+    )
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-mode-switch", attachments_per_user=1),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    popup._mode_bar._attachments_button.setChecked(True)
+    assert popup._stack.currentIndex() == _TimeTravelModeBar.MODE_ATTACHMENTS
+
+    popup._mode_bar._messages_button.setChecked(True)
+    assert popup._stack.currentIndex() == _TimeTravelModeBar.MODE_MESSAGES
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_count_badge_reflects_total() -> None:
+    """The Attachments tab label embeds the total count so users can see
+    "is there anything in there?" without switching tabs first."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-badge", user_count=3, attachments_per_user=2
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    label = popup._mode_bar._attachments_button.text()
+    assert "(6)" in label  # 3 users × 2 image attachments each
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_model_collects_all_attachments() -> None:
+    """Each attachment on each block contributes one row to the grid
+    model — image + file mix in one flat list."""
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TT_ATT_BLOCK_INDEX_ROLE,
+        _TT_ATT_KIND_ROLE,
+    )
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-collect",
+            user_count=4,
+            attachments_per_user=2,
+            file_attachment_per_user=True,
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    model = popup._attachments._model
+    # 4 users × (2 images + 1 file) = 12 attachments
+    assert model.rowCount() == 12
+    # Mix of image + file kinds
+    kinds = [
+        model.index(i, 0).data(_TT_ATT_KIND_ROLE)
+        for i in range(model.rowCount())
+    ]
+    assert kinds.count("image") == 8
+    assert kinds.count("file") == 4
+    # Block indices reference back into _all_blocks (user prompts, every
+    # ``asst_per_user + 1``-th block) — bare existence check is enough.
+    block_indices = {
+        model.index(i, 0).data(_TT_ATT_BLOCK_INDEX_ROLE)
+        for i in range(model.rowCount())
+    }
+    assert block_indices.issubset(set(range(len(panel._all_blocks))))
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_model_skips_blocks_without_attachments() -> None:
+    """A session with zero attachments yields an empty model — assistant /
+    tool blocks contribute nothing, even though they exist in the
+    timeline."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-empty", user_count=4, asst_per_user=2, tool_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    assert popup._attachments._model.rowCount() == 0
+    assert popup._attachments.attachment_count() == 0
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_model_marks_filtered_rows() -> None:
+    """Panel-level filter dims attachments that belong to filtered-out
+    blocks — they stay visible (Time Travel always shows the whole
+    session) but the delegate paints them at 35% opacity via
+    ``IsFilteredOutRole``."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelAttachmentsModel,
+        _TT_ATT_FILTERED_OUT_ROLE,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail(
+        "tt-att-dim", user_count=3, attachments_per_user=1
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+    # Allow only the first user prompt block — every other block is dim.
+    user_block_indices = [
+        i for i, (kind, payload) in enumerate(blocks)
+        if kind == "single" and getattr(payload, "type", "") == "message:user"
+    ]
+    assert len(user_block_indices) >= 2
+    allowed = [user_block_indices[0]]
+
+    model = _TimeTravelAttachmentsModel()
+    model.refresh(blocks, allowed)
+
+    in_count = 0
+    out_count = 0
+    for r in range(model.rowCount()):
+        if model.index(r, 0).data(_TT_ATT_FILTERED_OUT_ROLE):
+            out_count += 1
+        else:
+            in_count += 1
+    assert in_count == 1
+    assert out_count == len(user_block_indices) - 1
+
+
+def test_time_travel_attachments_click_emits_block_index() -> None:
+    """Activating an attachment row emits a jump request — preferring
+    ``offsetClicked(ordinal, item_id)`` when both are populated (covers
+    out-of-slice items in huge sessions), falling back to
+    ``attachmentJumpRequested(block_index)`` for sliced rows that lack
+    one or the other."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-click", user_count=3, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    offset_captured: list[tuple[int, str]] = []
+    block_captured: list[int] = []
+    popup._attachments.offsetClicked.connect(
+        lambda o, i: offset_captured.append((o, i))
+    )
+    popup._attachments.attachmentJumpRequested.connect(block_captured.append)
+
+    # Activate the first attachment row directly via the model index —
+    # this is the same QModelIndex the view's clicked signal would carry.
+    # The host's _push_time_travel_data populated ordinal_map, so the
+    # row carries both ordinal and item_id → offset path wins.
+    first_idx = popup._attachments._model.index(0, 0)
+    popup._attachments._on_activated(first_idx)
+
+    from codex_quota_viewer.sessions_page import (
+        _TT_ATT_ITEM_ID_ROLE,
+        _TT_ATT_ORDINAL_ROLE,
+    )
+    expected_ordinal = first_idx.data(_TT_ATT_ORDINAL_ROLE)
+    expected_item_id = first_idx.data(_TT_ATT_ITEM_ID_ROLE)
+    assert isinstance(expected_ordinal, int)
+    assert expected_item_id  # populated from owner.id
+    assert offset_captured == [(expected_ordinal, expected_item_id)]
+    assert block_captured == []  # offset path took precedence
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_jump_routes_through_popup_blockJumpRequested() -> None:
+    """The view's ``attachmentJumpRequested`` is forwarded by the popup
+    on its existing ``blockJumpRequested`` signal — host wires this to
+    ``_recenter_async`` so attachment clicks reuse the message-jump
+    path. Same rapid-browse semantics, no popup close."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-route", user_count=3, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    captured: list[int] = []
+    panel._recenter_async = (  # type: ignore[method-assign]
+        lambda focus_block, **_kwargs: captured.append(focus_block)
+    )
+
+    # Pick the first attachment's source block via the model.
+    from codex_quota_viewer.sessions_page import _TT_ATT_BLOCK_INDEX_ROLE
+    first_block = popup._attachments._model.index(0, 0).data(
+        _TT_ATT_BLOCK_INDEX_ROLE
+    )
+    popup._attachments.attachmentJumpRequested.emit(first_block)
+
+    assert captured == [first_block]
+    # Popup stays open after a jump — rapid-browse semantics.
+    assert panel._time_travel_popup is not None
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_view_empty_state_when_no_attachments() -> None:
+    """A session without attachments shows the placeholder ("No
+    attachments in this session") and the mode-bar count is 0. Tab
+    stays clickable — disabling it would feel jarring."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-att-empty-state"), CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    assert popup._attachments.attachment_count() == 0
+    assert "(0)" in popup._mode_bar._attachments_button.text()
+    assert popup._mode_bar._attachments_button.isEnabled()
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_delegate_caches_decoded_thumbnail() -> None:
+    """Thumbnails are decoded once per (block, attachment) and reused on
+    subsequent paints — guards the expensive base64 → QImage decode
+    path from running on every scroll tick."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-cache", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    delegate = popup._attachments._delegate
+    assert delegate._thumb_cache == {}
+
+    # Fire two paint-equivalent thumbnail lookups for the same row —
+    # the second must be served from cache (same QPixmap identity).
+    idx = popup._attachments._model.index(0, 0)
+    pix1 = delegate._thumbnail_for(idx)
+    pix2 = delegate._thumbnail_for(idx)
+    assert pix1 is not None
+    assert pix1 is pix2
+    assert len(delegate._thumb_cache) == 1
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_refresh_clears_thumbnail_cache() -> None:
+    """Each call to ``view.refresh`` is treated as a session boundary —
+    cached thumbnails are dropped so a re-open against a different
+    session never reuses pixmaps from the previous one."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-cache-clear", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    delegate = popup._attachments._delegate
+    idx = popup._attachments._model.index(0, 0)
+    delegate._thumbnail_for(idx)
+    assert len(delegate._thumb_cache) >= 1
+
+    popup._attachments.refresh(panel._all_blocks, None)
+    assert delegate._thumb_cache == {}
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_survive_lightweight_index_mode() -> None:
+    """Huge sessions (timeline_total >> loaded items) take the
+    lightweight index path for the messages list — that path strips
+    attachment payloads. The attachments grid must still populate from
+    ``_all_blocks`` (the materialized slice) so the user doesn't see
+    ``Attachments (0)`` on a session that clearly has attached files."""
+    from codex_quota_viewer.sessions.models import (
+        SessionDetail,
+        SessionTimelineIndexItem,
+        SessionTimelineItem,
+    )
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    # Build a small materialized slice with one user message that has
+    # both a payload-level file attachment AND a markdown image link.
+    md_text = (
+        "Two SVG icons:\n"
+        "![GPT-account](E:/Download/GPT-account.svg)\n"
+        "![API-account](E:/Download/API-account.svg)\n"
+    )
+    user_item = SessionTimelineItem(
+        id="u-bigsession",
+        type="message:user",
+        timestamp="2026-04-30T01:25:00Z",
+        text=md_text,
+    )
+    detail = SessionDetail(
+        record=_record("tt-att-bigsession"),
+        audit_entries=[],
+        timeline=[user_item],
+        # timeline_total deliberately much larger than len(timeline) so
+        # _needs_time_travel_index() returns True.
+        timeline_total=6319,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    # Stand in for the lightweight index that the manager would normally
+    # provide async — populate it directly so _push_time_travel_data
+    # takes the index path on open.
+    panel._time_travel_index_items = [
+        SessionTimelineIndexItem(
+            ordinal=i,
+            item_id=f"big-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-04-30T01:25:00Z",
+            preview=f"item {i}",
+            tool_name=None,
+        )
+        for i in range(6319)
+    ]
+
+    popup = _open_time_travel_for_test(panel)
+
+    # Index mode must still show attachments from the loaded slice.
+    assert popup._attachments._model.rowCount() == 2
+    assert "(2)" in popup._mode_bar._attachments_button.text()
+    # And the messages list took the lightweight index path (proxy
+    # rowCount reflects the global index count, not the materialized 1).
+    assert popup._vertical._proxy.rowCount() == 6319
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_use_global_ordinal_in_index_mode() -> None:
+    """In huge sessions taking the lightweight index path, the
+    attachments grid must label cells with the global timeline ordinal
+    (matching the messages tab's ``#N``), not the local block index.
+    Without the ordinal_map plumbing, an attachment at item ordinal
+    2537 in a 6319-item session would render as ``#1`` because it's
+    the first row in ``_all_blocks`` — a 2536× discrepancy from what
+    the messages tab shows."""
+    from codex_quota_viewer.sessions.models import (
+        SessionDetail,
+        SessionTimelineIndexItem,
+        SessionTimelineItem,
+    )
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TT_ATT_ORDINAL_ROLE,
+    )
+
+    QApplication.instance() or QApplication([])
+    user_item = SessionTimelineItem(
+        id="u-deep",
+        type="message:user",
+        timestamp="2026-04-30T01:25:00Z",
+        text=(
+            "Two SVG icons:\n"
+            "![GPT-account](E:/Download/GPT-account.svg)\n"
+        ),
+    )
+    detail = SessionDetail(
+        record=_record("tt-att-ordinal"),
+        audit_entries=[],
+        timeline=[user_item],
+        timeline_total=6319,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    # Pretend the lightweight index landed and places this user item
+    # at global ordinal 2537 (display would be #2538, matching the
+    # messages tab numbering).
+    panel._time_travel_index_items = [
+        SessionTimelineIndexItem(
+            ordinal=2537,
+            item_id="u-deep",
+            type="message:user",
+            timestamp="2026-04-30T01:25:00Z",
+            preview="Two SVG icons",
+            tool_name=None,
+        )
+    ]
+
+    popup = _open_time_travel_for_test(panel)
+
+    # Model surfaces the global ordinal via _TT_ATT_ORDINAL_ROLE.
+    first_idx = popup._attachments._model.index(0, 0)
+    assert first_idx.data(_TT_ATT_ORDINAL_ROLE) == 2537
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_ordinal_falls_back_to_block_index() -> None:
+    """When no ordinal_map is provided (small session, tests, etc.),
+    the model surfaces ``ordinal=None`` so the delegate falls back to
+    ``block_index + 1``. This guards the legacy code path used by the
+    standalone-model tests."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelAttachmentsModel,
+        _TT_ATT_ORDINAL_ROLE,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail(
+        "tt-att-no-ordinal", user_count=2, attachments_per_user=1
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+
+    model = _TimeTravelAttachmentsModel()
+    model.refresh(blocks, None)  # no ordinal_map → ordinal field stays None
+
+    for r in range(model.rowCount()):
+        assert model.index(r, 0).data(_TT_ATT_ORDINAL_ROLE) is None
+
+
+def test_time_travel_attachments_picks_up_markdown_image_links() -> None:
+    """A user message body like "see ![](E:/Download/x.svg) and
+    ![](E:/Download/y.png)" produces two attachment cards in the bubble
+    (via ``_extract_markdown_attachments``). The Time Travel grid must
+    pick those up too — otherwise sessions where the user pastes
+    screenshots via markdown syntax show "Attachments (0)" even though
+    the bubble clearly renders attachment cards."""
+    from codex_quota_viewer.sessions.models import (
+        SessionDetail,
+        SessionTimelineItem,
+    )
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    md_text = (
+        "Two SVG icons replacing the bitmap ones:\n"
+        "![GPT-account](E:/Download/GPT-account.svg)\n"
+        "![API-account](E:/Download/API-account.svg)\n"
+    )
+    user_item = SessionTimelineItem(
+        id="u-md",
+        type="message:user",
+        timestamp="2026-04-30T01:25:00Z",
+        text=md_text,
+    )
+    detail = SessionDetail(
+        record=_record("tt-att-md"),
+        audit_entries=[],
+        timeline=[user_item],
+        timeline_total=1,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    # Both markdown image links must contribute rows to the model.
+    assert popup._attachments._model.rowCount() == 2
+    assert "(2)" in popup._mode_bar._attachments_button.text()
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_handles_invalid_data_uri() -> None:
+    """A corrupt or empty data_uri falls back to the broken-image
+    placeholder rather than raising — `_decode_data_uri` returns None
+    on bad payloads and the delegate caches a sentinel pixmap."""
+    from codex_quota_viewer.sessions.models import (
+        Attachment,
+        SessionDetail,
+        SessionTimelineItem,
+    )
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    bad_attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri="data:image/png;base64,not_real_base64_!!!",
+        name="broken.png",
+    )
+    user_item = SessionTimelineItem(
+        id="u-bad",
+        type="message:user",
+        timestamp="2026-01-01T00:00:00Z",
+        text="hi",
+        attachments=(bad_attachment,),
+    )
+    detail = SessionDetail(
+        record=_record("tt-att-broken"),
+        audit_entries=[],
+        timeline=[user_item],
+        timeline_total=1,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    delegate = popup._attachments._delegate
+    idx = popup._attachments._model.index(0, 0)
+    pix = delegate._thumbnail_for(idx)
+    # Broken-image placeholder is a non-null QPixmap — the test guards
+    # against the path raising or returning None for the corrupt input.
+    assert pix is not None
+    assert not pix.isNull()
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+# ---- Full-session attachments lazy-load tests -------------------------------
+
+
+def _make_session_attachment_row(
+    *, ordinal: int, item_id: str, name: str = "shot.png"
+) -> Any:
+    """Build a SessionAttachmentRow for UI tests — same shape the
+    repository produces, but constructed by hand so tests don't have
+    to spin up a real SQLite database."""
+    from codex_quota_viewer.sessions.models import (
+        Attachment,
+        SessionAttachmentRow,
+    )
+
+    return SessionAttachmentRow(
+        ordinal=ordinal,
+        item_id=item_id,
+        type="message:user",
+        timestamp="2026-04-30T01:25:00Z",
+        attachment_index=0,
+        attachment=Attachment(
+            kind="image",
+            mime="image/png",
+            data_uri=_TT_TINY_PNG_DATA_URI,
+            name=name,
+        ),
+    )
+
+
+def test_time_travel_full_attachments_replaces_sliced_view() -> None:
+    """When the host pushes a SQL-fetched full attachment list, the
+    grid replaces its sliced view — row count comes from the full list,
+    ordinals come from the row objects (matching messages tab #N), not
+    from synthetic block indices."""
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TT_ATT_ORDINAL_ROLE,
+    )
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-full-replace", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+    assert popup._attachments._model.rowCount() == 2  # sliced
+
+    # Simulate the worker callback with 5 SQL rows at deep ordinals.
+    rows = [
+        _make_session_attachment_row(
+            ordinal=ord_, item_id=f"u-{ord_}", name=f"shot_{ord_}.png"
+        )
+        for ord_ in (12, 137, 2538, 4001, 6001)
+    ]
+    popup.set_full_attachments(rows)
+
+    assert popup._attachments._model.rowCount() == 5
+    assert "(5)" in popup._mode_bar._attachments_button.text()
+    # Each row's _TT_ATT_ORDINAL_ROLE is the SQL ordinal directly —
+    # NOT a synthetic block index. Display would render #13, #138, etc.
+    actual_ordinals = [
+        popup._attachments._model.index(r, 0).data(_TT_ATT_ORDINAL_ROLE)
+        for r in range(5)
+    ]
+    assert actual_ordinals == [12, 137, 2538, 4001, 6001]
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_caches_per_session() -> None:
+    """Repeat tab clicks within the same session reuse the cached
+    rows instead of re-firing ``full_attachments_requested``. Cross-
+    session swap drops the cache."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-cache", user_count=2),
+        CodexHomeTarget.SANDBOX,
+    )
+
+    requests: list[str] = []
+    panel.full_attachments_requested.connect(requests.append)
+
+    popup = _open_time_travel_for_test(panel)
+
+    # First time the popup signals the host: cache miss, fire signal.
+    panel._on_full_attachments_requested()
+    assert requests == [panel._loaded_session_id]
+
+    # Worker callback lands → cache populated.
+    rows = [_make_session_attachment_row(ordinal=42, item_id="u-1")]
+    panel.set_full_session_attachments(panel._loaded_session_id, rows)
+    assert panel._loaded_session_id in panel._full_attachments_cache
+
+    # Second trigger inside the same session → cache hit, no new emit.
+    panel._on_full_attachments_requested()
+    assert requests == [panel._loaded_session_id]  # length unchanged
+
+    # Different session swap → cache cleared.
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-other"), CodexHomeTarget.SANDBOX
+    )
+    assert panel._full_attachments_cache == {}
+    panel.close()
+
+
+def test_time_travel_full_attachments_drops_stale_after_session_swap() -> None:
+    """A worker callback that arrives AFTER the user navigated to
+    another session must be dropped — the rows belong to the previous
+    session and pushing them would corrupt the new view."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-stale-1"), CodexHomeTarget.SANDBOX
+    )
+    stale_id = panel._loaded_session_id
+
+    popup = _open_time_travel_for_test(panel)
+    panel._on_full_attachments_requested()
+    assert stale_id in panel._full_attachments_pending
+
+    # User navigates away before worker returns.
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-stale-2"), CodexHomeTarget.SANDBOX
+    )
+    new_id = panel._loaded_session_id
+    assert new_id != stale_id
+
+    # Stale callback lands — must NOT pollute the new session's cache.
+    rows = [_make_session_attachment_row(ordinal=99, item_id="u-stale")]
+    panel.set_full_session_attachments(stale_id, rows)
+    assert stale_id not in panel._full_attachments_cache
+    assert new_id not in panel._full_attachments_cache
+    panel.close()
+
+
+def test_time_travel_full_attachments_handles_worker_error() -> None:
+    """If the worker fails (manager.list_session_attachments raises),
+    the in-flight marker is cleared so the user can retry by re-
+    opening the tab. The sliced view stays in place."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-full-error", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+    sliced_count_before = popup._attachments._model.rowCount()
+
+    panel._on_full_attachments_requested()
+    assert panel._loaded_session_id in panel._full_attachments_pending
+
+    # Simulate the worker erroring out.
+    panel.cancel_full_session_attachments_request(panel._loaded_session_id)
+
+    assert panel._loaded_session_id not in panel._full_attachments_pending
+    # Sliced view still there — no rows replaced.
+    assert popup._attachments._model.rowCount() == sliced_count_before
+    # Popup's "already requested" flag was reset so re-opening the tab
+    # would fire a fresh request.
+    assert popup._full_attachments_requested is False
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_click_emits_offset() -> None:
+    """A click on a thumbnail in full-load mode emits ``offsetClicked``
+    (not the in-slice ``attachmentJumpRequested``) so the host's
+    ``_on_time_travel_offset_jump`` can route to items outside
+    ``_all_blocks``."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-click"), CodexHomeTarget.SANDBOX
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    rows = [
+        _make_session_attachment_row(
+            ordinal=2537, item_id="u-deep", name="GPT-account.svg"
+        )
+    ]
+    popup.set_full_attachments(rows)
+
+    captured: list[tuple[int, str]] = []
+    popup._attachments.offsetClicked.connect(lambda o, i: captured.append((o, i)))
+
+    first_idx = popup._attachments._model.index(0, 0)
+    popup._attachments._on_activated(first_idx)
+
+    assert captured == [(2537, "u-deep")]
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_click_routes_via_ordinal_with_empty_item_id() -> None:
+    """Regression for the P2 click-routing bug: a row with valid
+    ordinal but EMPTY item_id must still route through
+    ``offsetClicked`` (the host's offset-jump path resolves anchors
+    from ``_all_timeline_items`` when item_id is missing). The previous
+    ``and item_id`` guard incorrectly fell through to
+    ``attachmentJumpRequested(synthetic_block_index)`` and jumped to
+    an arbitrary in-slice block."""
+    from codex_quota_viewer.sessions.models import (
+        Attachment,
+        SessionAttachmentRow,
+    )
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-empty-id"), CodexHomeTarget.SANDBOX
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    # Build a SQL-row whose item_id is empty — could happen if the
+    # repository row had a NULL/empty id column.
+    rows = [
+        SessionAttachmentRow(
+            ordinal=4242,
+            item_id="",
+            type="message:user",
+            timestamp="2026-04-30T01:25:00Z",
+            attachment_index=0,
+            attachment=Attachment(
+                kind="image",
+                mime="image/png",
+                data_uri=_TT_TINY_PNG_DATA_URI,
+                name="orphan.png",
+            ),
+        )
+    ]
+    popup.set_full_attachments(rows)
+
+    offset_captured: list[tuple[int, str]] = []
+    block_captured: list[int] = []
+    popup._attachments.offsetClicked.connect(
+        lambda o, i: offset_captured.append((o, i))
+    )
+    popup._attachments.attachmentJumpRequested.connect(block_captured.append)
+
+    popup._attachments._on_activated(popup._attachments._model.index(0, 0))
+
+    # Ordinal alone is enough — empty item_id is OK; host fills it in
+    # from _all_timeline_items at jump time.
+    assert offset_captured == [(4242, "")]
+    assert block_captured == []
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_survive_subsequent_data_push() -> None:
+    """Regression for the P1 bug: once the cached full list is
+    populated, a later ``_push_time_travel_data`` (e.g. a minimap
+    refresh after the user scrolls) must NOT revert the grid back to
+    the sliced view. Previously the host always called
+    ``set_attachments(blocks, ...)`` which overwrote the full grid."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-full-survive", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+    sliced_count = popup._attachments._model.rowCount()
+    assert sliced_count == 2  # baseline sliced view
+
+    # Worker callback lands with a richer full list (5 rows from across
+    # the whole session, beyond the sliced 2).
+    full_rows = [
+        _make_session_attachment_row(
+            ordinal=ord_, item_id=f"u-{ord_}", name=f"shot_{ord_}.png"
+        )
+        for ord_ in (10, 100, 1000, 2500, 5000)
+    ]
+    panel.set_full_session_attachments(panel._loaded_session_id, full_rows)
+    assert popup._attachments._model.rowCount() == 5
+
+    # Simulate a later refresh — the kind of trigger that previously
+    # blew the grid away.
+    panel._push_time_travel_data()
+
+    assert popup._attachments._model.rowCount() == 5
+    assert "(5)" in popup._mode_bar._attachments_button.text()
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_rejects_stale_target() -> None:
+    """Regression for the P2 stale-target bug: a worker result that
+    arrives after the user switched targets (Sandbox <-> Real) must
+    NOT be applied even when the session id happens to match (Sandbox
+    and Real can hold copies with the same id).
+
+    Uses a task_runner stub that DELAYS the on_success callback so we
+    can swap ``_target`` between request submission and delivery —
+    that's the production race window the fix protects against."""
+    from codex_quota_viewer.sessions_page import SessionsPage
+
+    QApplication.instance() or QApplication([])
+    captured_calls: list[tuple[CodexHomeTarget, str]] = []
+
+    class FakeManager:
+        def __init__(self, target: CodexHomeTarget):
+            self._target = target
+
+        def list_session_attachments(self, session_id: str):
+            captured_calls.append((self._target, session_id))
+            return [("fake-row",)]
+
+        def list_sessions(self, _filters):
+            return []
+
+    deferred: list[tuple[Any, Any, Any]] = []
+
+    def fake_runner(action, on_success, on_error):
+        # Run the action immediately (captures active_target via the
+        # closure in _request_full_session_attachments) but defer the
+        # success callback so we can mutate _target in between.
+        try:
+            result = action()
+        except Exception as exc:  # pragma: no cover - sanity guard
+            deferred.append((None, on_error, exc))
+            return
+        deferred.append((result, on_success, None))
+
+    page = SessionsPage(
+        sessions_manager_factory=lambda target: FakeManager(target),
+        confirm_real_action=lambda _title, _msg: True,
+        translator=lambda s: s,
+        task_runner=fake_runner,
+    )
+
+    applied: list[tuple[str, list]] = []
+    real_setter = page._detail_panel.set_full_session_attachments
+
+    def spy(session_id: str, rows: list) -> None:
+        applied.append((session_id, list(rows)))
+        real_setter(session_id, rows)
+
+    page._detail_panel.set_full_session_attachments = spy  # type: ignore[method-assign]
+
+    # Simulate: request submitted under SANDBOX target...
+    page._active_session_id = "shared-sess"
+    page._target = CodexHomeTarget.SANDBOX
+    page._request_full_session_attachments("shared-sess")
+    # ...action ran against SANDBOX, callback queued.
+    assert captured_calls == [(CodexHomeTarget.SANDBOX, "shared-sess")]
+    assert len(deferred) == 1
+    assert applied == []
+
+    # User switches targets BEFORE the worker callback fires.
+    page._target = CodexHomeTarget.REAL
+
+    # Now drain the deferred callback. The deliver guard should reject
+    # the result because the target no longer matches the captured one.
+    result, callback, _err = deferred[0]
+    callback(result)
+
+    assert applied == []  # rejected — stale target
+    page.close()

@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ._perf import _perf_timer
+from .jsonl_parser import _extract_markdown_image_attachments
 from .models import (
     Attachment,
     AuditEntry,
     CatalogSessionEntry,
+    SessionAttachmentRow,
     SessionFilters,
     SessionRecord,
     SessionTimelineIndexItem,
@@ -479,6 +481,55 @@ class SessionRepository:
         ).fetchall()
         return [_map_timeline_index_row(row) for row in rows]
 
+    def list_session_attachments(self, session_id: str) -> list[SessionAttachmentRow]:
+        """Return every attachment in a session in ordinal order."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                select ordinal, item_id, type, timestamp, attachments_json, NULL as text
+                from timeline_items
+                where session_id = ? and attachments_json is not null
+                union all
+                select ordinal, item_id, type, timestamp, NULL as attachments_json, text
+                from timeline_items
+                where session_id = ?
+                  and attachments_json is null
+                  and text is not null
+                  and instr(text, '![') > 0
+                order by ordinal asc
+                """,
+                (session_id, session_id),
+            ).fetchall()
+            attachment_rows: list[SessionAttachmentRow] = []
+            for row in rows:
+                attachments = _decode_attachments_json(row)
+                if not attachments:
+                    _text, attachments = _extract_markdown_image_attachments(
+                        str(row["text"] or "")
+                    )
+                if not attachments:
+                    continue
+                item_type = str(row["type"])
+                normalized_type = (
+                    "tool_call"
+                    if item_type == "tool_call"
+                    else "message:assistant"
+                    if item_type == "message:assistant"
+                    else "message:user"
+                )
+                for attachment_index, attachment in enumerate(attachments):
+                    attachment_rows.append(
+                        SessionAttachmentRow(
+                            ordinal=int(row["ordinal"] or 0),
+                            item_id=str(row["item_id"]),
+                            type=normalized_type,  # type: ignore[arg-type]
+                            timestamp=str(row["timestamp"]),
+                            attachment_index=attachment_index,
+                            attachment=attachment,
+                        )
+                    )
+            return attachment_rows
+
     def list_audit_entries(self, session_id: str) -> list[AuditEntry]:
         rows = self._connection.execute(
             """
@@ -683,8 +734,25 @@ class SessionRepository:
         schema_path = Path(__file__).parent / SCHEMA_FILE_NAME
         sql = schema_path.read_text(encoding="utf-8")
         with self._lock, self._transaction():
+            self._ensure_legacy_timeline_attachment_column()
             self._connection.executescript(sql)
             self._ensure_legacy_columns()
+
+    def _ensure_legacy_timeline_attachment_column(self) -> None:
+        table = self._connection.execute(
+            """
+            select name from sqlite_master
+            where type = 'table' and name = 'timeline_items'
+            """
+        ).fetchone()
+        if table is None:
+            return
+        timeline_rows = self._connection.execute("pragma table_info(timeline_items)").fetchall()
+        timeline_columns = {str(row["name"]) for row in timeline_rows if row and row["name"]}
+        if "attachments_json" not in timeline_columns:
+            self._connection.execute(
+                "alter table timeline_items add column attachments_json text"
+            )
 
     def _ensure_legacy_columns(self) -> None:
         rows = self._connection.execute("pragma table_info(sessions)").fetchall()
