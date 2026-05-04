@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "src" / "CodexQuotaViewerWindows.Qt"))
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent, QPalette  # noqa: E402
-from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget  # noqa: E402
 
 from codex_quota_viewer.qt_app import ConfirmPhraseDialog, MainWindow, StatusBanner, StatusDetailsPopup, StatusPopupFrame, _apply_dark_palette  # noqa: E402
 from codex_quota_viewer.models import AccountMetadata, AccountRecord, AuthMode, CodexHomeTarget, UiLanguage, now_utc  # noqa: E402
@@ -43,6 +43,22 @@ def test_dark_palette_pins_native_view_colors() -> None:
     assert palette.color(QPalette.Text).lightness() > 200
     assert palette.color(QPalette.WindowText).lightness() > 200
     assert palette.color(QPalette.HighlightedText).lightness() > 200
+
+
+def test_restore_points_header_clips_to_frosted_table_radius() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+
+    MainWindow._apply_style(window)
+
+    style = window.styleSheet()
+    assert "QHeaderView#RestorePointsHeader" in style
+    assert "background: transparent;" in style
+    assert "QTableWidget#RestorePointsTable QHeaderView::section:first" in style
+    assert "border-top-left-radius: 10px;" in style
+    assert "QTableWidget#RestorePointsTable QHeaderView::section:last" in style
+    assert "QTableWidget#RestorePointsTable QTableCornerButton::section" in style
+    window.close()
 
 
 def test_confirm_phrase_requires_full_real_switch_phrase() -> None:

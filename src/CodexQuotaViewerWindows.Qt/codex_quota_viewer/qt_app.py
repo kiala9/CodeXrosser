@@ -1582,8 +1582,24 @@ class MainWindow(QMainWindow):
                 background: rgba(10, 132, 255, 95);
                 color: #ffffff;
             }
+            QHeaderView#RestorePointsHeader {
+                background: transparent;
+                border: 0;
+            }
             QTableWidget#RestorePointsTable QHeaderView::section {
                 background: rgba(255, 255, 255, 8);
+            }
+            QTableWidget#RestorePointsTable QHeaderView::section:first {
+                border-top-left-radius: 10px;
+            }
+            QTableWidget#RestorePointsTable QHeaderView::section:last {
+                border-top-right-radius: 10px;
+            }
+            QTableWidget#RestorePointsTable QTableCornerButton::section {
+                background: transparent;
+                border: 0;
+                border-bottom: 1px solid rgba(255, 255, 255, 20);
+                border-top-left-radius: 10px;
             }
             QTableCornerButton::section {
                 background: #2C2C2E;
@@ -2504,6 +2520,11 @@ class MainWindow(QMainWindow):
         table.viewport().setAttribute(Qt.WA_StyledBackground, True)
         table.viewport().setStyleSheet("background: transparent;")
         table.setHorizontalHeaderLabels([self._tr(text) for text in ["Kind", "ID", "Created At", "Target", "Size", "Files", "Note"]])
+        table.horizontalHeader().setObjectName("RestorePointsHeader")
+        table.horizontalHeader().setAttribute(Qt.WA_StyledBackground, True)
+        table.horizontalHeader().setAutoFillBackground(False)
+        table.horizontalHeader().setHighlightSections(False)
+        table.horizontalHeader().setStyleSheet("background: transparent;")
         table.verticalHeader().hide()
         table.setShowGrid(False)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2580,12 +2601,21 @@ class MainWindow(QMainWindow):
         table = QTableWidget(len(events), 5)
         table.setObjectName("RestorePointsTable")
         table.setFrameShape(QFrame.NoFrame)
+        table.setAttribute(Qt.WA_StyledBackground, True)
+        table.viewport().setAutoFillBackground(False)
+        table.viewport().setAttribute(Qt.WA_StyledBackground, True)
+        table.viewport().setStyleSheet("background: transparent;")
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.verticalHeader().hide()
         table.setShowGrid(False)
         table.setHorizontalHeaderLabels([self._tr(text) for text in ["Time", "Event", "Target", "Status", "Summary"]])
+        table.horizontalHeader().setObjectName("RestorePointsHeader")
+        table.horizontalHeader().setAttribute(Qt.WA_StyledBackground, True)
+        table.horizontalHeader().setAutoFillBackground(False)
+        table.horizontalHeader().setHighlightSections(False)
+        table.horizontalHeader().setStyleSheet("background: transparent;")
         table.setMinimumHeight(self._audit_table_height)
         table.setMaximumHeight(self._audit_table_height)
         for row, event in enumerate(events):

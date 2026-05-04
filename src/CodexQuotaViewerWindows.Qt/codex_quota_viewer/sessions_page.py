@@ -15,6 +15,7 @@ from typing import Any, Callable
 from PySide6.QtCore import (
     QAbstractListModel,
     QByteArray,
+    QCoreApplication,
     QEvent,
     QItemSelectionModel,
     QModelIndex,
@@ -490,6 +491,7 @@ _ROLE_DOT_COLORS: dict[str, str] = {
     "user": ROLE_DOT_USER,
     "assistant": ROLE_DOT_ASSISTANT,
     "tool": ROLE_DOT_TOOL,
+    "command": ROLE_DOT_TOOL,
     "tool_group": ROLE_DOT_TOOL_GROUP,
 }
 
@@ -502,12 +504,16 @@ def _role_for_block(block: Any) -> str:
     back-reference to the panel."""
     kind, payload = block
     if kind == "tool_group":
+        if payload and all(_is_command_tool(item) for item in payload):
+            return "command"
         return "tool_group"
     item_type = getattr(payload, "type", "")
     if item_type == "message:user":
         return "user"
     if item_type == "message:assistant":
         return "assistant"
+    if item_type == "tool_call" and _is_command_tool(payload):
+        return "command"
     return "tool"
 
 
@@ -517,6 +523,46 @@ def _role_for_timeline_type(item_type: str) -> str:
     if item_type == "message:assistant":
         return "assistant"
     return "tool"
+
+
+def _role_for_timeline_index_item(item: SessionTimelineIndexItem) -> str:
+    role = _role_for_timeline_type(item.type)
+    if role == "tool" and _is_command_tool(item):
+        return "command"
+    return role
+
+
+def _time_travel_filter_kinds_for_block(block: Any) -> tuple[str, ...]:
+    """Return the Time Travel chip kinds that can show this row.
+
+    Commands remain part of the broader Tool toggle, but they also get a
+    dedicated Command toggle so shell-heavy sessions can be isolated without
+    making command rows visible by default.
+    """
+    kind, payload = block
+    role = _role_for_block(block)
+    if role in ("user", "assistant"):
+        return (role,)
+    kinds: set[str] = {"tool"}
+    if kind == "tool_group":
+        kinds.add("tool_group")
+        if any(_is_command_tool(item) for item in payload):
+            kinds.add("command")
+    elif _is_command_tool(payload):
+        kinds.add("command")
+    return tuple(sorted(kinds))
+
+
+def _time_travel_filter_kinds_for_index_item(
+    item: SessionTimelineIndexItem,
+) -> tuple[str, ...]:
+    role = _role_for_timeline_index_item(item)
+    if role in ("user", "assistant"):
+        return (role,)
+    kinds = {"tool"}
+    if role == "command":
+        kinds.add("command")
+    return tuple(sorted(kinds))
 
 
 def _format_block_timestamp(item: SessionTimelineItem) -> str:
@@ -737,6 +783,7 @@ class _TimeTravelRow:
 
     block_index: int
     role: str
+    filter_kinds: tuple[str, ...]
     preview: str
     timestamp: str
     tool_name: str | None
@@ -756,6 +803,7 @@ _TT_TOOL_NAME_ROLE = Qt.UserRole + 104
 _TT_FILTERED_OUT_ROLE = Qt.UserRole + 105
 _TT_JUMP_OFFSET_ROLE = Qt.UserRole + 106
 _TT_ITEM_ID_ROLE = Qt.UserRole + 107
+_TT_FILTER_KINDS_ROLE = Qt.UserRole + 108
 
 
 def _time_travel_row_background_path(
@@ -905,6 +953,7 @@ class _TimeTravelVerticalModel(QAbstractListModel):
                     _TimeTravelRow(
                         block_index=i,
                         role=_role_for_block(block),
+                        filter_kinds=_time_travel_filter_kinds_for_block(block),
                         preview=_block_preview_text(
                             block, translator=self._translator, max_chars=120
                         ),
@@ -922,7 +971,8 @@ class _TimeTravelVerticalModel(QAbstractListModel):
             self._rows = [
                 _TimeTravelRow(
                     block_index=item.ordinal,
-                    role=_role_for_timeline_type(item.type),
+                    role=_role_for_timeline_index_item(item),
+                    filter_kinds=_time_travel_filter_kinds_for_index_item(item),
                     preview=_index_preview_text(item, translator=self._translator),
                     timestamp=_format_block_timestamp(
                         SessionTimelineItem(
@@ -956,6 +1006,8 @@ class _TimeTravelVerticalModel(QAbstractListModel):
             return row.block_index
         if role == _TT_ROLE_ROLE:
             return row.role
+        if role == _TT_FILTER_KINDS_ROLE:
+            return row.filter_kinds
         if role == _TT_PREVIEW_ROLE or role == Qt.DisplayRole:
             return row.preview
         if role == _TT_TIMESTAMP_ROLE:
@@ -1141,15 +1193,18 @@ class _TimeTravelVerticalView(QWidget):
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(8)
 
-        # Kind chips. Three buttons (User / Assistant / Tool) using the
+        # Kind chips. Conversation rows are enabled by default; tool calls and
+        # shell commands are intentionally opt-in because they are noisy in
+        # scan-heavy Time Travel sessions.
         # same QSS hook as the detail panel's filter chips so they pick
         # up identical styling once _DETAIL_PANEL_QSS is re-applied to
-        # the popup. Default: conversation rows only; Tool is opt-in.
+        # the popup.
         self._kind_chips: dict[str, QPushButton] = {}
         chip_specs: list[tuple[str, str, QIcon]] = [
             ("user", translator("User"), _user_icon()),
             ("assistant", translator("Assistant"), _bot_icon()),
             ("tool", translator("Tool"), _tool_call_icon()),
+            ("command", translator("Command"), _shell_icon()),
         ]
         for kind, label, icon in chip_specs:
             chip = QPushButton(label)
@@ -1263,9 +1318,9 @@ class _TimeTravelVerticalView(QWidget):
         self._proxy.set_filter_text(text)
 
     def _on_kind_chip_toggled(self, kind: str, checked: bool) -> None:
-        # The "Tool" chip controls both the single tool_call kind and
-        # the coalesced tool_group kind — coalescing is an internal
-        # rendering decision, not a user-facing taxonomy.
+        # The "Tool" chip controls both the single tool_call kind and the
+        # coalesced tool_group kind. "Command" is a shell-flavoured subset
+        # that remains off by default but can be isolated on demand.
         members = ("tool", "tool_group") if kind == "tool" else (kind,)
         if checked:
             self._active_kinds.update(members)
@@ -1287,7 +1342,9 @@ class _TimeTravelVerticalView(QWidget):
             self.blockClicked.emit(block_index)
 
 
-_TT_ALL_KINDS: frozenset[str] = frozenset({"user", "assistant", "tool", "tool_group"})
+_TT_ALL_KINDS: frozenset[str] = frozenset(
+    {"user", "assistant", "tool", "tool_group", "command"}
+)
 _TT_DEFAULT_CHIP_KINDS: frozenset[str] = frozenset({"user", "assistant"})
 _TT_DEFAULT_KINDS: frozenset[str] = frozenset({"user", "assistant"})
 
@@ -1340,8 +1397,14 @@ class _TimeTravelFilterProxy(QSortFilterProxyModel):
             return True
         idx = model.index(source_row, 0, source_parent)
         # Kind filter (cheaper, evaluate first).
-        row_kind = idx.data(_TT_ROLE_ROLE) or "tool"
-        if row_kind not in self._active_kinds:
+        row_kinds = idx.data(_TT_FILTER_KINDS_ROLE)
+        if isinstance(row_kinds, str):
+            row_kind_set = {row_kinds}
+        else:
+            row_kind_set = set(row_kinds or ())
+        if not row_kind_set:
+            row_kind_set = {idx.data(_TT_ROLE_ROLE) or "tool"}
+        if not (row_kind_set & self._active_kinds):
             return False
         # Text filter — only when a needle is set; default state lets
         # everything through after the kind check.
@@ -4213,6 +4276,7 @@ _PREPEND_ANCHOR_SETTLE_PASSES = 3
 _PREPEND_ANCHOR_SCROLL_TOLERANCE = 2
 _PREPEND_HEADROOM_BLOCKS = _WINDOW_SIZE // 4
 _PAGING_MINIMAP_REFRESH_DELAY_MS = 80
+_PAGING_INPUT_QUARANTINE_MS = 160
 _TOOL_GROUP_MIN = 2  # coalesce N or more consecutive tool calls into a group
 
 
@@ -4372,6 +4436,13 @@ class _SessionDetailPanel(QFrame):
         self._scroll_throttle.setSingleShot(True)
         self._scroll_throttle.setInterval(50)
         self._scroll_throttle.timeout.connect(self._on_scroll_settled)
+        self._paging_input_quarantine = False
+        self._paging_input_quarantine_timer = QTimer(self)
+        self._paging_input_quarantine_timer.setSingleShot(True)
+        self._paging_input_quarantine_timer.timeout.connect(
+            self._end_paging_input_quarantine
+        )
+        self._paging_wheel_seen_during_lock = False
         self._minimap_refresh_timer = QTimer(self)
         self._minimap_refresh_timer.setSingleShot(True)
         self._minimap_refresh_timer.setInterval(16)
@@ -5423,12 +5494,74 @@ class _SessionDetailPanel(QFrame):
         )
 
     def _timeline_scroll_locked(self) -> bool:
-        if self._suppress_edge_slide or self._loading_older or self._loading_newer:
+        if (
+            self._suppress_edge_slide
+            or self._loading_older
+            or self._loading_newer
+            or self._paging_input_quarantine
+        ):
             return True
         return bool(
             self._timeline_overlay is not None
             and self._timeline_overlay.isVisible()
         )
+
+    def _begin_paging_input_quarantine(
+        self, duration_ms: int = _PAGING_INPUT_QUARANTINE_MS
+    ) -> None:
+        duration = max(0, int(duration_ms))
+        if duration <= 0:
+            self._end_paging_input_quarantine()
+            return
+        self._paging_input_quarantine = True
+        self._paging_input_quarantine_timer.start(duration)
+
+    def _end_paging_input_quarantine(self) -> None:
+        if self._paging_input_quarantine_timer.isActive():
+            self._paging_input_quarantine_timer.stop()
+        self._paging_input_quarantine = False
+
+    def _finish_paging_scroll_transaction(self, *, final: bool = True) -> None:
+        if not final:
+            if self._paging_wheel_seen_during_lock:
+                self._begin_paging_input_quarantine()
+            return
+        if self._paging_wheel_seen_during_lock:
+            self._begin_paging_input_quarantine()
+        else:
+            self._end_paging_input_quarantine()
+        self._paging_wheel_seen_during_lock = False
+
+    def _flush_timeline_wheel_input(self) -> None:
+        """Drop wheel-like events already queued for timeline widgets.
+
+        When a wheel burst reaches the loaded edge, Windows/Qt may already
+        have pending wheel events targeted at child bubbles or the scroll
+        viewport before the paging lock flips on. Removing posted wheel events
+        at the transaction boundary keeps those stale deltas from being
+        replayed against the rebuilt scroll range.
+        """
+        event_types = [QEvent.Wheel]
+        for name in ("Scroll", "ScrollPrepare"):
+            event_type = getattr(QEvent, name, None)
+            if event_type is not None:
+                event_types.append(event_type)
+        targets: set[QWidget] = {
+            self._timeline_scroll,
+            self._timeline_scroll.viewport(),
+            self._timeline_container,
+        }
+        targets.update(self._timeline_container.findChildren(QWidget))
+        targets.update(self._timeline_scroll.viewport().findChildren(QWidget))
+        for target in targets:
+            for event_type in event_types:
+                QCoreApplication.removePostedEvents(target, event_type)
+
+    def _start_paging_scroll_transaction(self) -> None:
+        self._paging_wheel_seen_during_lock = False
+        self._begin_paging_input_quarantine()
+        self._scroll_throttle.stop()
+        self._flush_timeline_wheel_input()
 
     def _should_consume_timeline_wheel(self, event) -> bool:
         """Hold wheel input while a programmatic rebuild owns scroll state.
@@ -5438,7 +5571,10 @@ class _SessionDetailPanel(QFrame):
         during either phase do not map to real content yet, so let the pending
         prepend finish before accepting more upward scroll.
         """
-        return self._timeline_scroll_locked()
+        locked = self._timeline_scroll_locked()
+        if locked and self._wheel_delta_y(event) != 0:
+            self._paging_wheel_seen_during_lock = True
+        return locked
 
     def _handle_timeline_edge_wheel(self, event) -> bool:
         """Trigger window paging when a wheel tick cannot move the scrollbar.
@@ -5576,6 +5712,8 @@ class _SessionDetailPanel(QFrame):
 
     def show_loading_placeholder(self, record: SessionRecord) -> None:
         self._render_token += 1
+        self._end_paging_input_quarantine()
+        self._paging_wheel_seen_during_lock = False
         self._loading_older = False
         self._loading_newer = False
         self._pending_older_anchor = None
@@ -5600,6 +5738,8 @@ class _SessionDetailPanel(QFrame):
 
     def set_detail(self, detail: SessionDetail | None, target: CodexHomeTarget) -> None:
         self._render_token += 1
+        self._end_paging_input_quarantine()
+        self._paging_wheel_seen_during_lock = False
         # Cancel any in-flight older-page request — its result would
         # belong to the previous session anyway.
         self._loading_older = False
@@ -6145,33 +6285,147 @@ class _SessionDetailPanel(QFrame):
             on_done=_finish_recenter,
         )
 
-    def _slide_window_down(self) -> None:
+    def _slide_window_down(
+        self,
+        *,
+        finish_transaction: bool | None = None,
+        hide_overlay_on_release: bool = False,
+    ) -> bool:
         """Edge slide: append the next half-window of blocks and drop the
         same number from the top, with pixel-level scroll compensation so
         the user's visible content stays put. ``_window_end`` is in *view*
         coordinates — when a filter is active this slides through the
-        next half-window of MATCHES, not raw blocks."""
+        next half-window of MATCHES, not raw blocks.
+
+        Returns True when release is deferred to an event-loop settle pass.
+        """
         view_n = self._view_size()
         if self._window_end >= view_n:
             self._maybe_request_newer()
-            return
+            return False
         next_end = min(self._window_end + _WINDOW_HALF, view_n)
         new_start = max(0, next_end - _WINDOW_SIZE)
 
-        drop_count = new_start - self._window_start
-        scrollbar = self._timeline_scroll.verticalScrollBar()
-        prev_value = scrollbar.value()
-        if drop_count > 0:
-            removed_height = self._drop_widgets_at(list(range(drop_count - 1, -1, -1)))
-            self._suppress_edge_slide = True
-            scrollbar.setValue(max(0, prev_value - removed_height))
-            self._suppress_edge_slide = False
+        started_transaction = not self._timeline_scroll_locked()
+        should_finish_transaction = (
+            started_transaction
+            if finish_transaction is None
+            else bool(finish_transaction)
+        )
+        self._suppress_edge_slide = True
+        if started_transaction:
+            self._start_paging_scroll_transaction()
+        else:
+            self._scroll_throttle.stop()
+            self._flush_timeline_wheel_input()
 
-        self._build_window_widgets(self._window_end, next_end, prepend=False)
-        self._window_start = new_start
-        self._window_end = next_end
-        self._refresh_status_label()
-        self._refresh_minimap()
+        raw_scroll = self._timeline_scroll.verticalScrollBar().value()
+        anchor_widget = self._topmost_visible_widget_at_or_after_view_pos(new_start)
+        anchor_block_index: int | None = None
+        anchor_offset = 0
+        if anchor_widget is not None:
+            candidate = anchor_widget.property("blockIndex")
+            if isinstance(candidate, int):
+                anchor_block_index = candidate
+                anchor_offset = raw_scroll - anchor_widget.y()
+
+        drop_count = new_start - self._window_start
+        removed_height = 0
+        try:
+            if drop_count > 0:
+                removed_height = self._drop_widgets_at(
+                    list(range(drop_count - 1, -1, -1))
+                )
+
+            self._build_window_widgets(self._window_end, next_end, prepend=False)
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+            self._window_start = new_start
+            self._window_end = next_end
+            self._refresh_status_label()
+            self._schedule_paging_minimap_refresh()
+        except Exception:
+            if should_finish_transaction:
+                self._finish_paging_scroll_transaction()
+            self._suppress_edge_slide = False
+            raise
+        else:
+            self._schedule_downward_slide_release(
+                finish_transaction=should_finish_transaction,
+                hide_overlay=hide_overlay_on_release,
+                expected_window=(new_start, next_end),
+                anchor_block_index=anchor_block_index,
+                anchor_offset=anchor_offset,
+                fallback_scroll=max(0, raw_scroll - removed_height),
+            )
+        return True
+
+    def _schedule_downward_slide_release(
+        self,
+        *,
+        finish_transaction: bool,
+        hide_overlay: bool,
+        expected_window: tuple[int, int],
+        anchor_block_index: int | None,
+        anchor_offset: int,
+        fallback_scroll: int,
+        remaining_passes: int = _PREPEND_ANCHOR_SETTLE_PASSES,
+        token: int | None = None,
+        only_if_scroll_at: int | None = None,
+    ) -> None:
+        if token is None:
+            token = self._render_token
+        if token != self._render_token:
+            return
+        if (self._window_start, self._window_end) != expected_window:
+            return
+        if only_if_scroll_at is not None:
+            current = self._timeline_scroll.verticalScrollBar().value()
+            if abs(current - only_if_scroll_at) > _PREPEND_ANCHOR_SCROLL_TOLERANCE:
+                if finish_transaction:
+                    self._finish_paging_scroll_transaction()
+                self._suppress_edge_slide = False
+                if hide_overlay:
+                    self._hide_timeline_overlay()
+                self._schedule_paging_minimap_refresh()
+                return
+        if anchor_block_index is not None:
+            target = self._set_prepend_anchor_scroll(
+                anchor_block_index, anchor_offset, fallback_scroll
+            )
+        else:
+            bar = self._timeline_scroll.verticalScrollBar()
+            target = max(0, min(fallback_scroll, bar.maximum()))
+            bar.setValue(target)
+        if remaining_passes > 1:
+            QTimer.singleShot(
+                0,
+                lambda ft=finish_transaction,
+                hide=hide_overlay,
+                win=expected_window,
+                b=anchor_block_index,
+                off=anchor_offset,
+                raw=fallback_scroll,
+                p=remaining_passes - 1,
+                t=token,
+                last=target: self._schedule_downward_slide_release(
+                    finish_transaction=ft,
+                    hide_overlay=hide,
+                    expected_window=win,
+                    anchor_block_index=b,
+                    anchor_offset=off,
+                    fallback_scroll=raw,
+                    remaining_passes=p,
+                    token=t,
+                    only_if_scroll_at=last,
+                ),
+            )
+            return
+        if finish_transaction:
+            self._finish_paging_scroll_transaction()
+        self._suppress_edge_slide = False
+        if hide_overlay:
+            self._hide_timeline_overlay()
 
     def _slide_window_up(self) -> None:
         if self._window_start <= 0:
@@ -6211,6 +6465,7 @@ class _SessionDetailPanel(QFrame):
             )
 
         self._suppress_edge_slide = True
+        self._start_paging_scroll_transaction()
         try:
             self._build_window_widgets(
                 new_start, self._window_start, prepend=True
@@ -6267,7 +6522,7 @@ class _SessionDetailPanel(QFrame):
         self._pending_older_anchor = self._capture_prepend_anchor()
         self._loading_older = True
         self._suppress_edge_slide = True
-        self._scroll_throttle.stop()
+        self._start_paging_scroll_transaction()
         self.older_history_requested.emit(
             self._loaded_session_id, new_offset, page_limit
         )
@@ -6291,7 +6546,7 @@ class _SessionDetailPanel(QFrame):
             return
         self._loading_newer = True
         self._suppress_edge_slide = True
-        self._scroll_throttle.stop()
+        self._start_paging_scroll_transaction()
         self._show_timeline_overlay(self._translator("Loading timeline..."))
         self.newer_history_requested.emit(self._loaded_session_id, offset, limit)
 
@@ -6301,11 +6556,15 @@ class _SessionDetailPanel(QFrame):
         the manager surfaces an error."""
         self._loading_older = False
         self._pending_older_anchor = None
+        self._end_paging_input_quarantine()
+        self._paging_wheel_seen_during_lock = False
         self._suppress_edge_slide = False
         self._hide_timeline_overlay()
 
     def cancel_pending_newer(self) -> None:
         self._loading_newer = False
+        self._end_paging_input_quarantine()
+        self._paging_wheel_seen_during_lock = False
         self._suppress_edge_slide = False
         self._hide_timeline_overlay()
 
@@ -6351,6 +6610,7 @@ class _SessionDetailPanel(QFrame):
             # same request infinitely if the manager returned empty.
             self._loaded_offset = max(0, min(self._loaded_offset, sql_offset))
             self._pending_older_anchor = None
+            self._finish_paging_scroll_transaction()
             self._suppress_edge_slide = False
             self._hide_timeline_overlay()
             return
@@ -6363,6 +6623,7 @@ class _SessionDetailPanel(QFrame):
             self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
             self._timeline_item_count = len(self._all_timeline_items)
             self._pending_older_anchor = None
+            self._finish_paging_scroll_transaction()
             self._suppress_edge_slide = False
             self._hide_timeline_overlay()
             return
@@ -6416,6 +6677,7 @@ class _SessionDetailPanel(QFrame):
                 if token != self._render_token:
                     return
                 self._timeline_scroll.verticalScrollBar().setValue(0)
+                self._finish_paging_scroll_transaction()
                 self._suppress_edge_slide = False
                 self._refresh_status_label()
                 self._hide_timeline_overlay()
@@ -6480,6 +6742,7 @@ class _SessionDetailPanel(QFrame):
                 hide_overlay=False,
             )
         else:
+            self._finish_paging_scroll_transaction()
             self._suppress_edge_slide = False
             self._refresh_status_label()
             self._hide_timeline_overlay()
@@ -6500,6 +6763,7 @@ class _SessionDetailPanel(QFrame):
         self._loading_newer = False
         if not items:
             self._timeline_total = max(self._timeline_total, total)
+            self._finish_paging_scroll_transaction()
             self._suppress_edge_slide = False
             self._hide_timeline_overlay()
             return
@@ -6511,6 +6775,7 @@ class _SessionDetailPanel(QFrame):
             items = items[skip:]
         if not items:
             self._timeline_total = max(self._timeline_total, total)
+            self._finish_paging_scroll_transaction()
             self._suppress_edge_slide = False
             self._hide_timeline_overlay()
             return
@@ -6527,15 +6792,21 @@ class _SessionDetailPanel(QFrame):
             if kind == "single" and payload.type == "message:user"
         ]
         self._recompute_filtered_view()
+        release_deferred = False
         try:
             if was_at_loaded_bottom and self._view_size() > old_view_size:
-                self._slide_window_down()
+                release_deferred = self._slide_window_down(
+                    finish_transaction=True,
+                    hide_overlay_on_release=True,
+                )
             else:
                 self._refresh_status_label()
                 self._schedule_paging_minimap_refresh()
         finally:
-            self._suppress_edge_slide = False
-            self._hide_timeline_overlay()
+            if not release_deferred:
+                self._finish_paging_scroll_transaction()
+                self._suppress_edge_slide = False
+                self._hide_timeline_overlay()
 
     def replace_timeline_page(
         self,
@@ -6600,6 +6871,7 @@ class _SessionDetailPanel(QFrame):
                         self._scroll_to_block_center_and_release(b, token=t),
                 )
                 return
+            self._finish_paging_scroll_transaction()
             self._suppress_edge_slide = False
             self._refresh_status_label()
             self._refresh_minimap()
@@ -6626,6 +6898,28 @@ class _SessionDetailPanel(QFrame):
                 continue
             if widget.y() + widget.height() > viewport_top:
                 return widget
+        return None
+
+    def _topmost_visible_widget_at_or_after_view_pos(
+        self, min_view_pos: int
+    ) -> QWidget | None:
+        """Topmost visible bubble that will survive a forward window slide."""
+        bar = self._timeline_scroll.verticalScrollBar()
+        viewport_top = bar.value()
+        for i in range(self._timeline_layout.count() - 1):
+            item = self._timeline_layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is None or widget.isHidden():
+                continue
+            if widget.y() + widget.height() <= viewport_top:
+                continue
+            block_index = widget.property("blockIndex")
+            if not isinstance(block_index, int):
+                continue
+            view_pos = self._view_pos_for_block(block_index)
+            if view_pos is None or view_pos < min_view_pos:
+                continue
+            return widget
         return None
 
     def _anchor_id_for_widget(self, widget: QWidget | None) -> str | None:
@@ -6695,6 +6989,7 @@ class _SessionDetailPanel(QFrame):
         if only_if_scroll_at is not None and not hide_overlay:
             current = self._timeline_scroll.verticalScrollBar().value()
             if abs(current - only_if_scroll_at) > _PREPEND_ANCHOR_SCROLL_TOLERANCE:
+                self._finish_paging_scroll_transaction()
                 self._suppress_edge_slide = False
                 self._schedule_paging_minimap_refresh()
                 return
@@ -6725,7 +7020,9 @@ class _SessionDetailPanel(QFrame):
                 ),
             )
             return
-        self._suppress_edge_slide = False
+        final_settle = remaining_passes <= 1
+        self._finish_paging_scroll_transaction(final=final_settle)
+        self._suppress_edge_slide = not final_settle
         self._refresh_status_label()
         if hide_overlay:
             self._hide_timeline_overlay()
@@ -6779,7 +7076,7 @@ class _SessionDetailPanel(QFrame):
 
     def _on_scroll_changed(self, _value: int) -> None:
         self._schedule_minimap_refresh()
-        if self._suppress_edge_slide:
+        if self._timeline_scroll_locked():
             return
         self._scroll_throttle.start()
 
@@ -6794,6 +7091,7 @@ class _SessionDetailPanel(QFrame):
         # exact widget geometry scan can wait a beat; the rail cannot.
         if self._minimap_refresh_timer.isActive():
             self._minimap_refresh_timer.stop()
+        self._navigator.suspend_drag_until_release()
         self._refresh_minimap_fast()
         self._schedule_minimap_refresh(_PAGING_MINIMAP_REFRESH_DELAY_MS)
 
@@ -6919,6 +7217,7 @@ class _SessionDetailPanel(QFrame):
             try:
                 on_anchor()
             finally:
+                self._finish_paging_scroll_transaction()
                 self._suppress_edge_slide = False
             self._hide_timeline_overlay()
             self._refresh_status_label()
@@ -7062,6 +7361,8 @@ class _SessionDetailPanel(QFrame):
         return None
 
     def _set_scrollbar_value_from_minimap(self, target: int) -> None:
+        if self._timeline_scroll_locked():
+            return
         scrollbar = self._timeline_scroll.verticalScrollBar()
         clamped = max(0, min(int(target), scrollbar.maximum()))
         self._suppress_edge_slide = True
@@ -7096,6 +7397,7 @@ class _SessionDetailPanel(QFrame):
         try:
             self._scroll_to_block_center(block_index)
         finally:
+            self._finish_paging_scroll_transaction()
             self._suppress_edge_slide = False
         self._refresh_status_label()
         self._refresh_minimap()
@@ -7209,6 +7511,8 @@ class _TimelineNavigatorRail(QFrame):
         self._viewport_height = 0
         self._scroll_maximum = 0
         self._hover_marker_index: int | None = None
+        self._dragging = False
+        self._drag_suspended_until_release = False
 
     def set_viewport(
         self,
@@ -7226,6 +7530,18 @@ class _TimelineNavigatorRail(QFrame):
         self._scroll_maximum = max(0, int(scroll_maximum))
         self._hover_marker_index = None
         self.update()
+
+    def suspend_drag_until_release(self) -> None:
+        """Freeze the current minimap drag after a page rebase.
+
+        The rail's coordinate system changes when the timeline window is
+        rebuilt. Continuing to emit move events from the old mouse-down
+        gesture would reinterpret the same cursor position against a new
+        scroll range and can immediately page again. The next mouse press
+        starts a fresh gesture in the updated coordinates.
+        """
+        if self._dragging:
+            self._drag_suspended_until_release = True
 
     def _scale(self) -> float:
         return float(max(self.height(), 1)) / float(max(self._content_height, 1))
@@ -7343,6 +7659,8 @@ class _TimelineNavigatorRail(QFrame):
     def mousePressEvent(self, event):  # noqa: N802 - Qt naming
         if event.button() != Qt.LeftButton:
             return super().mousePressEvent(event)
+        self._dragging = True
+        self._drag_suspended_until_release = False
         y = event.position().toPoint().y()
         self.scroll_value_requested.emit(self._target_value_for_y(y))
         self._update_hover_tooltip(y, event)
@@ -7351,9 +7669,18 @@ class _TimelineNavigatorRail(QFrame):
     def mouseMoveEvent(self, event):  # noqa: N802 - Qt naming
         y = event.position().toPoint().y()
         if event.buttons() & Qt.LeftButton:
-            self.scroll_value_requested.emit(self._target_value_for_y(y))
+            if not self._drag_suspended_until_release:
+                self.scroll_value_requested.emit(self._target_value_for_y(y))
             event.accept()
         self._update_hover_tooltip(y, event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt naming
+        if event.button() != Qt.LeftButton:
+            return super().mouseReleaseEvent(event)
+        self._dragging = False
+        self._drag_suspended_until_release = False
+        self._update_hover_tooltip(event.position().toPoint().y(), event)
+        event.accept()
 
     def leaveEvent(self, event):  # noqa: N802 - Qt naming
         self._hover_marker_index = None

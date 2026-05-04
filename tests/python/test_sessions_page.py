@@ -14,7 +14,16 @@ sys.path.insert(0, str(ROOT / "src" / "CodexQuotaViewerWindows.Qt"))
 from typing import Any  # noqa: E402
 
 import pytest  # noqa: E402
-from PySide6.QtCore import QEvent, QModelIndex, QPoint, Qt  # noqa: E402
+from PySide6.QtCore import (  # noqa: E402
+    QCoreApplication,
+    QEvent,
+    QModelIndex,
+    QObject,
+    QPoint,
+    QPointF,
+    Qt,
+)
+from PySide6.QtGui import QMouseEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from codex_quota_viewer.localization import translate  # noqa: E402
@@ -1088,6 +1097,107 @@ def _wait_detail_panel_ready(panel, *, timeout: float = 5.0) -> None:
     raise AssertionError("detail panel did not settle")
 
 
+def test_paging_completion_quarantines_continuous_wheel_until_settle() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("paging-wheel-quarantine")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+
+    panel._maybe_request_older()
+    assert panel._should_consume_timeline_wheel(_WheelEvent(120))
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"older item {i}",
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+    app.processEvents()
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    before = scrollbar.value()
+
+    assert panel._paging_input_quarantine is True
+    assert panel._should_consume_timeline_wheel(_WheelEvent(120))
+    assert panel.eventFilter(panel._timeline_scroll.viewport(), _WheelEvent(120))
+    assert scrollbar.value() == before
+
+    _wait_detail_panel_ready(panel)
+    assert panel._paging_input_quarantine is True
+    panel._end_paging_input_quarantine()
+    assert not panel._should_consume_timeline_wheel(_WheelEvent(120))
+    panel.close()
+
+
+def test_paging_start_flushes_posted_timeline_wheel_events() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("paging-flush-wheel")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    viewport = panel._timeline_scroll.viewport()
+    seen: list[QEvent.Type] = []
+
+    class WheelProbe(QObject):
+        def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+            if event.type() == QEvent.Wheel:
+                seen.append(event.type())
+            return False
+
+    probe = WheelProbe(panel)
+    viewport.installEventFilter(probe)
+    QCoreApplication.postEvent(viewport, QEvent(QEvent.Wheel))
+
+    panel._maybe_request_older()
+    app.processEvents()
+
+    assert seen == []
+    assert panel._paging_input_quarantine is True
+    panel.close()
+
+
 def test_first_upward_wheel_at_static_top_requests_older_history() -> None:
     from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
     from codex_quota_viewer.sessions_page import _SessionDetailPanel
@@ -1674,6 +1784,258 @@ def test_downward_wheel_at_static_bottom_requests_newer_history() -> None:
     panel.close()
 
 
+def test_downward_window_slide_flushes_posted_timeline_wheel_events() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("down-flush-wheel")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    viewport = panel._timeline_scroll.viewport()
+    seen: list[QEvent.Type] = []
+
+    class WheelProbe(QObject):
+        def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+            if event.type() == QEvent.Wheel:
+                seen.append(event.type())
+            return False
+
+    probe = WheelProbe(panel)
+    viewport.installEventFilter(probe)
+    QCoreApplication.postEvent(viewport, QEvent(QEvent.Wheel))
+
+    old_window = (panel._window_start, panel._window_end)
+    panel._slide_window_down()
+    app.processEvents()
+
+    assert seen == []
+    assert (panel._window_start, panel._window_end) != old_window
+    assert panel._window_start > old_window[0]
+    panel.close()
+
+
+def test_downward_window_slide_quarantines_wheel_seen_during_transaction() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("down-quarantine-wheel")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    original_build = panel._build_window_widgets
+
+    def build_with_wheel(*args, **kwargs):
+        assert panel._should_consume_timeline_wheel(_WheelEvent(-120))
+        return original_build(*args, **kwargs)
+
+    panel._build_window_widgets = build_with_wheel  # type: ignore[method-assign]
+
+    panel._slide_window_down()
+
+    assert panel._paging_input_quarantine is True
+    assert panel._suppress_edge_slide is True
+    _wait_detail_panel_ready(panel)
+    assert panel._paging_input_quarantine is True
+    panel._end_paging_input_quarantine()
+    assert not panel._should_consume_timeline_wheel(_WheelEvent(-120))
+    panel.close()
+
+
+def test_downward_window_slide_keeps_edge_suppressed_until_layout_settles() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("down-settle-lock")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._scroll_throttle.stop()
+
+    panel._slide_window_down()
+    panel._on_scroll_changed(panel._timeline_scroll.verticalScrollBar().maximum())
+
+    assert panel._suppress_edge_slide is True
+    assert not panel._scroll_throttle.isActive()
+    _wait_detail_panel_ready(panel)
+    assert panel._suppress_edge_slide is False
+    panel.close()
+
+
+def test_downward_window_slide_restores_retained_visible_anchor_after_layout() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+    from PySide6.QtWidgets import QWidget
+
+    QApplication.instance() or QApplication([])
+    rec = _record("down-anchor-restore")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 5000)
+    scrollbar.setValue(1400)
+    fake_top = QWidget()
+    fake_top.move(0, 320)
+    fake_top.setProperty("blockIndex", 80)
+    panel._topmost_visible_widget_at_or_after_view_pos = (  # type: ignore[method-assign]
+        lambda _min_view_pos: fake_top
+    )
+    captured: list[tuple[int, int, int]] = []
+
+    def stub_set(block_index: int, offset: int, raw_scroll: int) -> int:
+        captured.append((block_index, offset, raw_scroll))
+        target = min(777, scrollbar.maximum())
+        scrollbar.setValue(target)
+        return target
+
+    panel._set_prepend_anchor_scroll = stub_set  # type: ignore[method-assign]
+
+    panel._slide_window_down()
+    _wait_detail_panel_ready(panel)
+
+    assert captured
+    assert captured[0][:2] == (80, 1080)
+    assert panel._suppress_edge_slide is False
+    panel.close()
+
+
+def test_scrollbar_changes_during_input_quarantine_do_not_arm_edge_slide() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("quarantine-scrollbar")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._scroll_throttle.stop()
+    panel._begin_paging_input_quarantine()
+    panel._suppress_edge_slide = False
+    panel._slide_window_down = Mock()  # type: ignore[method-assign]
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 2000)
+
+    panel._on_scroll_changed(scrollbar.maximum())
+
+    assert not panel._scroll_throttle.isActive()
+    panel._end_paging_input_quarantine()
+    panel._on_scroll_settled()
+    panel._slide_window_down.assert_not_called()
+    panel.close()
+
+
+def test_downward_window_slide_suspends_active_minimap_drag() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("down-minimap-drag")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._navigator._dragging = True
+    panel._navigator._drag_suspended_until_release = False
+
+    panel._slide_window_down()
+
+    assert panel._navigator._drag_suspended_until_release is True
+    panel.close()
+
+
 def test_prepend_older_anchors_to_topmost_visible_bubble() -> None:
     """Older-page prepend must anchor the scroll restore onto the bubble
     that was at the viewport top — not snap to the active user prompt.
@@ -2167,6 +2529,98 @@ def test_minimap_click_scrolls_current_window_without_recentering() -> None:
     assert panel._scroll_throttle.isActive()
     assert not panel._timeline_overlay.isVisible()
     panel.close()
+
+
+def test_minimap_ignores_drag_requests_while_scroll_locked() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("navigator-locked")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(120)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 2000)
+    scrollbar.setValue(100)
+    panel._scroll_throttle.stop()
+
+    panel._suppress_edge_slide = True
+    panel._set_scrollbar_value_from_minimap(1500)
+
+    assert scrollbar.value() == 100
+    assert not panel._scroll_throttle.isActive()
+    panel.close()
+
+
+def test_minimap_drag_suspended_after_paging_refresh_until_release() -> None:
+    from codex_quota_viewer.sessions_page import _TimelineNavigatorRail
+
+    QApplication.instance() or QApplication([])
+    rail = _TimelineNavigatorRail()
+    rail.resize(22, 300)
+    rail.set_viewport(
+        [],
+        content_height=1200,
+        scroll_value=0,
+        viewport_height=200,
+        scroll_maximum=1000,
+    )
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    def event(
+        event_type: QEvent.Type,
+        y: int,
+        *,
+        button: Qt.MouseButton = Qt.LeftButton,
+        buttons: Qt.MouseButton = Qt.LeftButton,
+    ) -> QMouseEvent:
+        pos = QPointF(11, y)
+        return QMouseEvent(
+            event_type,
+            pos,
+            pos,
+            pos,
+            button,
+            buttons,
+            Qt.NoModifier,
+        )
+
+    rail.mousePressEvent(event(QEvent.MouseButtonPress, 120))
+    assert len(emitted) == 1
+    assert rail._dragging is True
+
+    rail.suspend_drag_until_release()
+    rail.mouseMoveEvent(event(QEvent.MouseMove, 260))
+    assert len(emitted) == 1
+    assert rail._drag_suspended_until_release is True
+
+    rail.mouseReleaseEvent(
+        event(QEvent.MouseButtonRelease, 260, buttons=Qt.NoButton)
+    )
+    assert rail._dragging is False
+    assert rail._drag_suspended_until_release is False
+
+    rail.mousePressEvent(event(QEvent.MouseButtonPress, 180))
+    assert len(emitted) == 2
+    rail.close()
 
 
 def test_timeline_navigator_edge_drag_slides_window() -> None:
@@ -3338,12 +3792,90 @@ def test_time_travel_role_for_block_classifies_all_kinds() -> None:
 
     user = SessionTimelineItem(id="u", type="message:user", timestamp="t", text="x")
     asst = SessionTimelineItem(id="a", type="message:assistant", timestamp="t", text="x")
-    tool = SessionTimelineItem(id="c", type="tool_call", timestamp="t", tool_name="bash")
+    tool = SessionTimelineItem(
+        id="t", type="tool_call", timestamp="t", tool_name="read_file"
+    )
+    command = SessionTimelineItem(
+        id="c", type="tool_call", timestamp="t", tool_name="shell_command"
+    )
 
     assert _role_for_block(("single", user)) == "user"
     assert _role_for_block(("single", asst)) == "assistant"
     assert _role_for_block(("single", tool)) == "tool"
+    assert _role_for_block(("single", command)) == "command"
     assert _role_for_block(("tool_group", [tool, tool])) == "tool_group"
+    assert _role_for_block(("tool_group", [command, command])) == "command"
+
+
+def test_time_travel_defaults_hide_tool_calls_and_commands() -> None:
+    from codex_quota_viewer.sessions.models import SessionTimelineItem
+    from codex_quota_viewer.sessions_page import (
+        _TT_ROLE_ROLE,
+        _TimeTravelVerticalView,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    blocks = _coalesce_timeline_blocks(
+        [
+            SessionTimelineItem(
+                id="u",
+                type="message:user",
+                timestamp="2026-01-01T00:00:00Z",
+                text="user",
+            ),
+            SessionTimelineItem(
+                id="a",
+                type="message:assistant",
+                timestamp="2026-01-01T00:00:01Z",
+                text="assistant",
+            ),
+            SessionTimelineItem(
+                id="t",
+                type="tool_call",
+                timestamp="2026-01-01T00:00:02Z",
+                tool_name="read_file",
+                summary="tool",
+            ),
+            SessionTimelineItem(
+                id="a2",
+                type="message:assistant",
+                timestamp="2026-01-01T00:00:03Z",
+                text="separator",
+            ),
+            SessionTimelineItem(
+                id="c",
+                type="tool_call",
+                timestamp="2026-01-01T00:00:04Z",
+                tool_name="shell_command",
+                summary="command",
+            ),
+        ]
+    )
+
+    view = _TimeTravelVerticalView(translator=lambda s: s)
+    view.refresh(blocks, None, None)
+
+    assert view._kind_chips["user"].isChecked()
+    assert view._kind_chips["assistant"].isChecked()
+    assert not view._kind_chips["tool"].isChecked()
+    assert not view._kind_chips["command"].isChecked()
+
+    roles: list[str] = []
+    for row in range(view._proxy.rowCount()):
+        proxy_idx = view._proxy.index(row, 0)
+        source_idx = view._proxy.mapToSource(proxy_idx)
+        roles.append(source_idx.data(_TT_ROLE_ROLE))
+    assert roles == ["user", "assistant", "assistant"]
+
+    view._kind_chips["command"].setChecked(True)
+    roles = []
+    for row in range(view._proxy.rowCount()):
+        proxy_idx = view._proxy.index(row, 0)
+        source_idx = view._proxy.mapToSource(proxy_idx)
+        roles.append(source_idx.data(_TT_ROLE_ROLE))
+    assert "command" in roles
+    assert "tool" not in roles
 
 
 def test_time_travel_vertical_view_chip_toggles_filter_rows() -> None:
