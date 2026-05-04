@@ -190,6 +190,9 @@ ZH_HANS: dict[str, str] = {
     "Failed to save image: {error}": "保存图像失败：{error}",
     "Image files ({extensions})": "图像文件（{extensions}）",
     "All files (*)": "所有文件 (*)",
+    "Open file": "打开文件",
+    "Show in folder": "在文件夹中打开",
+    "Failed to open folder: {error}": "打开文件夹失败：{error}",
 }
 
 

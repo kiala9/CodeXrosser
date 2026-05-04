@@ -8897,6 +8897,20 @@ def _file_icon() -> QIcon:
     )
 
 
+def _folder_icon() -> QIcon:
+    """Lucide Folder — used by the "show in folder" attachment action."""
+    return _icon_from_svg(
+        """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+          <g fill="none" stroke="#c6d3e1" stroke-width="2.25"
+             stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>
+          </g>
+        </svg>
+        """
+    )
+
+
 def _reset_icon() -> QIcon:
     """Lucide RotateCcw — reset/undo action (clears the active filters)."""
     return _icon_from_svg(
@@ -9869,6 +9883,7 @@ class _ImageCard(_AttachmentCard):
         return _t("Image")
 
     def _build_action_buttons(self) -> list[QToolButton]:
+        buttons: list[QToolButton] = []
         open_button = QToolButton(self)
         open_button.setObjectName("SessionsAttachmentToolButton")
         open_button.setIcon(_zoom_in_icon())
@@ -9876,6 +9891,22 @@ class _ImageCard(_AttachmentCard):
         open_button.setCursor(QCursor(Qt.PointingHandCursor))
         open_button.setToolTip(_t("Open in system viewer"))
         open_button.clicked.connect(self._open_in_system_viewer)
+        buttons.append(open_button)
+
+        # Show "reveal in folder" only when the attachment carries a
+        # local source path. Payload images backed solely by data-URI
+        # bytes have no useful folder to reveal — the temp cache file
+        # we materialise would land the user in ``%TEMP%/cqv-image-cache``
+        # which isn't what they meant by "show in folder".
+        if self._attachment.path:
+            reveal_button = QToolButton(self)
+            reveal_button.setObjectName("SessionsAttachmentToolButton")
+            reveal_button.setIcon(_folder_icon())
+            reveal_button.setIconSize(QSize(14, 14))
+            reveal_button.setCursor(QCursor(Qt.PointingHandCursor))
+            reveal_button.setToolTip(_t("Show in folder"))
+            reveal_button.clicked.connect(self._reveal_source)
+            buttons.append(reveal_button)
 
         download_button = QToolButton(self)
         download_button.setObjectName("SessionsAttachmentToolButton")
@@ -9884,7 +9915,29 @@ class _ImageCard(_AttachmentCard):
         download_button.setCursor(QCursor(Qt.PointingHandCursor))
         download_button.setToolTip(_t("Download image"))
         download_button.clicked.connect(self._save_image)
-        return [open_button, download_button]
+        buttons.append(download_button)
+        return buttons
+
+    def _reveal_source(self) -> None:
+        path_value = self._attachment.path
+        if not path_value:
+            return
+        candidate = Path(path_value)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        if not candidate.exists():
+            QMessageBox.warning(
+                self,
+                _t("Show in folder"),
+                _t("Failed to open folder: {error}").format(error=str(candidate)),
+            )
+            return
+        if not _reveal_in_file_manager(candidate):
+            QMessageBox.warning(
+                self,
+                _t("Show in folder"),
+                _t("Failed to open folder: {error}").format(error=str(candidate)),
+            )
 
     def _build_body(self) -> QWidget | None:
         body = _ImageBody(self._open_in_system_viewer, self)
@@ -10029,12 +10082,17 @@ class _ImageCard(_AttachmentCard):
 
 
 class _FileCard(_AttachmentCard):
-    """Forward-looking placeholder card for non-image file attachments.
+    """Card for non-image file attachments.
 
-    Codex Desktop does not currently emit ``input_file`` content parts in
-    session JSONL, but the parser already accepts the shape so when the
-    payload appears we can render it without re-architecting. The card
-    shows a name + MIME row and a single download button.
+    Today this fires primarily for Codex Desktop's @-file mention markdown
+    (parser lifts those into ``Attachment(kind="file", path=...)``). Will
+    also catch any future ``input_file`` content parts the upstream
+    serialisation grows.
+
+    Header carries the filename; body shows the source path. Two action
+    buttons: open (hands the path to ``QDesktopServices`` for OS-default
+    handling) and download (copy source → user-chosen destination, or
+    write decoded data-URI bytes when the attachment is inline).
     """
 
     def _header_icon(self) -> QIcon:
@@ -10044,6 +10102,25 @@ class _FileCard(_AttachmentCard):
         return self._attachment.name or _t("Attachment")
 
     def _build_action_buttons(self) -> list[QToolButton]:
+        buttons: list[QToolButton] = []
+        if self._attachment.path:
+            open_button = QToolButton(self)
+            open_button.setObjectName("SessionsAttachmentToolButton")
+            open_button.setIcon(_zoom_in_icon())
+            open_button.setIconSize(QSize(14, 14))
+            open_button.setCursor(QCursor(Qt.PointingHandCursor))
+            open_button.setToolTip(_t("Open file"))
+            open_button.clicked.connect(self._open_file)
+            buttons.append(open_button)
+
+            reveal_button = QToolButton(self)
+            reveal_button.setObjectName("SessionsAttachmentToolButton")
+            reveal_button.setIcon(_folder_icon())
+            reveal_button.setIconSize(QSize(14, 14))
+            reveal_button.setCursor(QCursor(Qt.PointingHandCursor))
+            reveal_button.setToolTip(_t("Show in folder"))
+            reveal_button.clicked.connect(self._reveal_source)
+            buttons.append(reveal_button)
         download_button = QToolButton(self)
         download_button.setObjectName("SessionsAttachmentToolButton")
         download_button.setIcon(_download_icon())
@@ -10051,13 +10128,56 @@ class _FileCard(_AttachmentCard):
         download_button.setCursor(QCursor(Qt.PointingHandCursor))
         download_button.setToolTip(_t("Download image"))
         download_button.clicked.connect(self._save_file)
-        return [download_button]
+        buttons.append(download_button)
+        return buttons
+
+    def _reveal_source(self) -> None:
+        path_value = self._attachment.path
+        if not path_value:
+            return
+        candidate = Path(path_value)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        if not candidate.exists():
+            QMessageBox.warning(
+                self,
+                _t("Show in folder"),
+                _t("Failed to open folder: {error}").format(error=str(candidate)),
+            )
+            return
+        if not _reveal_in_file_manager(candidate):
+            QMessageBox.warning(
+                self,
+                _t("Show in folder"),
+                _t("Failed to open folder: {error}").format(error=str(candidate)),
+            )
 
     def _build_body(self) -> QWidget | None:
-        info = QLabel(self._attachment.mime, self)
+        # Show the path when present (the @-mention markdown case);
+        # fall back to MIME-only when there's no path (data-URI inline
+        # file attachments — currently rare in practice).
+        text = self._attachment.path or self._attachment.mime
+        info = QLabel(text, self)
         info.setObjectName("SessionsAttachmentCaption")
         info.setWordWrap(True)
+        info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         return info
+
+    def _open_file(self) -> None:
+        path_value = self._attachment.path
+        if not path_value:
+            return
+        candidate = Path(path_value)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        if not candidate.exists():
+            QMessageBox.warning(
+                self,
+                _t("Open file"),
+                _t("Failed to save image: {error}").format(error=str(candidate)),
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(candidate)))
 
     def _save_file(self) -> None:
         default_name = self._attachment.name or "attachment"
@@ -10069,17 +10189,49 @@ class _FileCard(_AttachmentCard):
         )
         if not save_path:
             return
+        # Prefer the inline data-URI when available (deterministic
+        # bytes); fall back to copying the source path. Either way the
+        # user gets a file at ``save_path``.
         if self._attachment.data_uri:
             decoded_bytes = _decode_data_uri_to_bytes(self._attachment.data_uri)
             if decoded_bytes is None:
-                QMessageBox.warning(self, _t("Save image"), _t("Failed to save image: {error}").format(error=save_path))
+                QMessageBox.warning(
+                    self,
+                    _t("Save image"),
+                    _t("Failed to save image: {error}").format(error=save_path),
+                )
                 return
             try:
                 Path(save_path).write_bytes(decoded_bytes)
             except OSError as exc:
                 QMessageBox.warning(
-                    self, _t("Save image"), _t("Failed to save image: {error}").format(error=str(exc))
+                    self,
+                    _t("Save image"),
+                    _t("Failed to save image: {error}").format(error=str(exc)),
                 )
+            return
+        path_value = self._attachment.path
+        if not path_value:
+            return
+        source = Path(path_value)
+        if not source.is_absolute():
+            source = Path.cwd() / source
+        if not source.exists():
+            QMessageBox.warning(
+                self,
+                _t("Save image"),
+                _t("Failed to save image: {error}").format(error=str(source)),
+            )
+            return
+        try:
+            import shutil
+            shutil.copyfile(str(source), save_path)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                _t("Save image"),
+                _t("Failed to save image: {error}").format(error=str(exc)),
+            )
 
 
 def _decode_data_uri_to_bytes(data_uri: str) -> bytes | None:
@@ -10093,6 +10245,36 @@ def _decode_data_uri_to_bytes(data_uri: str) -> bytes | None:
         return base64.b64decode(payload.encode("ascii", errors="ignore"), validate=False)
     except (binascii.Error, ValueError):
         return None
+
+
+def _reveal_in_file_manager(path: Path) -> bool:
+    """Open the OS file manager with ``path`` selected/highlighted.
+
+    On Windows this spawns ``explorer.exe /select,<path>`` which opens
+    File Explorer at the parent folder with the target file pre-
+    selected — the exact behaviour the user expects from
+    "show in folder". On other platforms there is no portable
+    select-file flag, so we fall back to opening the parent directory
+    via ``QDesktopServices``.
+
+    Returns ``True`` on best-effort success; the caller decides whether
+    to show an error toast on ``False``.
+    """
+    if sys.platform == "win32":
+        try:
+            import subprocess
+            # ``/select,<path>`` is a single explorer.exe argument with
+            # the comma separator; the path itself can contain spaces
+            # because subprocess passes it as one argv slot.
+            subprocess.Popen(  # noqa: S603 - explorer is a trusted shell
+                ["explorer.exe", f"/select,{path}"],
+                close_fds=True,
+            )
+            return True
+        except OSError:
+            return False
+    target = path.parent if path.is_file() else path
+    return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))))
 
 
 def _materialize_attachment_for_external_open(

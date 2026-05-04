@@ -589,6 +589,100 @@ def test_message_bubble_renders_file_card_for_file_attachment() -> None:
     assert len(file_cards) == 1
 
 
+def test_image_card_omits_reveal_button_for_data_uri_only_attachment() -> None:
+    """Payload images backed solely by base64 bytes have no source path,
+    so the "show in folder" button is hidden — revealing the temp cache
+    file would just land the user in ``%TEMP%/cqv-image-cache``."""
+    from PySide6.QtWidgets import QToolButton
+
+    QApplication.instance() or QApplication([])
+    attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri=_TEST_PNG_DATA_URI,
+        source="payload",
+    )
+    item = SessionTimelineItem(
+        id="m-no-reveal",
+        type="message:user",
+        timestamp="2026-04-28T05:10:14Z",
+        text="x",
+        attachments=(attachment,),
+    )
+    bubble = _MessageBubble(
+        "user", item.timestamp, item.text, parent=None, attachments=item.attachments
+    )
+    card = bubble.findChildren(_ImageCard)[0]
+    tooltips = {b.toolTip() for b in card.findChildren(QToolButton)}
+    assert "Show in folder" not in tooltips
+
+
+def test_image_card_reveal_invokes_helper_for_path_attachment(tmp_path, monkeypatch) -> None:
+    """When the attachment carries a local file path the reveal action
+    is wired up and clicking it invokes the reveal helper."""
+    QApplication.instance() or QApplication([])
+    fake_file = tmp_path / "icon.png"
+    fake_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+    attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        path=str(fake_file),
+        source="markdown",
+    )
+    item = SessionTimelineItem(
+        id="m-reveal",
+        type="message:user",
+        timestamp="2026-04-28T05:10:14Z",
+        text="see icon",
+        attachments=(attachment,),
+    )
+    bubble = _MessageBubble(
+        "user", item.timestamp, item.text, parent=None, attachments=item.attachments
+    )
+    card = bubble.findChildren(_ImageCard)[0]
+    reveal_calls: list[Path] = []
+    monkeypatch.setattr(
+        "codex_quota_viewer.sessions_page._reveal_in_file_manager",
+        lambda path: reveal_calls.append(path) or True,
+    )
+    card._reveal_source()
+    assert len(reveal_calls) == 1
+    assert reveal_calls[0] == fake_file
+
+
+def test_file_card_reveal_invokes_helper(tmp_path, monkeypatch) -> None:
+    """File-attachment cards always carry a path (extracted from the
+    Codex @-mention markdown), so the reveal button is always wired up."""
+    QApplication.instance() or QApplication([])
+    fake_file = tmp_path / "report.pdf"
+    fake_file.write_bytes(b"%PDF-1.4")
+    attachment = Attachment(
+        kind="file",
+        mime="application/pdf",
+        path=str(fake_file),
+        name="report.pdf",
+        source="markdown",
+    )
+    item = SessionTimelineItem(
+        id="m-file-reveal",
+        type="message:user",
+        timestamp="2026-04-28T05:10:14Z",
+        text="see report",
+        attachments=(attachment,),
+    )
+    bubble = _MessageBubble(
+        "user", item.timestamp, item.text, parent=None, attachments=item.attachments
+    )
+    card = bubble.findChildren(_FileCard)[0]
+    reveal_calls: list[Path] = []
+    monkeypatch.setattr(
+        "codex_quota_viewer.sessions_page._reveal_in_file_manager",
+        lambda path: reveal_calls.append(path) or True,
+    )
+    card._reveal_source()
+    assert reveal_calls == [fake_file]
+
+
 def test_sessions_page_real_target_archive_requires_confirmation(monkeypatch) -> None:
     QApplication.instance() or QApplication([])
     factory = _make_manager_factory([_record("session-real-1")])

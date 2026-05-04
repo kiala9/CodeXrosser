@@ -876,6 +876,210 @@ def test_repository_migrates_attachments_column_on_upgrade(tmp_path: Path) -> No
         repository.close()
 
 
+def test_jsonl_parser_extracts_files_mentioned_markdown(tmp_path: Path) -> None:
+    """Codex Desktop's @-file mention text block lifts into ``file``
+    attachments and the displayed text shrinks to the user's actual
+    request body."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="ffffffff-1111-2222-3333-444444444444",
+        started_at="2026-04-29T17:25:10Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": (
+                    "\n# Files mentioned by the user:\n\n"
+                    "## GPT-account.svg: E:/Download/GPT-account.svg\n\n"
+                    "## API-account.svg: E:/Download/API-account.svg\n\n"
+                    "## My request for Codex:\n"
+                    "两个SVG矢量图，替换之前的位图ICON\n"
+                ),
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    # Header + path lines stripped from displayed text — only the
+    # request body survives.
+    assert "Files mentioned by the user" not in item.text
+    assert "GPT-account.svg" not in item.text
+    assert "My request for Codex" not in item.text
+    assert "两个SVG矢量图" in item.text
+    # Two file attachments captured with name/path/mime preserved.
+    assert len(item.attachments) == 2
+    a, b = item.attachments
+    assert a.kind == "file" and a.name == "GPT-account.svg"
+    assert a.path == "E:/Download/GPT-account.svg"
+    assert a.mime == "image/svg+xml"
+    assert a.source == "markdown"
+    assert b.name == "API-account.svg"
+    assert b.path == "E:/Download/API-account.svg"
+
+
+def test_jsonl_parser_files_mentioned_no_request_body(tmp_path: Path) -> None:
+    """When the Codex transcript omits ``## My request for Codex:``
+    (file-only message) the request body is empty but attachments are
+    still captured."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="11111111-2222-3333-4444-555555555555",
+        started_at="2026-04-29T17:30:00Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": (
+                    "# Files mentioned by the user:\n\n"
+                    "## report.pdf: C:/Users/foo/report.pdf\n"
+                ),
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    assert item.text == ""
+    assert len(item.attachments) == 1
+    assert item.attachments[0].mime == "application/pdf"
+
+
+def test_jsonl_parser_files_mentioned_only_anchored_at_start(tmp_path: Path) -> None:
+    """User prose that quotes the marker mid-message should NOT be
+    rewritten — extraction only fires when the header is the first
+    thing in the text."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="22222222-3333-4444-5555-666666666666",
+        started_at="2026-04-29T17:35:00Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": (
+                    "let me show you what Codex emits:\n\n"
+                    "# Files mentioned by the user:\n"
+                    "## a.txt: /tmp/a.txt\n"
+                ),
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    # No leading header at the start → not extracted.
+    assert "Files mentioned by the user" in item.text
+    assert item.attachments == ()
+
+
+def test_jsonl_parser_strips_named_image_open_tag(tmp_path: Path) -> None:
+    """Codex Desktop sometimes emits ``<image name=[Image #1]>`` instead
+    of the bare ``<image>`` open tag. Both forms should be stripped
+    when adjacent to a real ``input_image``."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="33333333-4444-5555-6666-777777777777",
+        started_at="2026-04-29T07:57:30Z",
+        content=[
+            {"type": "input_text", "text": "test message"},
+            {"type": "input_text", "text": "<image name=[Image #1]>"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI},
+            {"type": "input_text", "text": "</image>"},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    assert "<image" not in item.text
+    assert "</image>" not in item.text
+    assert "test message" in item.text
+    assert len(item.attachments) == 1
+
+
+def test_jsonl_parser_dedupes_event_msg_response_item_with_files_mentioned(tmp_path: Path) -> None:
+    """Regression for the duplicate-bubble bug on session
+    019dce24-cd6b-7940-999e-2e801ed493ef:
+    Codex emits the same user turn twice (event_msg + response_item).
+    Without normalisation, the event_msg twin kept the raw "# Files
+    mentioned by the user:" markdown while the response_item twin had
+    it stripped, so they had different dedup keys and BOTH rendered.
+    """
+    codex_home, _ = _make_homes(tmp_path)
+    relative = build_fallback_relative_path("2026-04-29T07:57:30Z", "duplicate-id")
+    target = codex_home / "sessions" / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    file_mention_text = (
+        "\n# Files mentioned by the user:\n\n"
+        "## icon.png: C:/tmp/icon.png\n\n"
+        "## My request for Codex:\n"
+        "还是先暂时改用这个吧\n"
+    )
+    lines = [
+        json.dumps(
+            {
+                "type": "session_meta",
+                "timestamp": "2026-04-29T07:57:30Z",
+                "payload": {
+                    "id": "duplicate-id",
+                    "timestamp": "2026-04-29T07:57:30Z",
+                    "cwd": str(tmp_path),
+                    "originator": "vscode",
+                    "source": "vscode",
+                    "cli_version": "0.42.0",
+                    "model_provider": "openai",
+                },
+            }
+        ),
+        # response_item — earlier timestamp (sorts first).
+        json.dumps(
+            {
+                "type": "response_item",
+                "timestamp": "2026-04-29T07:57:30.933Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": file_mention_text},
+                        {"type": "input_text", "text": "<image name=[Image #1]>"},
+                        {"type": "input_image", "image_url": _PNG_1X1_DATA_URI},
+                        {"type": "input_text", "text": "</image>"},
+                    ],
+                },
+            }
+        ),
+        # event_msg twin — same logical message, slightly later timestamp.
+        json.dumps(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-04-29T07:57:30.936Z",
+                "payload": {"type": "user_message", "message": file_mention_text},
+            }
+        ),
+    ]
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    # Exactly one user bubble after dedup — both twins collapse.
+    assert len(user_items) == 1
+    item = user_items[0]
+    # The response_item version wins (earlier timestamp) so we keep
+    # both the file mention AND the structured image attachment.
+    assert item.text == "还是先暂时改用这个吧"
+    kinds = sorted(att.kind for att in item.attachments)
+    assert kinds == ["file", "image"]
+
+
 def test_repository_round_trips_attachments(tmp_path: Path) -> None:
     """Attachments survive the SQLite write/read cycle so the detail
     panel (which always pulls timeline items via ``list_timeline_page``)
