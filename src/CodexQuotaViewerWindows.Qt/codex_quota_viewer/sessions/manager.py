@@ -35,6 +35,7 @@ from .models import (
     SessionDetail,
     SessionFilters,
     SessionRecord,
+    SessionTimelineIndexItem,
     SessionTimelinePage,
 )
 from .paths import (
@@ -135,6 +136,10 @@ class SessionsManager:
             total=page.total,
             next_offset=page.next_offset,
         )
+
+    def get_session_timeline_index(self, session_id: str) -> list[SessionTimelineIndexItem]:
+        self._require_session(session_id)
+        return self.repository.list_timeline_index(session_id)
 
     def archive_session(self, session_id: str) -> SessionRecord:
         with self._mutation_lock:

@@ -9,10 +9,12 @@ from typing import Any, Iterable
 
 from ._perf import _perf_timer
 from .models import (
+    Attachment,
     AuditEntry,
     CatalogSessionEntry,
     SessionFilters,
     SessionRecord,
+    SessionTimelineIndexItem,
     SessionTimelineItem,
     SessionTimelinePage,
 )
@@ -286,7 +288,7 @@ class SessionRepository:
         rows = self._connection.execute(
             """
             select item_id, type, timestamp, text, tool_name, summary,
-                   input_text, output_text, status
+                   input_text, output_text, status, attachments_json
             from timeline_items
             where session_id = ?
             order by ordinal asc
@@ -321,7 +323,7 @@ class SessionRepository:
         rows = self._connection.execute(
             """
             select item_id, type, timestamp, text, tool_name, summary,
-                   input_text, output_text, status
+                   input_text, output_text, status, attachments_json
             from timeline_items
             where session_id = ?
             order by ordinal asc
@@ -343,6 +345,26 @@ class SessionRepository:
             (session_id,),
         ).fetchone()
         return int(row["count"] if row else 0)
+
+    def list_timeline_index(self, session_id: str) -> list[SessionTimelineIndexItem]:
+        # Lightweight Time Travel source. Keep the result bounded to fields
+        # needed by the popup, and slice large message/tool payloads in SQLite
+        # so opening the popup does not materialize the full timeline bodies.
+        rows = self._connection.execute(
+            """
+            select ordinal, item_id, type, timestamp,
+                   case
+                     when type = 'tool_call' then substr(coalesce(summary, tool_name, ''), 1, 240)
+                     else substr(coalesce(text, ''), 1, 240)
+                   end as preview,
+                   tool_name
+            from timeline_items
+            where session_id = ?
+            order by ordinal asc
+            """,
+            (session_id,),
+        ).fetchall()
+        return [_map_timeline_index_row(row) for row in rows]
 
     def list_audit_entries(self, session_id: str) -> list[AuditEntry]:
         rows = self._connection.execute(
@@ -515,8 +537,9 @@ class SessionRepository:
                 """
                 insert into timeline_items (
                     session_id, ordinal, item_id, type, timestamp, text,
-                    tool_name, summary, input_text, output_text, status
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tool_name, summary, input_text, output_text, status,
+                    attachments_json
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _timeline_item_to_params(entry.summary.id, ordinal, item),
             )
@@ -539,6 +562,12 @@ class SessionRepository:
             self._connection.execute("alter table sessions add column indexed_at text")
             self._connection.execute(
                 "update sessions set indexed_at = coalesce(indexed_at, updated_at, created_at, CURRENT_TIMESTAMP)"
+            )
+        timeline_rows = self._connection.execute("pragma table_info(timeline_items)").fetchall()
+        timeline_columns = {str(row["name"]) for row in timeline_rows if row and row["name"]}
+        if "attachments_json" not in timeline_columns:
+            self._connection.execute(
+                "alter table timeline_items add column attachments_json text"
             )
 
     def _transaction(self):
@@ -698,6 +727,12 @@ def _timeline_item_to_params(session_id: str, ordinal: int, item: SessionTimelin
             item.input,
             item.output,
             item.status or "pending",
+            None,
+        )
+    attachments_json: str | None = None
+    if item.attachments:
+        attachments_json = json.dumps(
+            [att.to_json() for att in item.attachments], ensure_ascii=False
         )
     return (
         session_id,
@@ -711,6 +746,7 @@ def _timeline_item_to_params(session_id: str, ordinal: int, item: SessionTimelin
         None,
         None,
         None,
+        attachments_json,
     )
 
 
@@ -816,12 +852,56 @@ def _map_timeline_row(row: sqlite3.Row) -> SessionTimelineItem:
             status=status,  # type: ignore[arg-type]
         )
     normalized_type = "message:assistant" if item_type == "message:assistant" else "message:user"
+    attachments = _decode_attachments_json(row)
     return SessionTimelineItem(
         id=str(row["item_id"]),
         type=normalized_type,  # type: ignore[arg-type]
         timestamp=str(row["timestamp"]),
         text=str(row["text"] or ""),
+        attachments=attachments,
     )
+
+
+def _map_timeline_index_row(row: sqlite3.Row) -> SessionTimelineIndexItem:
+    item_type = str(row["type"])
+    normalized_type = (
+        "tool_call"
+        if item_type == "tool_call"
+        else "message:assistant"
+        if item_type == "message:assistant"
+        else "message:user"
+    )
+    return SessionTimelineIndexItem(
+        ordinal=int(row["ordinal"] or 0),
+        item_id=str(row["item_id"]),
+        type=normalized_type,  # type: ignore[arg-type]
+        timestamp=str(row["timestamp"]),
+        preview=str(row["preview"] or ""),
+        tool_name=row["tool_name"],
+    )
+
+
+def _decode_attachments_json(row: sqlite3.Row) -> tuple[Attachment, ...]:
+    # ``attachments_json`` may be missing entirely on rows written by older
+    # builds that predate the column. ``sqlite3.Row`` raises ``IndexError``
+    # for unknown column names, so probe via ``keys()``.
+    if "attachments_json" not in row.keys():
+        return ()
+    raw = row["attachments_json"]
+    if not raw:
+        return ()
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+    attachments: list[Attachment] = []
+    for item in decoded:
+        attachment = Attachment.from_json(item)
+        if attachment is not None:
+            attachments.append(attachment)
+    return tuple(attachments)
 
 
 def _now_iso() -> str:

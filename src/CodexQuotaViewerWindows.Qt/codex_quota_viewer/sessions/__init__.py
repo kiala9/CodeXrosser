@@ -4,6 +4,9 @@ from .errors import SessionError
 from .helpers import build_resume_command
 from .manager import SessionsManager, SessionsManagerConfig
 from .models import (
+    Attachment,
+    AttachmentKind,
+    AttachmentSource,
     AuditEntry,
     BatchFailure,
     BatchResult,
@@ -16,6 +19,7 @@ from .models import (
     SessionFilters,
     SessionRecord,
     SessionStatus,
+    SessionTimelineIndexItem,
     SessionTimelineItem,
     SessionTimelinePage,
     TimelineKind,
@@ -29,6 +33,9 @@ from .paths import (
 from .repository import SessionRepository
 
 __all__ = [
+    "Attachment",
+    "AttachmentKind",
+    "AttachmentSource",
     "AuditEntry",
     "BatchFailure",
     "BatchResult",
@@ -44,6 +51,7 @@ __all__ = [
     "SessionRepository",
     "SessionRoots",
     "SessionStatus",
+    "SessionTimelineIndexItem",
     "SessionTimelineItem",
     "SessionTimelinePage",
     "SessionsManager",

@@ -76,10 +76,11 @@ def _install_acrylic_blur_for_popup(window: QWidget, *, tint_alpha: int = 58) ->
 
         ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
         WCA_ACCENT_POLICY = 19
-        # GradientColor is AABBGGRR. Match the dark-info tint used by the
-        # main-window status footer so popups feel native.
+        # GradientColor is AABBGGRR. Neutral warm-grey tint so the frosted
+        # popup reads as clean glass rather than muddy blue-grey against
+        # the dark app background.
         alpha = min(255, max(0, int(tint_alpha)))
-        red, green, blue = 24, 31, 36
+        red, green, blue = 45, 45, 48
         tint = (alpha << 24) | (blue << 16) | (green << 8) | red
         accent = _AccentPolicy(ACCENT_ENABLE_ACRYLICBLURBEHIND, 2, tint, 0)
         data = _WindowCompositionAttributeData(
@@ -184,24 +185,37 @@ class _FrostedSurface(QFrame):
     """Inner highlight radius — the highlight is inset 1.5px to read as
     a faint glass bevel."""
 
-    # ---- palette (info severity by default) --------------------------
-    BASE_COLOR: QColor = QColor(18, 39, 54, 222)
-    BORDER_COLOR: QColor = QColor(10, 132, 255, 165)
-    TINT_COLOR: QColor = QColor(10, 132, 255, 30)
-    INNER_COLOR: QColor = QColor(255, 255, 255, 18)
+    # ---- palette (neutral frosted glass) ----------------------------
+    BASE_COLOR: QColor = QColor(48, 48, 50, 200)
+    """Light neutral warm-grey base — reads as clean frosted glass
+    against dark backgrounds instead of the previous muddy blue-grey."""
+    BORDER_COLOR: QColor = QColor(255, 255, 255, 45)
+    """Neutral white glass edge — crisp but subtle."""
+    TINT_COLOR: QColor = QColor(255, 255, 255, 12)
+    """Neutral white tint — adds depth without introducing any hue
+    that could pool into a muddy colour on the grey base."""
+    INNER_COLOR: QColor = QColor(255, 255, 255, 30)
+    """Inner highlight — slightly stronger so the glass bevel reads
+    against the lighter neutral base."""
 
     # ---- native acrylic alpha overrides ------------------------------
-    NATIVE_ACRYLIC_BASE_ALPHA: int = 46
-    """Base fill alpha when ``set_native_acrylic(True)`` — drops so the
-    OS blurred backdrop reads through."""
-    NATIVE_ACRYLIC_TINT_ALPHA: int = 14
-    """Tint alpha when ``set_native_acrylic(True)``."""
+    NATIVE_ACRYLIC_BASE_ALPHA: int = 72
+    """Base fill alpha when ``set_native_acrylic(True)``. Kept high
+    so the painted surface still dominates over the OS acrylic tint;
+    the previous 46 let the OS ``rgb(24,31,36)`` blue-grey tint take
+    over and made popups look dirty."""
+    NATIVE_ACRYLIC_TINT_ALPHA: int = 10
+    """Tint alpha when ``set_native_acrylic(True)`` — minimal, since
+    the tint is now neutral white rather than brand blue."""
 
     # ---- DWM chrome --------------------------------------------------
     DWM_CORNER_PREFERENCE: int = 2  # DWMWCP_ROUND
     """``corner_preference`` passed to ``_install_dialog_chrome_for_popup``."""
-    DWM_TINT_ALPHA: int = 58
-    """``tint_alpha`` passed to ``_install_acrylic_blur_for_popup``."""
+    DWM_TINT_ALPHA: int = 22
+    """``tint_alpha`` passed to ``_install_acrylic_blur_for_popup``.
+    Very low (was 58) — just enough for the OS to register a faint
+    frosted haze behind the popup without letting the desktop wallpaper
+    bleed through and dirty the neutral-grey surface."""
 
     # ---- behaviour flags --------------------------------------------
     ACCEPT_FOCUS: bool = False
@@ -338,10 +352,14 @@ class _FrostedSurface(QFrame):
         if self._native_acrylic:
             base = QColor(base)
             tint = QColor(tint)
-            border = QColor(border)
             base.setAlpha(self.NATIVE_ACRYLIC_BASE_ALPHA)
             tint.setAlpha(self.NATIVE_ACRYLIC_TINT_ALPHA)
-            border.setAlpha(min(178, max(148, border.alpha())))
+            # Border stays at its designed alpha — the previous clamp
+            # to ``[148, 178]`` was tuned for the brand-blue case and
+            # would brighten a neutral glass-edge border too much under
+            # acrylic. Subclasses with severity borders that need to
+            # punch through the blurred backdrop should override
+            # ``_resolve_palette`` and bump alpha there.
         painter.fillPath(path, base)
         painter.fillPath(path, tint)
         painter.setClipping(False)

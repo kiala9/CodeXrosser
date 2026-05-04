@@ -21,6 +21,7 @@ from codex_quota_viewer.sessions import (  # noqa: E402
 )
 from codex_quota_viewer.sessions.helpers import build_fallback_relative_path  # noqa: E402
 from codex_quota_viewer.sessions.jsonl_parser import (  # noqa: E402
+    DEFAULT_TIMELINE_PAGE_SIZE,
     clear_parser_cache,
     parse_session_catalog,
     parse_session_timeline_page,
@@ -275,6 +276,82 @@ def test_sessions_timeline_page_preserves_total_after_dedupe(tmp_path: Path) -> 
         assert [item.id for item in page.items] == ["user-1", "assistant-1"]
         assert page.total == 3
         assert page.next_offset is None
+    finally:
+        manager.close()
+
+
+def test_get_session_detail_tail_load_is_bounded(tmp_path: Path) -> None:
+    codex_home, manager_home = _make_homes(tmp_path)
+    session_id = "bounded-detail-session"
+    total = DEFAULT_TIMELINE_PAGE_SIZE + 37
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id=session_id,
+                    cwd=str(tmp_path / "project_bounded_detail"),
+                    timeline=[
+                        SessionTimelineItem(
+                            id=f"e-{i}",
+                            type="message:user" if i % 2 == 0 else "message:assistant",
+                            timestamp="2026-01-15T10:00:00Z",
+                            text=f"message {i}",
+                        )
+                        for i in range(total)
+                    ],
+                )
+            ]
+        )
+
+        detail = manager.get_session_detail(session_id)
+
+        assert detail.timeline_total == total
+        assert len(detail.timeline) == DEFAULT_TIMELINE_PAGE_SIZE
+        assert detail.timeline_loaded_offset == 37
+        assert detail.timeline[0].id == "e-37"
+    finally:
+        manager.close()
+
+
+def test_session_timeline_index_is_lightweight_and_global(tmp_path: Path) -> None:
+    codex_home, manager_home = _make_homes(tmp_path)
+    session_id = "time-travel-index-session"
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id=session_id,
+                    cwd=str(tmp_path / "project_time_travel_index"),
+                    timeline=[
+                        SessionTimelineItem(
+                            id="user-big",
+                            type="message:user",
+                            timestamp="2026-01-15T10:00:00Z",
+                            text="x" * 10_000,
+                        ),
+                        SessionTimelineItem(
+                            id="tool-1",
+                            type="tool_call",
+                            timestamp="2026-01-15T10:00:01Z",
+                            tool_name="shell",
+                            summary="run compile",
+                            input="input should not be read into the index",
+                            output="output should not be read into the index",
+                        ),
+                    ],
+                )
+            ]
+        )
+
+        index = manager.get_session_timeline_index(session_id)
+
+        assert [item.ordinal for item in index] == [0, 1]
+        assert index[0].item_id == "user-big"
+        assert len(index[0].preview) == 240
+        assert index[1].tool_name == "shell"
+        assert index[1].preview == "run compile"
     finally:
         manager.close()
 
@@ -569,6 +646,467 @@ def test_sessions_jsonl_parser_keeps_response_items_sharing_timestamp(tmp_path: 
     timeline_types = [item.type for item in parsed.timeline]
     assert timeline_types.count("message:user") == 1
     assert timeline_types.count("message:assistant") == 2
+
+
+# ----------------------------------------------------------------------
+# Image / attachment parsing
+# ----------------------------------------------------------------------
+
+
+# 1×1 transparent PNG, encoded as a Codex-style data URI. Compact enough
+# to inline in tests without bloating the file but exercises the full
+# decode path (real PNG header → MIME extraction → Attachment).
+_PNG_1X1_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwAD"
+    "hgGAWjR9awAAAABJRU5ErkJggg=="
+)
+_JPEG_TINY_DATA_URI = "data:image/jpeg;base64,/9j/2wBDAA=="
+
+
+def _write_image_session(
+    sessions_root: Path,
+    *,
+    session_id: str,
+    started_at: str,
+    content: list[dict],
+) -> Path:
+    relative = build_fallback_relative_path(started_at, session_id)
+    target = sessions_root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(
+            {
+                "type": "session_meta",
+                "timestamp": started_at,
+                "payload": {
+                    "id": session_id,
+                    "timestamp": started_at,
+                    "cwd": str(sessions_root),
+                    "originator": "vscode",
+                    "source": "vscode",
+                    "cli_version": "0.42.0",
+                    "model_provider": "openai",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response_item",
+                "timestamp": started_at,
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                },
+            }
+        ),
+    ]
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target
+
+
+def test_jsonl_parser_extracts_bracketed_image_payload(tmp_path: Path) -> None:
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="aaaaaaaa-1111-2222-3333-444444444444",
+        started_at="2026-04-28T05:10:14Z",
+        content=[
+            {"type": "input_text", "text": "点击seed sandbox弹出\n"},
+            {"type": "input_text", "text": "<image>"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI, "detail": "high"},
+            {"type": "input_text", "text": "</image>"},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    # Bracket tokens were adjacent to the image part — both should be
+    # stripped from the rendered text.
+    assert "<image>" not in item.text
+    assert "</image>" not in item.text
+    assert "点击seed sandbox弹出" in item.text
+    assert len(item.attachments) == 1
+    attachment = item.attachments[0]
+    assert attachment.kind == "image"
+    assert attachment.mime == "image/png"
+    assert attachment.data_uri is not None
+    assert attachment.data_uri.startswith("data:image/png;base64,")
+
+
+def test_jsonl_parser_handles_jpeg_mime(tmp_path: Path) -> None:
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="bbbbbbbb-1111-2222-3333-444444444444",
+        started_at="2026-04-28T06:00:00Z",
+        content=[
+            {"type": "input_text", "text": "look at this"},
+            {"type": "input_image", "image_url": _JPEG_TINY_DATA_URI},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    assert user_items[0].attachments[0].mime == "image/jpeg"
+
+
+def test_jsonl_parser_keeps_bare_angle_brackets_in_prose(tmp_path: Path) -> None:
+    """Pure prose containing literal ``<image>`` text but no real image
+    part keeps the bracket tokens intact — the stripping rule fires only
+    when adjacent to an actual ``input_image`` content part."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="cccccccc-1111-2222-3333-444444444444",
+        started_at="2026-04-28T07:00:00Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": "I tried <image> in the markdown but it didn't render",
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    assert "<image>" in user_items[0].text
+    assert user_items[0].attachments == ()
+
+
+def test_jsonl_parser_strips_only_neighbouring_brackets(tmp_path: Path) -> None:
+    """When two image parts are present and the brackets only neighbour
+    the second one, the first image's text remains untouched."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="dddddddd-1111-2222-3333-444444444444",
+        started_at="2026-04-28T08:00:00Z",
+        content=[
+            {"type": "input_text", "text": "hi"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI},
+            {"type": "input_text", "text": "<image>"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI},
+            {"type": "input_text", "text": "</image>"},
+            {"type": "input_text", "text": "bye"},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    # Both images captured; bracket tokens around the SECOND image stripped.
+    assert len(item.attachments) == 2
+    # Brackets removed because they wrap an actual image part.
+    assert "<image>" not in item.text
+    assert "</image>" not in item.text
+    # Surrounding prose preserved.
+    assert "hi" in item.text and "bye" in item.text
+
+
+def test_repository_migrates_attachments_column_on_upgrade(tmp_path: Path) -> None:
+    """An existing pre-migration DB (timeline_items without
+    ``attachments_json``) gains the column when the repository opens it,
+    so users upgrading from an older build don't lose access to their
+    sessions."""
+    db_path = tmp_path / "sessions.db"
+    legacy_schema = """
+        create table sessions (
+          id text primary key,
+          active_path text,
+          archive_path text,
+          snapshot_path text,
+          original_relative_path text,
+          cwd text not null,
+          started_at text not null,
+          originator text not null,
+          source text not null,
+          cli_version text not null,
+          model_provider text not null,
+          size_bytes integer not null default 0,
+          line_count integer not null default 0,
+          event_count integer not null default 0,
+          tool_call_count integer not null default 0,
+          user_prompt_excerpt text not null default '',
+          latest_agent_message_excerpt text not null default '',
+          status text not null,
+          created_at text not null,
+          updated_at text not null
+        );
+        create table timeline_items (
+          session_id text not null,
+          ordinal integer not null,
+          item_id text not null,
+          type text not null,
+          timestamp text not null,
+          text text,
+          tool_name text,
+          summary text,
+          input_text text,
+          output_text text,
+          status text,
+          primary key (session_id, ordinal)
+        );
+        create table audit_log (
+          id integer primary key autoincrement,
+          action text not null,
+          session_id text not null,
+          source_path text,
+          target_path text,
+          details_json text not null default '{}',
+          created_at text not null
+        );
+    """
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(legacy_schema)
+    legacy.close()
+
+    repository = SessionRepository(db_path)
+    try:
+        rows = repository._connection.execute("pragma table_info(timeline_items)").fetchall()
+        column_names = {str(row["name"]) for row in rows}
+        assert "attachments_json" in column_names
+    finally:
+        repository.close()
+
+
+def test_jsonl_parser_extracts_files_mentioned_markdown(tmp_path: Path) -> None:
+    """Codex Desktop's @-file mention text block lifts into ``file``
+    attachments and the displayed text shrinks to the user's actual
+    request body."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="ffffffff-1111-2222-3333-444444444444",
+        started_at="2026-04-29T17:25:10Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": (
+                    "\n# Files mentioned by the user:\n\n"
+                    "## GPT-account.svg: E:/Download/GPT-account.svg\n\n"
+                    "## API-account.svg: E:/Download/API-account.svg\n\n"
+                    "## My request for Codex:\n"
+                    "两个SVG矢量图，替换之前的位图ICON\n"
+                ),
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    # Header + path lines stripped from displayed text — only the
+    # request body survives.
+    assert "Files mentioned by the user" not in item.text
+    assert "GPT-account.svg" not in item.text
+    assert "My request for Codex" not in item.text
+    assert "两个SVG矢量图" in item.text
+    # Two file attachments captured with name/path/mime preserved.
+    assert len(item.attachments) == 2
+    a, b = item.attachments
+    assert a.kind == "file" and a.name == "GPT-account.svg"
+    assert a.path == "E:/Download/GPT-account.svg"
+    assert a.mime == "image/svg+xml"
+    assert a.source == "markdown"
+    assert b.name == "API-account.svg"
+    assert b.path == "E:/Download/API-account.svg"
+
+
+def test_jsonl_parser_files_mentioned_no_request_body(tmp_path: Path) -> None:
+    """When the Codex transcript omits ``## My request for Codex:``
+    (file-only message) the request body is empty but attachments are
+    still captured."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="11111111-2222-3333-4444-555555555555",
+        started_at="2026-04-29T17:30:00Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": (
+                    "# Files mentioned by the user:\n\n"
+                    "## report.pdf: C:/Users/foo/report.pdf\n"
+                ),
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    assert item.text == ""
+    assert len(item.attachments) == 1
+    assert item.attachments[0].mime == "application/pdf"
+
+
+def test_jsonl_parser_files_mentioned_only_anchored_at_start(tmp_path: Path) -> None:
+    """User prose that quotes the marker mid-message should NOT be
+    rewritten — extraction only fires when the header is the first
+    thing in the text."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="22222222-3333-4444-5555-666666666666",
+        started_at="2026-04-29T17:35:00Z",
+        content=[
+            {
+                "type": "input_text",
+                "text": (
+                    "let me show you what Codex emits:\n\n"
+                    "# Files mentioned by the user:\n"
+                    "## a.txt: /tmp/a.txt\n"
+                ),
+            },
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    # No leading header at the start → not extracted.
+    assert "Files mentioned by the user" in item.text
+    assert item.attachments == ()
+
+
+def test_jsonl_parser_strips_named_image_open_tag(tmp_path: Path) -> None:
+    """Codex Desktop sometimes emits ``<image name=[Image #1]>`` instead
+    of the bare ``<image>`` open tag. Both forms should be stripped
+    when adjacent to a real ``input_image``."""
+    codex_home, _ = _make_homes(tmp_path)
+    target = _write_image_session(
+        codex_home / "sessions",
+        session_id="33333333-4444-5555-6666-777777777777",
+        started_at="2026-04-29T07:57:30Z",
+        content=[
+            {"type": "input_text", "text": "test message"},
+            {"type": "input_text", "text": "<image name=[Image #1]>"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI},
+            {"type": "input_text", "text": "</image>"},
+        ],
+    )
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    assert len(user_items) == 1
+    item = user_items[0]
+    assert "<image" not in item.text
+    assert "</image>" not in item.text
+    assert "test message" in item.text
+    assert len(item.attachments) == 1
+
+
+def test_jsonl_parser_dedupes_event_msg_response_item_with_files_mentioned(tmp_path: Path) -> None:
+    """Regression for the duplicate-bubble bug on session
+    019dce24-cd6b-7940-999e-2e801ed493ef:
+    Codex emits the same user turn twice (event_msg + response_item).
+    Without normalisation, the event_msg twin kept the raw "# Files
+    mentioned by the user:" markdown while the response_item twin had
+    it stripped, so they had different dedup keys and BOTH rendered.
+    """
+    codex_home, _ = _make_homes(tmp_path)
+    relative = build_fallback_relative_path("2026-04-29T07:57:30Z", "duplicate-id")
+    target = codex_home / "sessions" / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    file_mention_text = (
+        "\n# Files mentioned by the user:\n\n"
+        "## icon.png: C:/tmp/icon.png\n\n"
+        "## My request for Codex:\n"
+        "还是先暂时改用这个吧\n"
+    )
+    lines = [
+        json.dumps(
+            {
+                "type": "session_meta",
+                "timestamp": "2026-04-29T07:57:30Z",
+                "payload": {
+                    "id": "duplicate-id",
+                    "timestamp": "2026-04-29T07:57:30Z",
+                    "cwd": str(tmp_path),
+                    "originator": "vscode",
+                    "source": "vscode",
+                    "cli_version": "0.42.0",
+                    "model_provider": "openai",
+                },
+            }
+        ),
+        # response_item — earlier timestamp (sorts first).
+        json.dumps(
+            {
+                "type": "response_item",
+                "timestamp": "2026-04-29T07:57:30.933Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": file_mention_text},
+                        {"type": "input_text", "text": "<image name=[Image #1]>"},
+                        {"type": "input_image", "image_url": _PNG_1X1_DATA_URI},
+                        {"type": "input_text", "text": "</image>"},
+                    ],
+                },
+            }
+        ),
+        # event_msg twin — same logical message, slightly later timestamp.
+        json.dumps(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-04-29T07:57:30.936Z",
+                "payload": {"type": "user_message", "message": file_mention_text},
+            }
+        ),
+    ]
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    parsed = parse_session_catalog(target)
+    assert parsed is not None
+    user_items = [item for item in parsed.timeline if item.type == "message:user"]
+    # Exactly one user bubble after dedup — both twins collapse.
+    assert len(user_items) == 1
+    item = user_items[0]
+    # The response_item version wins (earlier timestamp) so we keep
+    # both the file mention AND the structured image attachment.
+    assert item.text == "还是先暂时改用这个吧"
+    kinds = sorted(att.kind for att in item.attachments)
+    assert kinds == ["file", "image"]
+
+
+def test_repository_round_trips_attachments(tmp_path: Path) -> None:
+    """Attachments survive the SQLite write/read cycle so the detail
+    panel (which always pulls timeline items via ``list_timeline_page``)
+    sees the same images the parser captured."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    _write_image_session(
+        codex_home / "sessions",
+        session_id="eeeeeeee-1111-2222-3333-444444444444",
+        started_at="2026-04-28T09:00:00Z",
+        content=[
+            {"type": "input_text", "text": "first"},
+            {"type": "input_image", "image_url": _PNG_1X1_DATA_URI, "detail": "high"},
+        ],
+    )
+    manager = SessionsManager(codex_home, manager_home)
+    try:
+        manager.rescan()
+        detail = manager.get_session_detail("eeeeeeee-1111-2222-3333-444444444444")
+        user_items = [item for item in detail.timeline if item.type == "message:user"]
+        assert len(user_items) == 1
+        attachments = user_items[0].attachments
+        assert len(attachments) == 1
+        assert attachments[0].kind == "image"
+        assert attachments[0].mime == "image/png"
+        assert attachments[0].data_uri == _PNG_1X1_DATA_URI
+    finally:
+        manager.close()
 
 
 def test_sessions_filters_by_status(tmp_path: Path) -> None:

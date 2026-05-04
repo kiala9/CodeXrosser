@@ -1,19 +1,85 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from ._perf import _perf_timer
 from .models import (
+    Attachment,
     ParsedSessionCatalog,
     SessionFileSummary,
     SessionTimelineItem,
     SessionTimelinePage,
 )
+
+
+_DATA_URI_MIME_RE = re.compile(r"^data:(image/[a-z0-9.+\-]+);base64,", re.IGNORECASE)
+_GENERIC_DATA_URI_MIME_RE = re.compile(r"^data:([a-z0-9.+\-]+/[a-z0-9.+\-]+);base64,", re.IGNORECASE)
+# Matches both the bare ``<image>`` placeholder Codex used historically
+# and the newer ``<image name=[Image #N]>`` form. Anchored to the entire
+# stripped text so user prose like ``check the <image> tag in HTML``
+# never accidentally fires the strip rule (the rule is also gated on
+# adjacency to a real ``input_image`` part — see
+# ``_read_response_message_content``).
+_IMAGE_OPEN_BRACKET_RE = re.compile(r"^<image\b[^>]*>$", re.IGNORECASE)
+
+
+# Codex Desktop serialises @-file mentions as a single ``input_text``
+# content part with a markdown-style preamble — NOT as structured
+# ``input_file`` content parts. The format is:
+#
+#     # Files mentioned by the user:
+#
+#     ## <filename>: <full_path>
+#     ## <filename>: <full_path>
+#
+#     ## My request for Codex:
+#     <user prompt body>
+#
+# We pattern-match this and lift each file reference into a real
+# ``Attachment(kind="file")`` so the renderer can show a proper file
+# card under the message. The ``Files mentioned`` header and the file
+# list are stripped from the displayed text; the trailing prompt body
+# survives as the message text. Matching is anchored at the start of
+# the text so a user prose message that *quotes* the same header does
+# not get rewritten.
+_FILES_MENTIONED_HEADER_RE = re.compile(
+    r"^\s*#\s+Files\s+mentioned\s+by\s+the\s+user:\s*\n",
+    re.IGNORECASE,
+)
+_REQUEST_HEADER_RE = re.compile(
+    r"^\s*##\s+My\s+request\s+for\s+Codex:\s*(?:\n|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_FILE_MENTION_LINE_RE = re.compile(
+    r"^\s*##\s+(?P<name>[^\n:]+?):\s*(?P<path>\S[^\n]*?)\s*$",
+    re.MULTILINE,
+)
+_FILE_EXTENSION_MIME: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".js": "text/javascript",
+    ".ts": "text/typescript",
+    ".py": "text/x-python",
+    ".html": "text/html",
+    ".css": "text/css",
+    ".csv": "text/csv",
+}
 
 try:
     import orjson as _orjson  # type: ignore[import-not-found]
@@ -22,7 +88,9 @@ except ImportError:
     _json_loads = json.loads
 
 
-DEFAULT_TIMELINE_PAGE_SIZE = 100000
+# Detail views should never default to a near-full timeline load. The UI seeds
+# the panel from a bounded tail page and pages older rows on demand.
+DEFAULT_TIMELINE_PAGE_SIZE = 200
 MAX_TIMELINE_PAGE_SIZE = 500
 _PARSER_CACHE_LIMIT = 128
 _EPOCH_TIMESTAMP = "1970-01-01T00:00:00.000Z"
@@ -113,13 +181,30 @@ def parse_session_catalog(file_path: Path) -> ParsedSessionCatalog | None:
                 if payload_type == "agent_message":
                     latest_agent_message_excerpt = _truncate_message(message)
                 if message and payload_type in ("user_message", "agent_message"):
+                    # Lift Codex Desktop's @-file mention markdown out of
+                    # the user_message string the same way we do for
+                    # response_item content. Without this, the
+                    # event_msg twin keeps the raw markdown body while
+                    # the response_item twin has it stripped + holds
+                    # attachments — they end up with different dedup
+                    # keys and BOTH bubbles render. With both paths
+                    # producing the same post-extraction text, dedup
+                    # collapses them to a single bubble (the
+                    # response_item version wins because it sorts
+                    # earlier and carries the structured image
+                    # attachment data the event_msg twin can't see).
+                    extracted_attachments: tuple[Attachment, ...] = ()
+                    cleaned_message = message
+                    if payload_type == "user_message":
+                        cleaned_message, extracted_attachments = _extract_files_mentioned(message)
                     fallback_messages.append(
                         _TimelineDraft(
                             id=f"event-{sequence + 1}",
                             order=sequence,
                             timestamp=timestamp,
                             type="message:user" if payload_type == "user_message" else "message:assistant",
-                            text=message,
+                            text=cleaned_message,
+                            attachments=extracted_attachments,
                         )
                     )
                     sequence += 1
@@ -158,8 +243,9 @@ def parse_session_catalog(file_path: Path) -> ParsedSessionCatalog | None:
                     # setMarkdown went pathological on the malformed result.
                     # The truncated form is still used for the session-list
                     # excerpt, but the timeline keeps the full body.
-                    full_text = _normalize_message(_read_response_message_text(payload))
-                    if not full_text:
+                    raw_text, attachments = _read_response_message_content(payload)
+                    full_text = _normalize_message(raw_text)
+                    if not full_text and not attachments:
                         continue
                     role = payload.get("role")
                     if role == "user" and not response_user_excerpt:
@@ -174,6 +260,7 @@ def parse_session_catalog(file_path: Path) -> ParsedSessionCatalog | None:
                                 timestamp=timestamp,
                                 type="message:user" if role == "user" else "message:assistant",
                                 text=full_text,
+                                attachments=attachments,
                             )
                         )
                         sequence += 1
@@ -333,6 +420,7 @@ class _TimelineDraft:
     timestamp: str
     type: str
     text: str
+    attachments: tuple[Attachment, ...] = field(default_factory=tuple)
 
     def to_item(self) -> SessionTimelineItem:
         return SessionTimelineItem(
@@ -340,6 +428,7 @@ class _TimelineDraft:
             type=self.type,  # type: ignore[arg-type]
             timestamp=self.timestamp,
             text=self.text,
+            attachments=self.attachments,
         )
 
 
@@ -376,13 +465,47 @@ def _read_message(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _read_response_message_text(payload: dict[str, Any]) -> str:
+def _read_response_message_content(
+    payload: dict[str, Any],
+) -> tuple[str, tuple[Attachment, ...]]:
+    """Extract message text and attachments from a response_item ``message``.
+
+    The Codex Desktop client wraps inline screenshots with literal
+    ``<image>`` / ``</image>`` text tokens that bracket the actual
+    ``input_image`` content part. These bracket tokens are stripped only
+    when adjacent to a real image part — user prose containing other
+    angle-bracketed text (HTML samples, generic placeholders) is left
+    alone.
+    """
     content = payload.get("content")
     if not isinstance(content, list):
-        return ""
+        return "", ()
+    parts: list[dict[str, Any]] = [part for part in content if isinstance(part, dict)]
+    bracket_indices: set[int] = set()
+    for index, part in enumerate(parts):
+        if not _is_image_part(part):
+            continue
+        prev_index = index - 1
+        if prev_index >= 0 and _is_image_open_bracket(parts[prev_index]):
+            bracket_indices.add(prev_index)
+        next_index = index + 1
+        if next_index < len(parts) and _is_bracket_text(parts[next_index], "</image>"):
+            bracket_indices.add(next_index)
+
     segments: list[str] = []
-    for part in content:
-        if not isinstance(part, dict):
+    attachments: list[Attachment] = []
+    for index, part in enumerate(parts):
+        if index in bracket_indices:
+            continue
+        if _is_image_part(part):
+            attachment = _parse_image_part(part)
+            if attachment is not None:
+                attachments.append(attachment)
+            continue
+        if _is_file_part(part):
+            attachment = _parse_file_part(part)
+            if attachment is not None:
+                attachments.append(attachment)
             continue
         text = part.get("text")
         if isinstance(text, str):
@@ -391,7 +514,158 @@ def _read_response_message_text(payload: dict[str, Any]) -> str:
         nested = part.get("content")
         if isinstance(nested, str):
             segments.append(nested)
-    return "\n".join(segment for segment in segments if segment).strip()
+    text_value = "\n".join(segment for segment in segments if segment).strip()
+    text_value, mention_attachments = _extract_files_mentioned(text_value)
+    if mention_attachments:
+        attachments.extend(mention_attachments)
+    return text_value, tuple(attachments)
+
+
+def _read_response_message_text(payload: dict[str, Any]) -> str:
+    """Backwards-compatible accessor used by tests / external callers."""
+    return _read_response_message_content(payload)[0]
+
+
+def _extract_files_mentioned(text: str) -> tuple[str, tuple[Attachment, ...]]:
+    """Lift Codex Desktop's @-file mention markdown into ``Attachment``\\ s.
+
+    The serialised shape is documented next to ``_FILES_MENTIONED_HEADER_RE``
+    above. We anchor on the leading ``# Files mentioned by the user:``
+    line so user prose that merely mentions or quotes the same header
+    is left alone.
+    """
+    if not text:
+        return text, ()
+    header_match = _FILES_MENTIONED_HEADER_RE.match(text)
+    if header_match is None:
+        return text, ()
+    body = text[header_match.end():]
+    request_match = _REQUEST_HEADER_RE.search(body)
+    if request_match is not None:
+        files_block = body[: request_match.start()]
+        request_body = body[request_match.end():].strip()
+    else:
+        files_block = body
+        request_body = ""
+    attachments: list[Attachment] = []
+    for line_match in _FILE_MENTION_LINE_RE.finditer(files_block):
+        name = line_match.group("name").strip()
+        path_value = line_match.group("path").strip()
+        if not name or not path_value:
+            continue
+        suffix = ""
+        dot = name.rfind(".")
+        if dot >= 0:
+            suffix = name[dot:].lower()
+        mime = _FILE_EXTENSION_MIME.get(suffix, "application/octet-stream")
+        attachments.append(
+            Attachment(
+                kind="file",
+                mime=mime,
+                path=path_value,
+                name=name,
+                source="markdown",
+            )
+        )
+    if not attachments:
+        return text, ()
+    return request_body, tuple(attachments)
+
+
+def _is_image_part(part: dict[str, Any]) -> bool:
+    part_type = part.get("type")
+    return part_type in ("input_image", "output_image", "image_url", "image")
+
+
+def _is_file_part(part: dict[str, Any]) -> bool:
+    part_type = part.get("type")
+    return part_type in ("input_file", "file_url", "attachment")
+
+
+def _is_bracket_text(part: dict[str, Any], expected: str) -> bool:
+    if part.get("type") not in ("input_text", "text"):
+        return False
+    text = part.get("text")
+    if not isinstance(text, str):
+        return False
+    return text.strip() == expected
+
+
+def _is_image_open_bracket(part: dict[str, Any]) -> bool:
+    """Match either ``<image>`` or ``<image name=[Image #N]>`` open tags."""
+    if part.get("type") not in ("input_text", "text"):
+        return False
+    text = part.get("text")
+    if not isinstance(text, str):
+        return False
+    return _IMAGE_OPEN_BRACKET_RE.match(text.strip()) is not None
+
+
+def _parse_image_part(part: dict[str, Any]) -> Attachment | None:
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url")
+    if not isinstance(image_url, str) or not image_url:
+        return None
+    if image_url.startswith("data:"):
+        match = _DATA_URI_MIME_RE.match(image_url)
+        mime = match.group(1).lower() if match else _fallback_data_uri_mime(image_url)
+        return Attachment(
+            kind="image",
+            mime=mime,
+            data_uri=image_url,
+            alt=_string_or_none(part.get("detail")),
+            source="payload",
+        )
+    return Attachment(
+        kind="image",
+        mime="image/unknown",
+        path=image_url,
+        alt=_string_or_none(part.get("detail")),
+        source="payload",
+    )
+
+
+def _parse_file_part(part: dict[str, Any]) -> Attachment | None:
+    file_url = part.get("file_url") or part.get("url")
+    file_path = part.get("file_path") or part.get("path")
+    name = _string_or_none(part.get("filename") or part.get("name"))
+    mime = _string_or_none(part.get("mime") or part.get("media_type")) or "application/octet-stream"
+    data_uri: str | None = None
+    path: str | None = None
+    if isinstance(file_url, str) and file_url:
+        if file_url.startswith("data:"):
+            data_uri = file_url
+            mime_match = _GENERIC_DATA_URI_MIME_RE.match(file_url)
+            if mime_match:
+                mime = mime_match.group(1).lower()
+        else:
+            path = file_url
+    if path is None and isinstance(file_path, str) and file_path:
+        path = file_path
+    if data_uri is None and path is None:
+        return None
+    return Attachment(
+        kind="file",
+        mime=mime,
+        data_uri=data_uri,
+        path=path,
+        name=name,
+        source="payload",
+    )
+
+
+def _fallback_data_uri_mime(data_uri: str) -> str:
+    match = _GENERIC_DATA_URI_MIME_RE.match(data_uri)
+    if match:
+        return match.group(1).lower()
+    return "image/octet-stream"
+
+
+def _string_or_none(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def _truncate_message(message: str) -> str:
