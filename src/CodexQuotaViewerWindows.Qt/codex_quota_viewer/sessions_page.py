@@ -4503,7 +4503,7 @@ class _SessionDetailPanel(QFrame):
         # Timeline body: scroll area + navigator rail side by side.
         body_row = QHBoxLayout()
         body_row.setContentsMargins(0, 0, 0, 0)
-        body_row.setSpacing(6)
+        body_row.setSpacing(0)
 
         self._timeline_scroll = QScrollArea(self)
         self._timeline_scroll.setObjectName("SessionsDetailTimelineScroll")
@@ -4562,6 +4562,7 @@ class _SessionDetailPanel(QFrame):
         self._scroll_jump_window_filter_installed = False
 
         self._navigator = _TimelineNavigatorRail(self)
+        self._navigator.installEventFilter(self)
         self._navigator.scroll_value_requested.connect(
             self._set_scrollbar_value_from_minimap
         )
@@ -5422,6 +5423,8 @@ class _SessionDetailPanel(QFrame):
             self._reposition_timeline_overlay()
             self._reposition_scroll_jump_buttons()
             self._schedule_minimap_refresh()
+        if et == QEvent.Wheel and obj is self._navigator:
+            return self._handle_timeline_navigator_wheel(event)
         if et == QEvent.Wheel and self._is_timeline_event_source(obj):
             if self._should_consume_timeline_wheel(event):
                 return True
@@ -5494,6 +5497,7 @@ class _SessionDetailPanel(QFrame):
             self._timeline_scroll,
             self._timeline_scroll.viewport(),
             self._timeline_container,
+            self._navigator,
         ):
             return True
         if not isinstance(obj, QWidget):
@@ -5560,6 +5564,7 @@ class _SessionDetailPanel(QFrame):
             self._timeline_scroll,
             self._timeline_scroll.viewport(),
             self._timeline_container,
+            self._navigator,
         }
         targets.update(self._timeline_container.findChildren(QWidget))
         targets.update(self._timeline_scroll.viewport().findChildren(QWidget))
@@ -5619,6 +5624,64 @@ class _SessionDetailPanel(QFrame):
             return True
         return False
 
+    def _handle_timeline_navigator_wheel(self, event) -> bool:
+        if self._should_consume_timeline_wheel(event):
+            self._accept_event(event)
+            return True
+        if self._handle_timeline_edge_wheel(event):
+            self._accept_event(event)
+            return True
+        if self._scroll_timeline_from_wheel(event):
+            self._accept_event(event)
+            return True
+        return False
+
+    def _scroll_timeline_from_wheel(self, event) -> bool:
+        distance = self._wheel_scroll_distance(event)
+        if distance == 0:
+            return False
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        target = scrollbar.value() - distance
+        target = max(scrollbar.minimum(), min(target, scrollbar.maximum()))
+        scrollbar.setValue(target)
+        return True
+
+    @staticmethod
+    def _accept_event(event) -> None:
+        accept = getattr(event, "accept", None)
+        if callable(accept):
+            accept()
+
+    @staticmethod
+    def _wheel_scroll_distance(event) -> int:
+        pixel_getter = getattr(event, "pixelDelta", None)
+        if callable(pixel_getter):
+            pixel_delta = pixel_getter()
+            y_getter = getattr(pixel_delta, "y", None)
+            if callable(y_getter):
+                value = int(y_getter())
+                if value:
+                    return value
+
+        angle_delta = 0
+        angle_getter = getattr(event, "angleDelta", None)
+        if callable(angle_getter):
+            delta = angle_getter()
+            y_getter = getattr(delta, "y", None)
+            if callable(y_getter):
+                angle_delta = int(y_getter())
+        if angle_delta == 0:
+            return 0
+
+        single_step = 20
+        app_scroll_lines = getattr(QApplication, "wheelScrollLines", None)
+        if callable(app_scroll_lines):
+            single_step *= max(1, int(app_scroll_lines()))
+        distance = int(round((float(angle_delta) / 120.0) * float(single_step)))
+        if distance == 0:
+            return 1 if angle_delta > 0 else -1
+        return distance
+
     @staticmethod
     def _wheel_delta_y(event) -> int:
         for name in ("angleDelta", "pixelDelta"):
@@ -5639,6 +5702,7 @@ class _SessionDetailPanel(QFrame):
     # ---- floating jump-to-top / jump-to-bottom buttons --------------------
 
     _SCROLL_JUMP_MARGIN = 10
+    _SCROLL_JUMP_RAIL_GAP = 6
     _SCROLL_JUMP_GAP = 6
     # Don't show the buttons unless the user has actually scrolled at least
     # this many pixels from the boundary. This keeps the buttons out of the
@@ -5650,16 +5714,26 @@ class _SessionDetailPanel(QFrame):
         if viewport is None:
             return
         # Buttons are top-level Qt.Tool windows, so positioning uses global
-        # screen coordinates. We anchor at the viewport's bottom-right
-        # corner: top button above bottom button, both pulled off the edge
-        # by _SCROLL_JUMP_MARGIN so they don't collide with the scrollbar.
+        # screen coordinates. Anchor them just left of the visible minimap
+        # rail, using the rail's transparent left pad as breathing room.
         global_origin = viewport.mapToGlobal(QPoint(0, 0))
-        right_x = (
+        viewport_right_x = (
             global_origin.x()
             + viewport.width()
             - self._SCROLL_JUMP_MARGIN
             - self._scroll_bottom_btn.width()
         )
+        right_x = viewport_right_x
+        if self._navigator is not None:
+            visual_left = self._navigator.mapToGlobal(
+                QPoint(int(round(self._navigator._visual_left())), 0)
+            ).x()
+            rail_anchor_x = (
+                visual_left
+                - self._SCROLL_JUMP_RAIL_GAP
+                - self._scroll_bottom_btn.width()
+            )
+            right_x = max(viewport_right_x, rail_anchor_x)
         bottom_btn_y = (
             global_origin.y()
             + viewport.height()
@@ -7501,8 +7575,11 @@ class _TimelineNavigatorRail(QFrame):
 
     scroll_value_requested = Signal(int)
 
-    _RAIL_WIDTH = 22
+    _VISUAL_WIDTH = 22
+    _LEFT_INTERACTION_PAD = 18
+    _RAIL_WIDTH = _VISUAL_WIDTH + _LEFT_INTERACTION_PAD
     _HIT_PAD = 3
+    _DRAG_SUSPENSION_TIMEOUT_MS = 1000
     # Tooltip-only wider hit pad for user-prompt markers — hovering near
     # (not just on) a user marker still surfaces its prompt preview.
     # Click/drag scroll deliberately keeps the regular _HIT_PAD so the
@@ -7523,6 +7600,11 @@ class _TimelineNavigatorRail(QFrame):
         self._hover_marker_index: int | None = None
         self._dragging = False
         self._drag_suspended_until_release = False
+        self._drag_suspension_timer = QTimer(self)
+        self._drag_suspension_timer.setSingleShot(True)
+        self._drag_suspension_timer.timeout.connect(
+            self._resume_suspended_drag_after_timeout
+        )
 
     def set_viewport(
         self,
@@ -7547,21 +7629,50 @@ class _TimelineNavigatorRail(QFrame):
         The rail's coordinate system changes when the timeline window is
         rebuilt. Continuing to emit move events from the old mouse-down
         gesture would reinterpret the same cursor position against a new
-        scroll range and can immediately page again. The next mouse press
-        starts a fresh gesture in the updated coordinates.
+        scroll range and can immediately page again. Release still ends the
+        gesture immediately; if the user keeps holding the button, a short
+        timeout resumes the drag against the updated coordinates.
         """
-        if self._dragging:
-            self._drag_suspended_until_release = True
+        if not self._dragging:
+            self._drag_suspension_timer.stop()
+            self._drag_suspended_until_release = False
+            return
+        self._drag_suspended_until_release = True
+        self._drag_suspension_timer.start(self._DRAG_SUSPENSION_TIMEOUT_MS)
+
+    def _resume_suspended_drag_after_timeout(self) -> None:
+        if not self._dragging:
+            self._drag_suspended_until_release = False
+            return
+        if not self._drag_suspended_until_release:
+            return
+        if not (QGuiApplication.mouseButtons() & Qt.LeftButton):
+            self._dragging = False
+            self._drag_suspended_until_release = False
+            return
+        self._drag_suspended_until_release = False
+        global_pos = QCursor.pos()
+        y = self.mapFromGlobal(global_pos).y()
+        self.scroll_value_requested.emit(self._target_value_for_y(y))
+        self._update_hover_tooltip(y, None, global_pos=global_pos)
 
     def _scale(self) -> float:
         return float(max(self.height(), 1)) / float(max(self._content_height, 1))
+
+    def _visual_left(self) -> float:
+        return float(max(0, self.width() - self._VISUAL_WIDTH))
+
+    def _visual_width(self) -> float:
+        return float(min(max(self.width(), 1), self._VISUAL_WIDTH))
 
     def _marker_rects(self) -> list[tuple[int, _MinimapMarker, QRectF]]:
         scale = self._scale()
         rail_h = float(max(self.height(), 1))
         cap_h = max(2.0, rail_h * 0.05)
-        marker_w = max(4.0, float(self.width() - 12))
-        x = (float(self.width()) - marker_w) / 2.0
+        visual_left = self._visual_left()
+        visual_width = self._visual_width()
+        marker_w = max(4.0, visual_width - 12.0)
+        x = visual_left + (visual_width - marker_w) / 2.0
         rects: list[tuple[int, _MinimapMarker, QRectF]] = []
         for i, marker in enumerate(self._markers):
             marker_h = min(max(2.0, float(marker.height) * scale), cap_h)
@@ -7577,10 +7688,17 @@ class _TimelineNavigatorRail(QFrame):
         rail_h = float(max(self.height(), 0))
         if rail_h <= 0:
             return QRectF()
+        visual_left = self._visual_left()
+        visual_width = self._visual_width()
         thumb_h = min(rail_h, float(self._viewport_height) * scale)
         thumb_y = float(self._scroll_value) * scale
         thumb_y = max(0.0, min(thumb_y, rail_h - thumb_h))
-        return QRectF(2.0, thumb_y, max(4.0, float(self.width() - 4)), thumb_h)
+        return QRectF(
+            visual_left + 2.0,
+            thumb_y,
+            max(4.0, visual_width - 4.0),
+            thumb_h,
+        )
 
     def _target_value_for_y(self, y: int) -> int:
         scale = self._scale()
@@ -7593,7 +7711,7 @@ class _TimelineNavigatorRail(QFrame):
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.Antialiasing)
-            cx = self.width() // 2
+            cx = int(round(self._visual_left() + self._visual_width() / 2.0))
 
             # Low-contrast spine keeps the rail visible without competing
             # with the active viewport thumb.
@@ -7669,6 +7787,7 @@ class _TimelineNavigatorRail(QFrame):
     def mousePressEvent(self, event):  # noqa: N802 - Qt naming
         if event.button() != Qt.LeftButton:
             return super().mousePressEvent(event)
+        self._drag_suspension_timer.stop()
         self._dragging = True
         self._drag_suspended_until_release = False
         y = event.position().toPoint().y()
@@ -7687,6 +7806,7 @@ class _TimelineNavigatorRail(QFrame):
     def mouseReleaseEvent(self, event):  # noqa: N802 - Qt naming
         if event.button() != Qt.LeftButton:
             return super().mouseReleaseEvent(event)
+        self._drag_suspension_timer.stop()
         self._dragging = False
         self._drag_suspended_until_release = False
         self._update_hover_tooltip(event.position().toPoint().y(), event)
@@ -7698,7 +7818,9 @@ class _TimelineNavigatorRail(QFrame):
         QToolTip.hideText()
         return super().leaveEvent(event)
 
-    def _update_hover_tooltip(self, y: int, event) -> None:
+    def _update_hover_tooltip(
+        self, y: int, event, *, global_pos: QPoint | None = None
+    ) -> None:
         # Tooltip-only assist for user prompts: probe with the wider
         # _USER_HIT_PAD first so hovering near (not just on) a user
         # marker still surfaces its preview. This is the only place the
@@ -7727,7 +7849,10 @@ class _TimelineNavigatorRail(QFrame):
         if marker.kind == "user":
             label = marker.label
             self.setToolTip(label)
-            QToolTip.showText(event.globalPosition().toPoint(), label, self)
+            if global_pos is None and event is not None:
+                global_pos = event.globalPosition().toPoint()
+            if global_pos is not None:
+                QToolTip.showText(global_pos, label, self)
         else:
             self.setToolTip("")
             QToolTip.hideText()

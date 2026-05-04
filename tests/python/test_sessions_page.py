@@ -23,7 +23,8 @@ from PySide6.QtCore import (  # noqa: E402
     QPointF,
     Qt,
 )
-from PySide6.QtGui import QMouseEvent  # noqa: E402
+from PySide6.QtGui import QCursor, QGuiApplication, QMouseEvent  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from codex_quota_viewer.localization import translate  # noqa: E402
@@ -1405,6 +1406,81 @@ def test_timeline_wheel_filter_covers_bubble_children() -> None:
     panel.close()
 
 
+def test_timeline_wheel_filter_covers_navigator_rail() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("navigator-wheel")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=[
+            SessionTimelineItem(
+                id=f"e-{i}",
+                type="message:user" if i % 5 == 0 else "message:assistant",
+                timestamp="2026-01-01T00:00:00Z",
+                text=f"item {i}",
+            )
+            for i in range(40)
+        ],
+        timeline_total=40,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._hide_timeline_overlay()
+    assert panel._is_timeline_event_source(panel._navigator)
+    assert panel._navigator.width() == panel._navigator._RAIL_WIDTH
+
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 1000)
+    scrollbar.setValue(500)
+
+    assert panel.eventFilter(panel._navigator, _WheelEvent(120))
+    assert scrollbar.value() < 500
+    panel.close()
+
+
+def test_navigator_rail_wheel_at_loaded_edge_requests_older_history() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("navigator-wheel-edge")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    captured: list[tuple[str, int, int]] = []
+    panel.older_history_requested.connect(
+        lambda sid, off, lim: captured.append((sid, off, lim))
+    )
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._hide_timeline_overlay()
+    panel._timeline_scroll.viewport().resize(800, 600)
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+
+    assert panel.eventFilter(panel._navigator, _WheelEvent(120))
+    assert captured == [(rec.id, 600, 200)]
+    assert panel._loading_older is True
+    panel.close()
+
+
 def test_older_result_uses_request_time_anchor() -> None:
     from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
     from codex_quota_viewer.sessions_page import _SessionDetailPanel
@@ -2663,12 +2739,32 @@ def test_minimap_ignores_drag_requests_while_scroll_locked() -> None:
     panel.close()
 
 
-def test_minimap_drag_suspended_after_paging_refresh_until_release() -> None:
+def _rail_mouse_event(
+    event_type: QEvent.Type,
+    y: int,
+    *,
+    x: int = 11,
+    button: Qt.MouseButton = Qt.LeftButton,
+    buttons: Qt.MouseButton = Qt.LeftButton,
+) -> QMouseEvent:
+    pos = QPointF(x, y)
+    return QMouseEvent(
+        event_type,
+        pos,
+        pos,
+        pos,
+        button,
+        buttons,
+        Qt.NoModifier,
+    )
+
+
+def _configured_timeline_rail():
     from codex_quota_viewer.sessions_page import _TimelineNavigatorRail
 
     QApplication.instance() or QApplication([])
     rail = _TimelineNavigatorRail()
-    rail.resize(22, 300)
+    rail.resize(rail._RAIL_WIDTH, 300)
     rail.set_viewport(
         [],
         content_height=1200,
@@ -2676,44 +2772,137 @@ def test_minimap_drag_suspended_after_paging_refresh_until_release() -> None:
         viewport_height=200,
         scroll_maximum=1000,
     )
+    return rail
+
+
+def test_minimap_drag_suspended_after_paging_refresh_until_release() -> None:
+    rail = _configured_timeline_rail()
     emitted: list[int] = []
     rail.scroll_value_requested.connect(emitted.append)
 
-    def event(
-        event_type: QEvent.Type,
-        y: int,
-        *,
-        button: Qt.MouseButton = Qt.LeftButton,
-        buttons: Qt.MouseButton = Qt.LeftButton,
-    ) -> QMouseEvent:
-        pos = QPointF(11, y)
-        return QMouseEvent(
-            event_type,
-            pos,
-            pos,
-            pos,
-            button,
-            buttons,
-            Qt.NoModifier,
-        )
-
-    rail.mousePressEvent(event(QEvent.MouseButtonPress, 120))
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120))
     assert len(emitted) == 1
     assert rail._dragging is True
 
     rail.suspend_drag_until_release()
-    rail.mouseMoveEvent(event(QEvent.MouseMove, 260))
+    rail.mouseMoveEvent(_rail_mouse_event(QEvent.MouseMove, 260))
     assert len(emitted) == 1
     assert rail._drag_suspended_until_release is True
 
     rail.mouseReleaseEvent(
-        event(QEvent.MouseButtonRelease, 260, buttons=Qt.NoButton)
+        _rail_mouse_event(QEvent.MouseButtonRelease, 260, buttons=Qt.NoButton)
     )
     assert rail._dragging is False
     assert rail._drag_suspended_until_release is False
 
-    rail.mousePressEvent(event(QEvent.MouseButtonPress, 180))
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 180))
     assert len(emitted) == 2
+    rail.close()
+
+
+def test_minimap_left_interaction_pad_accepts_drag_without_moving_visual_rail() -> None:
+    rail = _configured_timeline_rail()
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    assert rail._RAIL_WIDTH > rail._VISUAL_WIDTH
+    assert rail._thumb_rect().left() == pytest.approx(
+        rail._RAIL_WIDTH - rail._VISUAL_WIDTH + 2.0
+    )
+
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120, x=4))
+    rail.mouseMoveEvent(_rail_mouse_event(QEvent.MouseMove, 260, x=4))
+
+    assert rail._dragging is True
+    assert emitted == [rail._target_value_for_y(120), rail._target_value_for_y(260)]
+    rail.close()
+
+
+def test_minimap_drag_suspension_timeout_resumes_and_emits_current_cursor_target(
+    monkeypatch,
+) -> None:
+    rail = _configured_timeline_rail()
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120))
+    rail.suspend_drag_until_release()
+    assert rail._drag_suspension_timer.isActive()
+
+    cursor_pos = rail.mapToGlobal(QPoint(11, 260))
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.LeftButton)
+    )
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: cursor_pos))
+
+    rail._drag_suspension_timer.timeout.emit()
+    rail._drag_suspension_timer.stop()
+
+    assert rail._dragging is True
+    assert rail._drag_suspended_until_release is False
+    assert len(emitted) == 2
+    assert emitted[-1] == rail._target_value_for_y(260)
+    rail.close()
+
+
+def test_minimap_drag_suspension_release_clears_timer_without_timeout_emit(
+    monkeypatch,
+) -> None:
+    rail = _configured_timeline_rail()
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120))
+    rail.suspend_drag_until_release()
+    assert rail._drag_suspension_timer.isActive()
+
+    rail.mouseReleaseEvent(
+        _rail_mouse_event(QEvent.MouseButtonRelease, 260, buttons=Qt.NoButton)
+    )
+    assert rail._drag_suspension_timer.isActive() is False
+
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.NoButton)
+    )
+    monkeypatch.setattr(
+        QCursor, "pos", staticmethod(lambda: rail.mapToGlobal(QPoint(11, 260)))
+    )
+    rail._drag_suspension_timer.timeout.emit()
+
+    assert rail._dragging is False
+    assert rail._drag_suspended_until_release is False
+    assert len(emitted) == 1
+    rail.close()
+
+
+def test_minimap_drag_suspension_repeated_freeze_restarts_timeout(
+    monkeypatch,
+) -> None:
+    rail = _configured_timeline_rail()
+    rail._DRAG_SUSPENSION_TIMEOUT_MS = 160
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    cursor_pos = rail.mapToGlobal(QPoint(11, 260))
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.LeftButton)
+    )
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: cursor_pos))
+
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120))
+    rail.suspend_drag_until_release()
+    QTest.qWait(80)
+    rail.suspend_drag_until_release()
+    QTest.qWait(90)
+
+    assert len(emitted) == 1
+    assert rail._drag_suspended_until_release is True
+
+    QTest.qWait(120)
+
+    assert rail._drag_suspended_until_release is False
+    assert len(emitted) == 2
+    assert emitted[-1] == rail._target_value_for_y(260)
     rail.close()
 
 
@@ -3118,6 +3307,31 @@ def test_scroll_jump_buttons_show_both_in_middle() -> None:
     panel._update_scroll_jump_buttons()
     assert panel._scroll_top_btn.isVisible()
     assert panel._scroll_bottom_btn.isVisible()
+
+
+def test_scroll_jump_buttons_anchor_next_to_visible_minimap_rail() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+    from PySide6.QtWidgets import QWidget
+
+    app = QApplication.instance() or QApplication([])
+    parent = QWidget()
+    parent.resize(900, 700)
+    panel = _SessionDetailPanel(translator=lambda s: s, parent=parent)
+    panel.resize(900, 700)
+    parent.show()
+    panel.show()
+    app.processEvents()
+    panel._reposition_scroll_jump_buttons()
+
+    viewport = panel._timeline_scroll.viewport()
+    viewport_right = viewport.mapToGlobal(QPoint(viewport.width(), 0)).x()
+    visual_left = panel._navigator.mapToGlobal(
+        QPoint(int(round(panel._navigator._visual_left())), 0)
+    ).x()
+    bottom_right = panel._scroll_bottom_btn.x() + panel._scroll_bottom_btn.width()
+
+    assert bottom_right > viewport_right
+    assert bottom_right == visual_left - panel._SCROLL_JUMP_RAIL_GAP
 
 
 def test_scroll_jump_buttons_jump_to_extreme_values() -> None:
