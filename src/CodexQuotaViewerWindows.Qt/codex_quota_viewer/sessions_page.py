@@ -3859,16 +3859,6 @@ class SessionsPage(QWidget):
         ):
             self._reposition_list_overlay()
             self._reposition_floating_actions()
-        # Drive the deferred floating-bar show off the tree viewport's
-        # first paintEvent after a page show — see ``showEvent`` for
-        # the rationale.
-        if (
-            self._floating_actions_pending_show
-            and tree is not None
-            and obj is tree.viewport()
-            and event.type() == QEvent.Paint
-        ):
-            self._show_floating_actions_after_layout()
         if (
             tree is not None
             and obj is tree.viewport()
