@@ -9252,6 +9252,8 @@ class _ImageOpenOverlay(_FrostedSurface):
     INNER_COLOR = QColor(0, 0, 0, 0)
 
     _MAX_VISIBLE_MS = 3000
+    _CAPTURE_DELAY_MS = 16
+    _LAUNCH_AFTER_BLUR_DELAY_MS = 16
     # Higher values = stronger blur. 14× downsample blends out text and
     # image detail while keeping rough colour blocks recognisable.
     _BLUR_DOWNSAMPLE = 14
@@ -9271,16 +9273,30 @@ class _ImageOpenOverlay(_FrostedSurface):
         self._fallback_timer.timeout.connect(self.dismiss)
         self._focus_hook_connected = False
         self._blurred_backdrop: QPixmap | None = None
+        self._capture_pending = False
+        self._after_backdrop_callbacks: list[Callable[[], None]] = []
         self.hide()
 
-    def trigger(self) -> bool:
+    def trigger(self, on_backdrop_ready: Callable[[], None] | None = None) -> bool:
         """Show the overlay. Returns ``False`` if it was already visible
-        (caller should treat the click as debounced)."""
+        (caller should treat the click as debounced).
+
+        The grab + blur is intentionally deferred past the first paint:
+        capturing the parent on a freshly-rendered card pays
+        Qt's first-time render overhead (style resolution, layout
+        validation, pixmap caching), which on busy bubbles costs up to
+        a second on the click→paint critical path. With pure-blur
+        palette (BASE/TINT/BORDER all alpha 0) the overlay renders
+        nothing until the backdrop arrives, so frame 1 shows the
+        spinner against the still-clear card and frame 2 swaps in the
+        blurred backdrop. The user sees feedback within 16 ms instead
+        of waiting on the grab.
+        """
         if self.isVisible():
             return False
-        # Capture and blur the parent BEFORE showing. Overlay is still
-        # hidden, so the grab does not include itself.
-        self._refresh_backdrop()
+        self._after_backdrop_callbacks = []
+        if on_backdrop_ready is not None:
+            self._after_backdrop_callbacks.append(on_backdrop_ready)
         self.show()
         self.raise_()
         self._spinner.start()
@@ -9289,9 +9305,55 @@ class _ImageOpenOverlay(_FrostedSurface):
         if app is not None and not self._focus_hook_connected:
             app.focusWindowChanged.connect(self._on_focus_window_changed)
             self._focus_hook_connected = True
+        self._schedule_backdrop_capture()
         return True
 
+    def _schedule_backdrop_capture(self, delay_ms: int | None = None) -> None:
+        if self._capture_pending:
+            return
+        self._capture_pending = True
+        QTimer.singleShot(
+            self._CAPTURE_DELAY_MS if delay_ms is None else max(0, delay_ms),
+            self._capture_backdrop_async,
+        )
+
+    def _capture_backdrop_async(self) -> None:
+        self._capture_pending = False
+        if not self.isVisible():
+            # User dismissed before the deferred capture ran (rare —
+            # would need < 16 ms between trigger and dismiss). Skip the
+            # work; the overlay is already hidden.
+            return
+        # Hide the spinner during the grab so it doesn't appear as a
+        # ghost blob in the blurred backdrop. The overlay itself is
+        # alpha-0 everywhere so it contributes nothing visible to the
+        # grab; only the spinner child has paint output. Qt batches
+        # the hide() + show() paint events with the trailing update(),
+        # so the user sees one continuous spinner with no flicker.
+        spinner_was_visible = self._spinner.isVisible()
+        if spinner_was_visible:
+            self._spinner.hide()
+        try:
+            self._refresh_backdrop()
+        finally:
+            if spinner_was_visible:
+                self._spinner.show()
+        self.update()
+        if self._after_backdrop_callbacks:
+            QTimer.singleShot(
+                self._LAUNCH_AFTER_BLUR_DELAY_MS,
+                self._drain_after_backdrop_callbacks,
+            )
+
+    def _drain_after_backdrop_callbacks(self) -> None:
+        callbacks = self._after_backdrop_callbacks
+        self._after_backdrop_callbacks = []
+        for callback in callbacks:
+            callback()
+
     def dismiss(self) -> None:
+        self._after_backdrop_callbacks = []
+        self._capture_pending = False
         if self._focus_hook_connected:
             app = QApplication.instance()
             if app is not None:
@@ -9315,7 +9377,7 @@ class _ImageOpenOverlay(_FrostedSurface):
         # Card resized while overlay is visible → recapture so the
         # backdrop matches the new geometry.
         if self.isVisible():
-            self._refresh_backdrop()
+            self._schedule_backdrop_capture()
 
     def paintEvent(self, _event) -> None:  # noqa: N802 - Qt naming
         # Override _FrostedSurface's buffered paint so we can layer the
@@ -9450,6 +9512,13 @@ class _ImageCard(_AttachmentCard):
         self._pixmap: QPixmap | None = None
         self._body_label: QLabel | None = None
         self._image_index: int = 0
+        # Cache of the temp-file path written by
+        # ``_materialize_attachment_for_external_open`` so a repeat click
+        # on the same image skips the base64 re-decode + sha256 hash on
+        # the UI thread. The first click still pays that cost; the
+        # ``QTimer.singleShot`` defer in ``_open_in_system_viewer`` keeps
+        # it off the click→paint critical path.
+        self._materialized_path: Path | None = None
         super().__init__(attachment, parent)
         # Overlay covers the whole card (header chrome + body) so the
         # launching state reads as one coherent dim rather than a band
@@ -9564,9 +9633,28 @@ class _ImageCard(_AttachmentCard):
         overlay = self._open_overlay
         # Debounce: if the spinner is already up the user is impatient and
         # the OS is still spawning the viewer — silently swallow re-clicks.
-        if overlay is not None and not overlay.trigger():
+        if overlay is None:
+            QTimer.singleShot(0, self._launch_external_viewer)
             return
-        path = _materialize_attachment_for_external_open(self._attachment, self._image)
+        if not overlay.trigger(self._launch_external_viewer):
+            return
+        # The overlay owns launch sequencing: first paint gets a spinner,
+        # then the expensive parent grab/blur runs, then the shell viewer is
+        # launched after the blurred backdrop has had a paint opportunity.
+        # This keeps both known expensive operations off the click handler
+        # and out of the first visual-response frame.
+
+    def _launch_external_viewer(self) -> None:
+        overlay = self._open_overlay
+        cached = self._materialized_path
+        if cached is not None and cached.exists():
+            path: Path | None = cached
+        else:
+            path = _materialize_attachment_for_external_open(
+                self._attachment, self._image
+            )
+            if path is not None:
+                self._materialized_path = path
         if path is None:
             if overlay is not None:
                 overlay.dismiss()

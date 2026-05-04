@@ -481,6 +481,11 @@ def test_image_card_overlay_debounces_repeated_clicks(monkeypatch) -> None:
     card._open_in_system_viewer()
     card._open_in_system_viewer()
     card._open_in_system_viewer()
+    # The viewer launch waits for overlay first-paint + backdrop capture.
+    deadline = time.monotonic() + 1.0
+    while not open_calls and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
 
     assert len(open_calls) == 1, "subsequent clicks while spinner is up should be swallowed"
 
@@ -494,6 +499,61 @@ def test_image_card_overlay_debounces_repeated_clicks(monkeypatch) -> None:
     overlay.dismiss()
     assert not overlay.isVisible()
 
+    bubble.hide()
+
+
+def test_image_open_does_not_blur_or_launch_on_click_stack(monkeypatch) -> None:
+    """A click on a freshly-rendered image must return immediately.
+
+    The expensive card grab/blur and shell launch are both delayed until after
+    the overlay has had a chance to paint its spinner. This guards the
+    regression where ``singleShot(0)`` work still ran before the first visual
+    response and made the click appear ignored for one or two seconds.
+    """
+    QApplication.instance() or QApplication([])
+    attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri=_TEST_PNG_DATA_URI,
+        source="payload",
+    )
+    item = SessionTimelineItem(
+        id="m-lazy-open",
+        type="message:user",
+        timestamp="2026-04-28T05:10:14Z",
+        text="x",
+        attachments=(attachment,),
+    )
+    bubble = _MessageBubble(
+        "user", item.timestamp, item.text, parent=None, attachments=item.attachments
+    )
+    card = bubble.findChildren(_ImageCard)[0]
+    bubble.show()
+    QApplication.processEvents()
+
+    refresh_calls: list[bool] = []
+    open_calls: list[str] = []
+    overlay = card._open_overlay
+    assert overlay is not None
+    overlay._refresh_backdrop = lambda: refresh_calls.append(True)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "codex_quota_viewer.sessions_page.QDesktopServices.openUrl",
+        lambda url: open_calls.append(url.toLocalFile()) or True,
+    )
+
+    card._open_in_system_viewer()
+
+    assert overlay.isVisible()
+    assert refresh_calls == []
+    assert open_calls == []
+
+    deadline = time.monotonic() + 1.0
+    while not open_calls and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+
+    assert refresh_calls == [True]
+    assert len(open_calls) == 1
     bubble.hide()
 
 
