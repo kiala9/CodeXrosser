@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import html
 import re
 import sys
 from dataclasses import dataclass
@@ -239,6 +240,14 @@ class _SessionsFilterPopup(_SessionsSearchPopup):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("SessionsFilterPopup")
+
+
+class _SessionsExportPopup(_SessionsSearchPopup):
+    """Frosted popover for detail-panel export actions."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("SessionsExportPopup")
 
 
 class _ScrollJumpButton(QWidget):
@@ -524,6 +533,147 @@ def _format_block_timestamp(item: SessionTimelineItem) -> str:
         return slice_ if (len(slice_) == 5 and slice_[2] == ":") else ""
 
 
+_PREVIEW_WORKING_CHARS = 4096
+_PREVIEW_KNOWN_XML_PAIR_RE = re.compile(
+    r"<(?P<tag>cwd|shell|path|current_date|timezone|sandbox_mode|"
+    r"writable_roots|collaboration_mode|environment_context)>"
+    r"(?P<value>.*?)</(?P=tag)>",
+    re.DOTALL | re.IGNORECASE,
+)
+_PREVIEW_GENERIC_XML_PAIR_RE = re.compile(
+    r"<(?P<tag>[A-Za-z][\w:.-]*)(?:\s+[^>]*)?>"
+    r"(?P<value>.*?)</(?P=tag)>",
+    re.DOTALL,
+)
+_PREVIEW_TAG_RE = re.compile(r"</?[A-Za-z][\w:.-]*(?:\s+[^>]*)?/?>")
+_PREVIEW_MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]*)\)")
+_PREVIEW_MD_LINK_RE = re.compile(r"\[(?P<label>[^\]]+)\]\((?P<src>[^)]*)\)")
+_PREVIEW_MD_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_PREVIEW_MD_PREFIX_RE = re.compile(
+    r"^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+|[-*_]{3,}\s*$)"
+)
+_PREVIEW_SPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_preview_text(
+    text: str,
+    *,
+    translator: Callable[[str], str] | None = None,
+    max_chars: int = 120,
+    fallback: str = "",
+) -> str:
+    """One-line plain-text preview for row delegates and Time Travel.
+
+    The source text can be XML-ish Codex metadata, markdown, pasted emoji, or
+    normal prose. Delegates must receive a single logical line: QPainter's
+    drawText honours embedded newlines and will otherwise paint across
+    adjacent rows.
+    """
+    if not isinstance(text, str):
+        return fallback
+    sample = text[:_PREVIEW_WORKING_CHARS]
+    if translator is not None:
+        env = _parse_environment_context(sample)
+        if env:
+            parts: list[str] = []
+            for key in ("cwd", "shell", "sandbox_mode", "current_date", "timezone"):
+                value = env.get(key)
+                if value:
+                    parts.append(f"{key}: {value}")
+            if parts:
+                return _safe_preview_truncate(" · ".join(parts), max_chars)
+    sample = _markdown_to_plain_preview(sample)
+    sample = _xml_to_plain_preview(sample)
+    sample = html.unescape(sample)
+    sample = sample.replace("\u00a0", " ")
+    sample = _PREVIEW_SPACE_RE.sub(" ", sample).strip()
+    if not sample:
+        sample = fallback
+    return _safe_preview_truncate(sample, max_chars)
+
+
+def _markdown_to_plain_preview(text: str) -> str:
+    if not text:
+        return ""
+
+    def replace_image(match: re.Match[str]) -> str:
+        alt = (match.group("alt") or "").strip()
+        return alt or "image"
+
+    text = _PREVIEW_MD_IMAGE_RE.sub(replace_image, text)
+    text = re.sub(
+        r"!\[(?P<alt>[^\]]*)\]\([^)]*$",
+        lambda m: (m.group("alt") or "").strip() or "image",
+        text,
+    )
+    text = _PREVIEW_MD_LINK_RE.sub(lambda m: m.group("label").strip(), text)
+    text = re.sub(
+        r"\[(?P<label>[^\]]+)\]\([^)]*$",
+        lambda m: m.group("label").strip(),
+        text,
+    )
+    lines: list[str] = []
+    in_fence = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _PREVIEW_MD_FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        line = _PREVIEW_MD_PREFIX_RE.sub("", line).strip()
+        if not line:
+            continue
+        # Strip common inline markdown wrappers without touching path
+        # separators or underscores inside filenames.
+        line = re.sub(r"(`+)(.*?)\1", r"\2", line)
+        line = re.sub(r"(\*\*|__)(.*?)\1", r"\2", line)
+        line = re.sub(r"(\*|_)([^*_]+?)\1", r"\2", line)
+        line = re.sub(r"(~~)(.*?)\1", r"\2", line)
+        lines.append(line)
+    return " ".join(lines)
+
+
+def _xml_to_plain_preview(text: str) -> str:
+    if not text:
+        return ""
+
+    def replace_known(match: re.Match[str]) -> str:
+        tag = match.group("tag")
+        value = _PREVIEW_SPACE_RE.sub(" ", match.group("value")).strip()
+        return f"{tag}: {value}" if value else tag
+
+    text = _PREVIEW_KNOWN_XML_PAIR_RE.sub(replace_known, text)
+    stripped = text.lstrip()
+    if stripped.startswith("<"):
+        text = _PREVIEW_GENERIC_XML_PAIR_RE.sub(replace_known, text)
+        text = _PREVIEW_TAG_RE.sub("", text)
+    return text
+
+
+def _safe_preview_truncate(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    suffix = "..."
+    limit = max(1, max_chars - len(suffix))
+    cut = text[:limit].rstrip()
+    while cut and _is_dangling_emoji_modifier(cut[-1]):
+        cut = cut[:-1].rstrip()
+    return f"{cut}{suffix}"
+
+
+def _is_dangling_emoji_modifier(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        char == "\u200d"
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or 0x1F3FB <= codepoint <= 0x1F3FF
+        or codepoint == 0x20E3
+    )
+
+
 def _block_preview_text(block: Any, *, translator: Callable[[str], str], max_chars: int = 120) -> str:
     """Short preview string used by the Time Travel vertical-view rows.
     Slices the head BEFORE strip() — same anti-allocation trick as
@@ -536,13 +686,19 @@ def _block_preview_text(block: Any, *, translator: Callable[[str], str], max_cha
         return f"{suffix}  —  {names}" if names else suffix
     item_type = getattr(payload, "type", "")
     if item_type in ("message:user", "message:assistant"):
-        head = (getattr(payload, "text", "") or "")[: max_chars * 2].strip()
-        return head[:max_chars]
+        return _normalize_preview_text(
+            getattr(payload, "text", "") or "",
+            translator=translator,
+            max_chars=max_chars,
+        )
     if item_type == "tool_call":
         name = getattr(payload, "tool_name", None) or "unknown_tool"
-        summary = (getattr(payload, "summary", "") or "").strip()
+        summary = _normalize_preview_text(
+            getattr(payload, "summary", "") or "",
+            max_chars=max_chars,
+        )
         if summary and summary != name:
-            return f"{name}  —  {summary[:max_chars]}"
+            return _safe_preview_truncate(f"{name}  —  {summary}", max_chars)
         return name
     return ""
 
@@ -555,13 +711,17 @@ def _index_preview_text(
 ) -> str:
     if item.type == "tool_call":
         name = item.tool_name or "unknown_tool"
-        summary = (item.preview or "").strip()
+        summary = _normalize_preview_text(item.preview or "", max_chars=max_chars)
         if summary and summary != name:
-            return f"{name}  —  {summary[:max_chars]}"
+            return _safe_preview_truncate(f"{name}  —  {summary}", max_chars)
         return name
-    text = (item.preview or "").strip()
+    text = _normalize_preview_text(
+        item.preview or "",
+        translator=translator,
+        max_chars=max_chars,
+    )
     if text:
-        return text[:max_chars]
+        return text
     if item.type == "message:user":
         return translator("User prompt")
     return translator("Assistant message")
@@ -922,7 +1082,11 @@ class _TimeTravelRowDelegate(QStyledItemDelegate):
             elided = metrics.elidedText(
                 preview, Qt.ElideRight, max(0, preview_rect.width())
             )
-            painter.drawText(preview_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
+            painter.drawText(
+                preview_rect,
+                Qt.AlignVCenter | Qt.AlignLeft | Qt.TextSingleLine,
+                elided,
+            )
 
             # Timestamp.
             ts_rect = QRect(
@@ -1411,11 +1575,23 @@ class _SessionsTreeModel(QStandardItemModel):
         if compact:
             title_text = "(context compaction)"
         else:
-            title_text = record.user_prompt_excerpt or record.id
+            title_text = _normalize_preview_text(
+                record.user_prompt_excerpt,
+                max_chars=180,
+                fallback=record.id,
+            )
         title_item = QStandardItem(title_text)
         title_item.setEditable(False)
         title_item.setData(record.id, _RECORD_ID_ROLE)
-        title_item.setData(record.cwd or record.latest_agent_message_excerpt or "", _RECORD_SUBTITLE_ROLE)
+        title_item.setData(
+            record.cwd
+            or _normalize_preview_text(
+                record.latest_agent_message_excerpt,
+                max_chars=180,
+            )
+            or "",
+            _RECORD_SUBTITLE_ROLE,
+        )
         title_item.setData(_format_started_at(record.started_at), _RECORD_STARTED_ROLE)
         title_item.setData(record.status, _RECORD_STATUS_ROLE)
         title_item.setData(record.event_count, _RECORD_EVENT_COUNT_ROLE)
@@ -1933,7 +2109,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         elided = painter.fontMetrics().elidedText(str(title), Qt.ElideRight, max(20, text_right - text_left))
         painter.drawText(
             QRectF(text_left, text_rect_top, max(20, text_right - text_left), text_rect_height),
-            Qt.AlignLeft | Qt.AlignVCenter,
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
             elided,
         )
 
@@ -2045,7 +2221,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             meta_y = title_y + 40
         painter.drawText(
             QRectF(text_left, title_y, max(24, text_right - text_left), 22),
-            Qt.AlignLeft | Qt.AlignVCenter,
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
             painter.fontMetrics().elidedText(title, Qt.ElideRight, max(24, text_right - text_left)),
         )
 
@@ -2057,7 +2233,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
             painter.setPen(QColor(140, 149, 163) if not selected else QColor(185, 210, 230))
             painter.drawText(
                 QRectF(text_left, subtitle_y, max(24, text_right - text_left), 18),
-                Qt.AlignLeft | Qt.AlignVCenter,
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
                 painter.fontMetrics().elidedText(subtitle, Qt.ElideRight, max(24, text_right - text_left)),
             )
 
@@ -2073,7 +2249,7 @@ class _SessionsTreeDelegate(QStyledItemDelegate):
         painter.setPen(QColor(165, 177, 193) if not selected else QColor(210, 230, 245))
         painter.drawText(
             QRectF(text_left, meta_y, max(24, text_right - text_left), 18),
-            Qt.AlignLeft | Qt.AlignVCenter,
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
             painter.fontMetrics().elidedText(meta, Qt.ElideRight, max(24, text_right - text_left)),
         )
 
@@ -4021,7 +4197,34 @@ _WINDOW_SIZE = 120  # max blocks alive in the sliding window
 _WINDOW_HALF = _WINDOW_SIZE // 2  # offset used when recentering on a focus block
 _RECENTER_THRESHOLD = _WINDOW_SIZE // 4  # natural-scroll drift before recenter
 _EDGE_TRIGGER_RATIO = 0.18  # scroll within this fraction of an edge → slide
+_DEFERRED_RENDER_COST_THRESHOLD = 32 * 1024
+_DEFERRED_RENDER_CHUNK_BLOCKS = 4
+# Filtered older-page prepends still rebuild a matched-view window. The common
+# unfiltered path below reconciles existing widgets in place instead.
+_PREPEND_RENDER_CHUNK_BLOCKS = _WINDOW_HALF
+_PREPEND_RENDER_CHUNK_DELAY_MS = 1
+_PREPEND_ANCHOR_SETTLE_PASSES = 3
+_PREPEND_ANCHOR_SCROLL_TOLERANCE = 2
+_PREPEND_HEADROOM_BLOCKS = _WINDOW_SIZE // 4
+_PAGING_MINIMAP_REFRESH_DELAY_MS = 80
 _TOOL_GROUP_MIN = 2  # coalesce N or more consecutive tool calls into a group
+
+
+@dataclass(frozen=True)
+class _PrependAnchor:
+    item_id: str | None
+    pixel_offset: int
+    raw_scroll: int
+    fallback_user_id: str | None
+    block_index: int | None
+    window_start: int
+    window_end: int
+
+
+@dataclass(frozen=True)
+class _RenderedWidgetSnapshot:
+    widget: QWidget
+    item_ids: tuple[str, ...]
 
 
 class _SessionDetailPanel(QFrame):
@@ -4110,6 +4313,7 @@ class _SessionDetailPanel(QFrame):
         # slide trigger from spamming the worker.
         self._loading_older: bool = False
         self._loading_newer: bool = False
+        self._pending_older_anchor: _PrependAnchor | None = None
         # The user prompt whose section the viewport currently belongs to.
         # The window stays anchored on this block; the rail puts its dot at
         # the rail's center. Sliding/redraw only happens when this changes.
@@ -4139,9 +4343,8 @@ class _SessionDetailPanel(QFrame):
 
         # ---- detail-panel toolbar + filter popup ------------------------
         # Replaces the old session-meta header (id/started/cwd/provider/...).
-        # The toolbar row holds: clock placeholder (time-travel TBD),
-        # search-target toggle, search input, screenshot/export
-        # placeholders, and a filter trigger button at the end.
+        # The toolbar row holds: Time Travel, search-target toggle, search
+        # input, an export-menu trigger, and a filter trigger button at the end.
         # The role/type filter chips, the bubble-count chip and the
         # reset button live inside ``_filter_popup`` — a frosted
         # popover anchored under the trigger button. Folding them into
@@ -4158,6 +4361,9 @@ class _SessionDetailPanel(QFrame):
         # as Optional so the panel can dispose it on session-switch without
         # leaking a stale top-level window into the next session.
         self._time_travel_popup: _TimeTravelPopup | None = None
+        self._export_popup = _SessionsExportPopup(self)
+        self._export_popup.setStyleSheet(_DETAIL_PANEL_QSS)
+        self._export_popup.dismiss_requested.connect(self._dismiss_export_popup)
         self._filter_popup = _SessionsFilterPopup(self)
         # The popup is a top-level window so it does NOT inherit the
         # detail card's QSS via the widget tree. Re-apply the same
@@ -4168,6 +4374,7 @@ class _SessionDetailPanel(QFrame):
         self._filter_popup.setStyleSheet(_DETAIL_PANEL_QSS)
         self._filter_popup.dismiss_requested.connect(self._dismiss_filter_popup)
         layout.addLayout(self._build_detail_toolbar_row())
+        self._populate_export_popup()
         self._populate_filter_popup()
 
         # Timeline body: scroll area + navigator rail side by side.
@@ -4205,6 +4412,8 @@ class _SessionDetailPanel(QFrame):
         self._timeline_overlay.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
         self._timeline_overlay.hide()
         self._timeline_scroll.viewport().installEventFilter(self)
+        self._timeline_scroll.installEventFilter(self)
+        self._timeline_container.installEventFilter(self)
 
         # Floating jump-to-top / jump-to-bottom buttons. They are top-level
         # Qt.Tool windows (see _ScrollJumpButton's docstring for why) so the
@@ -4268,13 +4477,14 @@ class _SessionDetailPanel(QFrame):
         # Clock button — opens the Time Travel popup, a frosted overlay that
         # spans the page width and provides global navigation across the
         # entire session (vs. the in-window rail navigator on the right).
-        self._time_travel_button = QPushButton()
-        self._time_travel_button.setObjectName("SessionsDetailToolbarButton")
+        self._time_travel_button = QPushButton(self._translator("Time Travel"))
+        self._time_travel_button.setObjectName("SessionsTimeTravelButton")
         self._time_travel_button.setIcon(_clock_icon())
-        self._time_travel_button.setIconSize(QSize(18, 18))
-        self._time_travel_button.setFixedSize(32, 32)
+        self._time_travel_button.setIconSize(QSize(16, 16))
+        self._time_travel_button.setMinimumSize(118, 32)
+        self._time_travel_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self._time_travel_button.setCursor(Qt.PointingHandCursor)
-        self._time_travel_button.setToolTip(self._translator("Time travel"))
+        self._time_travel_button.setToolTip(self._translator("Open Time Travel"))
         self._time_travel_button.clicked.connect(self._on_time_travel_clicked)
         row.addWidget(self._time_travel_button)
 
@@ -4327,23 +4537,16 @@ class _SessionDetailPanel(QFrame):
         self._detail_search.textChanged.connect(self._on_search_text_changed)
         row.addWidget(self._detail_search, 1)
 
-        # Screenshot mode + Export — placeholders. Tooltips disclose status.
-        self._screenshot_button = QPushButton(self._translator("Screenshot"))
-        self._screenshot_button.setObjectName("SessionsDetailToolbarButton")
-        self._screenshot_button.setIcon(_camera_icon())
-        self._screenshot_button.setIconSize(QSize(16, 16))
-        self._screenshot_button.setMinimumHeight(32)
-        self._screenshot_button.setCursor(Qt.PointingHandCursor)
-        self._screenshot_button.setToolTip(self._translator("Screenshot mode (coming soon)"))
-        row.addWidget(self._screenshot_button)
-
+        # Export trigger — opens a frosted action menu. Screenshot moved
+        # into that menu so capture/export actions are grouped together.
         self._export_button = QPushButton(self._translator("Export"))
         self._export_button.setObjectName("SessionsDetailToolbarButton")
         self._export_button.setIcon(_download_icon())
         self._export_button.setIconSize(QSize(16, 16))
         self._export_button.setMinimumHeight(32)
         self._export_button.setCursor(Qt.PointingHandCursor)
-        self._export_button.setToolTip(self._translator("Export (coming soon)"))
+        self._export_button.setToolTip(self._translator("Export menu"))
+        self._export_button.clicked.connect(self._toggle_export_popup)
         row.addWidget(self._export_button)
 
         # Filter trigger — opens the filter popover with the role chips and
@@ -4363,6 +4566,45 @@ class _SessionDetailPanel(QFrame):
         row.addWidget(self._filter_button)
 
         return row
+
+    def _populate_export_popup(self) -> None:
+        body = QVBoxLayout(self._export_popup)
+        body.setContentsMargins(8, 8, 8, 8)
+        body.setSpacing(4)
+
+        self._export_screenshot_button = QPushButton(
+            self._translator("Screenshot"), self._export_popup
+        )
+        self._export_screenshot_button.setObjectName("SessionsExportMenuItem")
+        self._export_screenshot_button.setIcon(_camera_icon())
+        self._export_screenshot_button.setIconSize(QSize(16, 16))
+        self._export_screenshot_button.setMinimumHeight(34)
+        self._export_screenshot_button.setCursor(Qt.PointingHandCursor)
+        self._export_screenshot_button.setToolTip(
+            self._translator("Screenshot mode (coming soon)")
+        )
+        self._export_screenshot_button.clicked.connect(
+            self._on_screenshot_action_clicked
+        )
+        body.addWidget(self._export_screenshot_button)
+
+        self._export_markdown_button = QPushButton(
+            self._translator("Export to MD"), self._export_popup
+        )
+        self._export_markdown_button.setObjectName("SessionsExportMenuItem")
+        self._export_markdown_button.setIcon(_download_icon())
+        self._export_markdown_button.setIconSize(QSize(16, 16))
+        self._export_markdown_button.setMinimumHeight(34)
+        self._export_markdown_button.setCursor(Qt.PointingHandCursor)
+        self._export_markdown_button.setToolTip(
+            self._translator("Export to Markdown (coming soon)")
+        )
+        self._export_markdown_button.clicked.connect(
+            self._on_export_markdown_clicked
+        )
+        body.addWidget(self._export_markdown_button)
+
+        self._export_popup.hide()
 
     def _populate_filter_popup(self) -> None:
         """Build the inner layout of the filter popover.
@@ -4560,6 +4802,63 @@ class _SessionDetailPanel(QFrame):
     def _update_reset_button_visibility(self) -> None:
         self._sync_filter_button_state()
 
+    # ---- export popup lifecycle -----------------------------------------
+
+    def _toggle_export_popup(self) -> None:
+        if self._export_popup.isVisible():
+            self._export_popup.hide()
+            return
+        self._show_export_popup()
+
+    def _show_export_popup(self) -> None:
+        self._dismiss_filter_popup()
+        if self._time_travel_popup is not None and self._time_travel_popup.isVisible():
+            self._dismiss_time_travel_popup()
+        self._position_export_popup()
+        self._export_popup.show()
+        self._export_popup.raise_()
+        self._export_popup.install_dwm_chrome()
+        self._export_popup.activateWindow()
+        self._export_markdown_button.setFocus(Qt.PopupFocusReason)
+
+    def _position_export_popup(self) -> None:
+        container = self
+        width = min(240, max(190, container.width() - 24))
+        height = max(72, self._export_popup.sizeHint().height())
+        button_bottom_global = self._export_button.mapToGlobal(
+            QPoint(0, self._export_button.height() + 8)
+        )
+        container_top_global = container.mapToGlobal(QPoint(0, 0))
+        x_local = (
+            button_bottom_global.x()
+            + self._export_button.width()
+            - width
+            - container_top_global.x()
+        )
+        x_local = min(
+            max(12, x_local),
+            max(12, container.width() - width - 12),
+        )
+        y_local = button_bottom_global.y() - container_top_global.y()
+        y_local = min(
+            y_local,
+            max(12, container.height() - height - 12),
+        )
+        self._export_popup.setFixedSize(width, height)
+        self._export_popup.move(
+            QPoint(container_top_global.x() + x_local, container_top_global.y() + y_local)
+        )
+
+    def _dismiss_export_popup(self) -> None:
+        if self._export_popup.isVisible():
+            self._export_popup.hide()
+
+    def _on_screenshot_action_clicked(self) -> None:
+        self._dismiss_export_popup()
+
+    def _on_export_markdown_clicked(self) -> None:
+        self._dismiss_export_popup()
+
     # ---- filter popup lifecycle -----------------------------------------
 
     def _toggle_filter_popup(self) -> None:
@@ -4569,6 +4868,7 @@ class _SessionDetailPanel(QFrame):
         self._show_filter_popup()
 
     def _show_filter_popup(self) -> None:
+        self._dismiss_export_popup()
         self._position_filter_popup()
         self._filter_popup.show()
         self._filter_popup.raise_()
@@ -4625,6 +4925,8 @@ class _SessionDetailPanel(QFrame):
         if self._time_travel_popup is not None and self._time_travel_popup.isVisible():
             self._dismiss_time_travel_popup()
             return
+        self._dismiss_export_popup()
+        self._dismiss_filter_popup()
         if self._time_travel_popup is None:
             host_window = self.window() or self
             self._time_travel_popup = _TimeTravelPopup(self._translator, host_window)
@@ -4949,19 +5251,26 @@ class _SessionDetailPanel(QFrame):
         view_n = self._view_size()
         self._window_start = 0
         self._window_end = min(_WINDOW_SIZE, view_n)
+        self._render_token += 1
+        token = self._render_token
         self._suppress_edge_slide = True
-        try:
-            self._clear_timeline()
-            self._build_window_widgets(
-                self._window_start, self._window_end, prepend=False
-            )
-            self._timeline_container.adjustSize()
-            self._timeline_container.layout().activate()
-        finally:
+        self._clear_timeline()
+
+        def _finish_filter_render() -> None:
+            if token != self._render_token:
+                return
+            self._timeline_scroll.verticalScrollBar().setValue(0)
             self._suppress_edge_slide = False
-        self._timeline_scroll.verticalScrollBar().setValue(0)
-        self._refresh_status_label()
-        self._schedule_minimap_refresh()
+            self._refresh_status_label()
+            self._hide_timeline_overlay()
+            self._schedule_minimap_refresh()
+
+        self._render_window_or_defer(
+            self._window_start,
+            self._window_end,
+            token=token,
+            on_done=_finish_filter_render,
+        )
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
         et = event.type()
@@ -4975,6 +5284,11 @@ class _SessionDetailPanel(QFrame):
             self._reposition_timeline_overlay()
             self._reposition_scroll_jump_buttons()
             self._schedule_minimap_refresh()
+        if et == QEvent.Wheel and self._is_timeline_event_source(obj):
+            if self._should_consume_timeline_wheel(event):
+                return True
+            if self._handle_timeline_edge_wheel(event):
+                return True
         # The jump buttons are top-level windows in *global* screen
         # coordinates, so they don't follow the host window automatically —
         # we have to reposition them whenever the host moves or resizes.
@@ -4986,6 +5300,8 @@ class _SessionDetailPanel(QFrame):
                 and self._time_travel_popup.isVisible()
             ):
                 self._position_time_travel_popup()
+            if self._export_popup.isVisible():
+                self._position_export_popup()
         return super().eventFilter(obj, event)
 
     # -- showEvent/hideEvent: top-level jump buttons need explicit lifecycle.
@@ -5008,6 +5324,8 @@ class _SessionDetailPanel(QFrame):
 
     def hideEvent(self, event) -> None:  # noqa: N802 - Qt naming
         super().hideEvent(event)
+        self._dismiss_export_popup()
+        self._dismiss_filter_popup()
         if self._scroll_top_btn is not None:
             self._scroll_top_btn.hide()
         if self._scroll_bottom_btn is not None:
@@ -5032,6 +5350,88 @@ class _SessionDetailPanel(QFrame):
     def _hide_timeline_overlay(self) -> None:
         if self._timeline_overlay is not None:
             self._timeline_overlay.hide()
+
+    def _is_timeline_event_source(self, obj: Any) -> bool:
+        if obj in (
+            self._timeline_scroll,
+            self._timeline_scroll.viewport(),
+            self._timeline_container,
+        ):
+            return True
+        if not isinstance(obj, QWidget):
+            return False
+        return (
+            self._timeline_container.isAncestorOf(obj)
+            or self._timeline_scroll.viewport().isAncestorOf(obj)
+        )
+
+    def _timeline_scroll_locked(self) -> bool:
+        if self._suppress_edge_slide or self._loading_older or self._loading_newer:
+            return True
+        return bool(
+            self._timeline_overlay is not None
+            and self._timeline_overlay.isVisible()
+        )
+
+    def _should_consume_timeline_wheel(self, event) -> bool:
+        """Hold wheel input while a programmatic rebuild owns scroll state.
+
+        Older-page loading has two phases: the worker fetch, then a widget
+        rebuild + anchor restore. Extra upward wheel ticks at the loaded top
+        during either phase do not map to real content yet, so let the pending
+        prepend finish before accepting more upward scroll.
+        """
+        return self._timeline_scroll_locked()
+
+    def _handle_timeline_edge_wheel(self, event) -> bool:
+        """Trigger window paging when a wheel tick cannot move the scrollbar.
+
+        At the very top/bottom, Qt does not emit ``valueChanged`` for another
+        wheel tick in the same direction. Relying only on the throttled
+        ``_on_scroll_settled`` path therefore makes the user scroll down once
+        and back up before older history loads. Handle edge wheel input here
+        so top-edge paging is immediate.
+        """
+        delta_y = self._wheel_delta_y(event)
+        if delta_y == 0:
+            return False
+        viewport_h = self._timeline_scroll.viewport().height()
+        if viewport_h <= 0:
+            return False
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        value = scrollbar.value()
+        maximum = scrollbar.maximum()
+        edge_px = max(60, int(viewport_h * _EDGE_TRIGGER_RATIO))
+        if delta_y > 0 and value <= edge_px and (
+            self._window_start > 0 or self._loaded_offset > 0
+        ):
+            self._scroll_throttle.stop()
+            self._slide_window_up()
+            return True
+        if delta_y < 0 and (maximum - value) <= edge_px and (
+            self._window_end < self._view_size() or self._has_newer_history()
+        ):
+            self._scroll_throttle.stop()
+            self._slide_window_down()
+            return True
+        return False
+
+    @staticmethod
+    def _wheel_delta_y(event) -> int:
+        for name in ("angleDelta", "pixelDelta"):
+            getter = getattr(event, name, None)
+            if not callable(getter):
+                continue
+            delta = getter()
+            if delta is None:
+                continue
+            y_getter = getattr(delta, "y", None)
+            if not callable(y_getter):
+                continue
+            value = int(y_getter())
+            if value:
+                return value
+        return 0
 
     # ---- floating jump-to-top / jump-to-bottom buttons --------------------
 
@@ -5119,6 +5519,10 @@ class _SessionDetailPanel(QFrame):
 
     def show_loading_placeholder(self, record: SessionRecord) -> None:
         self._render_token += 1
+        self._loading_older = False
+        self._loading_newer = False
+        self._pending_older_anchor = None
+        self._suppress_edge_slide = False
         self._all_blocks = []
         self._user_anchor_blocks = []
         self._current_user_block = None
@@ -5142,6 +5546,9 @@ class _SessionDetailPanel(QFrame):
         # Cancel any in-flight older-page request — its result would
         # belong to the previous session anyway.
         self._loading_older = False
+        self._loading_newer = False
+        self._pending_older_anchor = None
+        self._suppress_edge_slide = False
         # Dispose the Time Travel popup if it's open — its block list /
         # window indices belong to the *previous* session and re-pushing
         # against the new (briefly empty) state can show stale data
@@ -5197,20 +5604,37 @@ class _SessionDetailPanel(QFrame):
         self._recompute_filtered_view()
         # Build the window centered on the current user anchor.
         self._set_window_centered_on(self._current_user_block or 0)
-        self._build_window_widgets(self._window_start, self._window_end, prepend=False)
         self._set_audit_text(_format_audit(detail.audit_entries))
-        self._timeline_scroll.verticalScrollBar().setValue(0)
-        self._refresh_status_label()
-        self._refresh_minimap()
-        self._hide_timeline_overlay()
-        self._refresh_count_label()
-        QTimer.singleShot(0, self._refresh_minimap)
+
+        token = self._render_token
+        self._suppress_edge_slide = True
+
+        def _finish_initial_render() -> None:
+            if token != self._render_token:
+                return
+            self._timeline_scroll.verticalScrollBar().setValue(0)
+            self._suppress_edge_slide = False
+            self._refresh_status_label()
+            self._refresh_minimap()
+            self._hide_timeline_overlay()
+            self._refresh_count_label()
+            QTimer.singleShot(0, self._refresh_minimap)
+
+        self._render_window_or_defer(
+            self._window_start,
+            self._window_end,
+            token=token,
+            on_done=_finish_initial_render,
+        )
 
     def discard_rendered_timeline(self) -> None:
         """Drop every bubble widget. Caller is expected to re-fetch and call
         set_detail again on the next show."""
         self._render_token += 1
         self._loading_older = False
+        self._loading_newer = False
+        self._pending_older_anchor = None
+        self._suppress_edge_slide = False
         # Same reason as set_detail: don't leak the popup pointing at the
         # previous session's blocks across a panel reset.
         self._dismiss_time_travel_popup()
@@ -5225,7 +5649,6 @@ class _SessionDetailPanel(QFrame):
         self._timeline_total = 0
         self._time_travel_index_items = []
         self._time_travel_index_pending = False
-        self._loading_newer = False
         self._loaded_session_id = None
         self._clear_timeline()
         self._timeline_status.setText("")
@@ -5285,6 +5708,161 @@ class _SessionDetailPanel(QFrame):
         start = max(0, end - _WINDOW_SIZE)
         self._window_start = start
         self._window_end = end
+
+    def _set_window_with_prepend_headroom(
+        self, anchor_block: int, anchor: _PrependAnchor
+    ) -> None:
+        """Materialize older headroom while preserving the visible anchor.
+
+        Older-page fetches should feel like a normal chat-history prepend:
+        the pre-fetch top bubble stays put, but newly-loaded rows above it are
+        immediately scrollable. Keeping the anchor as the first rendered block
+        avoids jumps but creates a dead first wheel tick; centering it can
+        overdo the headroom and let Qt clamp the anchor restore. A modest
+        quarter-window headroom gives the user real upward scroll range while
+        retaining enough content below the anchor for stable restoration.
+        """
+        view_n = self._view_size()
+        if view_n <= 0:
+            self._window_start = 0
+            self._window_end = 0
+            return
+        window_size = max(1, anchor.window_end - anchor.window_start)
+        window_size = min(window_size, _WINDOW_SIZE, view_n)
+        old_anchor_offset = 0
+        if anchor.block_index is not None:
+            old_anchor_offset = max(0, anchor.block_index - anchor.window_start)
+        anchor_view_pos = self._view_pos_for_block(anchor_block)
+        if anchor_view_pos is None:
+            anchor_view_pos = max(0, min(anchor_block, view_n - 1))
+        headroom = min(
+            anchor_view_pos,
+            max(old_anchor_offset, _PREPEND_HEADROOM_BLOCKS),
+            max(0, window_size - 1),
+        )
+        start = anchor_view_pos - headroom
+        start = max(0, min(start, max(0, view_n - window_size)))
+        end = min(view_n, start + window_size)
+        self._window_start = start
+        self._window_end = end
+
+    def _window_render_cost(self, start: int, end: int) -> int:
+        total = 0
+        for view_pos in range(start, end):
+            try:
+                physical = self._block_index_for_view(view_pos)
+            except IndexError:
+                continue
+            total += self._block_render_cost(physical)
+            if total > _DEFERRED_RENDER_COST_THRESHOLD:
+                return total
+        return total
+
+    def _block_render_cost(self, block_index: int) -> int:
+        if not 0 <= block_index < len(self._all_blocks):
+            return 0
+        kind, payload = self._all_blocks[block_index]
+        if kind == "tool_group":
+            return sum(
+                len(getattr(item, "summary", "") or "")
+                + len(getattr(item, "input", "") or "")
+                + len(getattr(item, "output", "") or "")
+                for item in payload
+            )
+        item_type = getattr(payload, "type", "")
+        if item_type in ("message:user", "message:assistant"):
+            return len(getattr(payload, "text", "") or "") + (
+                50_000 if getattr(payload, "attachments", ()) else 0
+            )
+        if item_type == "tool_call":
+            return (
+                len(getattr(payload, "summary", "") or "")
+                + len(getattr(payload, "input", "") or "")
+                + len(getattr(payload, "output", "") or "")
+            )
+        return 0
+
+    def _should_defer_window_render(self, start: int, end: int) -> bool:
+        return self._window_render_cost(start, end) > _DEFERRED_RENDER_COST_THRESHOLD
+
+    def _render_window_or_defer(
+        self,
+        start: int,
+        end: int,
+        *,
+        token: int,
+        on_done: Callable[[], None],
+        force_defer: bool = False,
+        chunk_blocks: int = _DEFERRED_RENDER_CHUNK_BLOCKS,
+        chunk_delay_ms: int = 0,
+    ) -> None:
+        if start >= end:
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+            on_done()
+            return
+        if not force_defer and not self._should_defer_window_render(start, end):
+            self._build_window_widgets(start, end, prepend=False)
+            self._timeline_container.adjustSize()
+            self._timeline_container.layout().activate()
+            on_done()
+            return
+        self._show_timeline_overlay(self._translator("Loading timeline..."))
+        QTimer.singleShot(
+            0,
+            lambda s=start,
+            e=end,
+            c=start,
+            t=token,
+            cb=on_done,
+            step=chunk_blocks: self._render_window_chunk(
+                s,
+                e,
+                c,
+                token=t,
+                on_done=cb,
+                chunk_blocks=step,
+                chunk_delay_ms=chunk_delay_ms,
+            ),
+        )
+
+    def _render_window_chunk(
+        self,
+        start: int,
+        end: int,
+        cursor: int,
+        *,
+        token: int,
+        on_done: Callable[[], None],
+        chunk_blocks: int = _DEFERRED_RENDER_CHUNK_BLOCKS,
+        chunk_delay_ms: int = 0,
+    ) -> None:
+        if token != self._render_token:
+            return
+        next_cursor = min(cursor + max(1, chunk_blocks), end)
+        self._build_window_widgets(cursor, next_cursor, prepend=False)
+        self._timeline_container.adjustSize()
+        self._timeline_container.layout().activate()
+        if next_cursor < end:
+            QTimer.singleShot(
+                max(0, chunk_delay_ms),
+                lambda s=start,
+                e=end,
+                c=next_cursor,
+                t=token,
+                cb=on_done,
+                step=chunk_blocks: self._render_window_chunk(
+                    s,
+                    e,
+                    c,
+                    token=t,
+                    on_done=cb,
+                    chunk_blocks=step,
+                    chunk_delay_ms=chunk_delay_ms,
+                ),
+            )
+            return
+        on_done()
 
     # ------------------------------------------------------ window mechanics
 
@@ -5359,7 +5937,110 @@ class _SessionDetailPanel(QFrame):
             bubble = _build_block_widget(block, parent=self._timeline_container)
             wrapped = _wrap_bubble(bubble, parent=self._timeline_container)
             wrapped.setProperty("blockIndex", block_index)
+            self._install_timeline_wheel_filters(wrapped)
         return wrapped
+
+    def _install_timeline_wheel_filters(self, widget: QWidget) -> None:
+        for candidate in (widget, *widget.findChildren(QWidget)):
+            if candidate.property("_cqvTimelineWheelFilterInstalled") is True:
+                continue
+            candidate.installEventFilter(self)
+            candidate.setProperty("_cqvTimelineWheelFilterInstalled", True)
+
+    def _anchor_id_for_block(self, block_index: int) -> str | None:
+        if not 0 <= block_index < len(self._all_blocks):
+            return None
+        item_ids = self._item_ids_for_block(block_index)
+        return item_ids[0] if item_ids else None
+
+    def _item_ids_for_block(self, block_index: int) -> tuple[str, ...]:
+        if not 0 <= block_index < len(self._all_blocks):
+            return ()
+        kind, payload = self._all_blocks[block_index]
+        if kind == "single":
+            item_id = getattr(payload, "id", None)
+            return (item_id,) if item_id else ()
+        if kind == "tool_group":
+            return tuple(
+                item_id
+                for item_id in (getattr(item, "id", None) for item in payload)
+                if item_id
+            )
+        return ()
+
+    def _capture_rendered_widget_snapshots(self) -> list[_RenderedWidgetSnapshot]:
+        snapshots: list[_RenderedWidgetSnapshot] = []
+        for layout_index in range(self._timeline_layout.count() - 1):
+            item = self._timeline_layout.itemAt(layout_index)
+            widget = item.widget() if item is not None else None
+            if widget is None:
+                continue
+            block_index = widget.property("blockIndex")
+            item_ids: tuple[str, ...] = ()
+            if isinstance(block_index, int):
+                item_ids = self._item_ids_for_block(block_index)
+            snapshots.append(
+                _RenderedWidgetSnapshot(
+                    widget=widget,
+                    item_ids=item_ids,
+                )
+            )
+        return snapshots
+
+    def _reconcile_window_widgets(
+        self,
+        start: int,
+        end: int,
+        snapshots: list[_RenderedWidgetSnapshot],
+    ) -> None:
+        """Re-materialize [start, end) without tearing down unchanged bubbles.
+
+        Older-page prepends shift physical block indexes, so every kept
+        widget has its ``blockIndex`` property updated from stable item ids.
+        Existing single-message bubbles and unchanged tool groups are reused;
+        newly-loaded headroom blocks are built and stale tail widgets are
+        deleted after the new layout is in place.
+        """
+        reusable: dict[tuple[str, ...], _RenderedWidgetSnapshot] = {
+            snap.item_ids: snap
+            for snap in snapshots
+            if snap.item_ids
+        }
+        detached: list[QWidget] = []
+        while self._timeline_layout.count() > 1:
+            item = self._timeline_layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                detached.append(widget)
+
+        reused_widget_ids: set[int] = set()
+        with _perf_timer(
+            "ui.detail_panel.reconcile_window_widgets",
+            count=max(0, end - start),
+        ):
+            for view_pos in range(start, end):
+                physical = self._block_index_for_view(view_pos)
+                item_ids = self._item_ids_for_block(physical)
+                snapshot = reusable.pop(item_ids, None) if item_ids else None
+                if snapshot is not None:
+                    widget = snapshot.widget
+                    widget.setParent(self._timeline_container)
+                    widget.setProperty("blockIndex", physical)
+                    self._install_timeline_wheel_filters(widget)
+                    reused_widget_ids.add(id(widget))
+                else:
+                    widget = self._build_window_widget(physical)
+                    if widget is None:
+                        continue
+                self._timeline_layout.insertWidget(
+                    self._timeline_layout.count() - 1, widget
+                )
+
+        for widget in detached:
+            if id(widget) in reused_widget_ids:
+                continue
+            widget.hide()
+            widget.deleteLater()
 
     def _drop_widgets_at(self, layout_indexes: list[int]) -> int:
         """Delete the widgets at the given layout indexes (descending order
@@ -5388,15 +6069,24 @@ class _SessionDetailPanel(QFrame):
         self._set_window_centered_on(focus_block)
         if self._window_start == prev_start and self._window_end == prev_end:
             return
+        self._render_token += 1
+        token = self._render_token
         self._suppress_edge_slide = True
-        try:
-            self._clear_timeline()
-            self._build_window_widgets(self._window_start, self._window_end, prepend=False)
-            self._timeline_container.adjustSize()
-            self._timeline_container.layout().activate()
-        finally:
+        self._clear_timeline()
+
+        def _finish_recenter() -> None:
+            if token != self._render_token:
+                return
             self._suppress_edge_slide = False
-        self._refresh_minimap()
+            self._hide_timeline_overlay()
+            self._refresh_minimap()
+
+        self._render_window_or_defer(
+            self._window_start,
+            self._window_end,
+            token=token,
+            on_done=_finish_recenter,
+        )
 
     def _slide_window_down(self) -> None:
         """Edge slide: append the next half-window of blocks and drop the
@@ -5470,22 +6160,30 @@ class _SessionDetailPanel(QFrame):
             )
             self._timeline_container.adjustSize()
             self._timeline_container.layout().activate()
-        finally:
+        except Exception:
             self._suppress_edge_slide = False
+            raise
         self._window_start = new_start
         self._window_end = new_end
-        self._refresh_status_label()
-        self._refresh_minimap()
 
         # Defer the scroll restore one event-loop tick so Qt has finished
         # propagating the real wrapped-text heights to widget.y(); the
         # apply re-finds the anchor block and lands at widget.y() + offset.
         if anchor_block_index is not None:
+            token = self._render_token
             QTimer.singleShot(
                 0,
-                lambda b=anchor_block_index, off=anchor_offset, raw=raw_scroll:
-                    self._apply_prepend_anchor(b, off, raw),
+                lambda b=anchor_block_index,
+                off=anchor_offset,
+                raw=raw_scroll,
+                t=token: self._apply_prepend_anchor_and_release(
+                    b, off, raw, token=t
+                ),
             )
+        else:
+            self._suppress_edge_slide = False
+            self._refresh_status_label()
+            self._refresh_minimap()
 
     # --- older-page pagination ------------------------------------------
     #
@@ -5509,7 +6207,10 @@ class _SessionDetailPanel(QFrame):
         page_limit = self._loaded_offset - new_offset
         if page_limit <= 0:
             return
+        self._pending_older_anchor = self._capture_prepend_anchor()
         self._loading_older = True
+        self._suppress_edge_slide = True
+        self._scroll_throttle.stop()
         self.older_history_requested.emit(
             self._loaded_session_id, new_offset, page_limit
         )
@@ -5532,6 +6233,9 @@ class _SessionDetailPanel(QFrame):
         if limit <= 0:
             return
         self._loading_newer = True
+        self._suppress_edge_slide = True
+        self._scroll_throttle.stop()
+        self._show_timeline_overlay(self._translator("Loading timeline..."))
         self.newer_history_requested.emit(self._loaded_session_id, offset, limit)
 
     def cancel_pending_older(self) -> None:
@@ -5539,9 +6243,38 @@ class _SessionDetailPanel(QFrame):
         result. Called by SessionsPage when the user navigates away or
         the manager surfaces an error."""
         self._loading_older = False
+        self._pending_older_anchor = None
+        self._suppress_edge_slide = False
+        self._hide_timeline_overlay()
 
     def cancel_pending_newer(self) -> None:
         self._loading_newer = False
+        self._suppress_edge_slide = False
+        self._hide_timeline_overlay()
+
+    def _capture_prepend_anchor(self) -> _PrependAnchor:
+        bar = self._timeline_scroll.verticalScrollBar()
+        raw_scroll = bar.value()
+        top_widget = self._topmost_visible_widget()
+        anchor_item_id = self._anchor_id_for_widget(top_widget)
+        anchor_block_index: int | None = None
+        if top_widget is not None:
+            candidate = top_widget.property("blockIndex")
+            if isinstance(candidate, int):
+                anchor_block_index = candidate
+        anchor_offset = (
+            raw_scroll - top_widget.y() if top_widget is not None else 0
+        )
+        fallback_user_id = self._current_user_anchor_id()
+        return _PrependAnchor(
+            item_id=anchor_item_id,
+            pixel_offset=anchor_offset,
+            raw_scroll=raw_scroll,
+            fallback_user_id=fallback_user_id,
+            block_index=anchor_block_index,
+            window_start=self._window_start,
+            window_end=self._window_end,
+        )
 
     def prepend_older_items(
         self,
@@ -5560,6 +6293,9 @@ class _SessionDetailPanel(QFrame):
             # Nothing to add; mark the offset so we don't re-issue the
             # same request infinitely if the manager returned empty.
             self._loaded_offset = max(0, min(self._loaded_offset, sql_offset))
+            self._pending_older_anchor = None
+            self._suppress_edge_slide = False
+            self._hide_timeline_overlay()
             return
         if not self._all_timeline_items:
             # Defensive: shouldn't happen because set_detail seeds
@@ -5569,6 +6305,9 @@ class _SessionDetailPanel(QFrame):
             self._loaded_offset = max(0, sql_offset)
             self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
             self._timeline_item_count = len(self._all_timeline_items)
+            self._pending_older_anchor = None
+            self._suppress_edge_slide = False
+            self._hide_timeline_overlay()
             return
 
         # Capture the topmost-visible bubble + its viewport offset so we
@@ -5576,14 +6315,9 @@ class _SessionDetailPanel(QFrame):
         # recoalesce. Anchoring on the active user prompt (the prior
         # behavior) snapped the view to that prompt's absolute y on every
         # older-page fetch — felt like a forced jump.
-        bar = self._timeline_scroll.verticalScrollBar()
-        raw_scroll = bar.value()
-        top_widget = self._topmost_visible_widget()
-        anchor_item_id = self._anchor_id_for_widget(top_widget)
-        anchor_offset = (
-            raw_scroll - top_widget.y() if top_widget is not None else 0
-        )
-        fallback_user_id = self._current_user_anchor_id()
+        pending_anchor = self._pending_older_anchor or self._capture_prepend_anchor()
+        self._pending_older_anchor = None
+        rendered_snapshots = self._capture_rendered_widget_snapshots()
 
         self._all_timeline_items = list(items) + self._all_timeline_items
         self._loaded_offset = max(0, sql_offset)
@@ -5601,7 +6335,7 @@ class _SessionDetailPanel(QFrame):
 
         # Track which user section we're in for the minimap highlight —
         # the user-prompt id may have shifted to a new block index.
-        new_user_block = self._block_for_message_id(fallback_user_id)
+        new_user_block = self._block_for_message_id(pending_anchor.fallback_user_id)
         if new_user_block is not None:
             self._current_user_block = new_user_block
 
@@ -5616,56 +6350,83 @@ class _SessionDetailPanel(QFrame):
             view_n = self._view_size()
             self._window_start = 0
             self._window_end = min(_WINDOW_SIZE, view_n)
+            self._render_token += 1
+            token = self._render_token
             self._suppress_edge_slide = True
-            try:
-                self._clear_timeline()
-                self._build_window_widgets(
-                    self._window_start, self._window_end, prepend=False
-                )
-                self._timeline_container.adjustSize()
-                self._timeline_container.layout().activate()
-            finally:
+            self._clear_timeline()
+
+            def _finish_filtered_prepend() -> None:
+                if token != self._render_token:
+                    return
+                self._timeline_scroll.verticalScrollBar().setValue(0)
                 self._suppress_edge_slide = False
-            self._timeline_scroll.verticalScrollBar().setValue(0)
-            self._refresh_status_label()
-            self._refresh_minimap()
+                self._refresh_status_label()
+                self._hide_timeline_overlay()
+                self._schedule_paging_minimap_refresh()
+
+            self._render_window_or_defer(
+                self._window_start,
+                self._window_end,
+                token=token,
+                on_done=_finish_filtered_prepend,
+                force_defer=True,
+                chunk_blocks=_PREPEND_RENDER_CHUNK_BLOCKS,
+                chunk_delay_ms=_PREPEND_RENDER_CHUNK_DELAY_MS,
+            )
             return
 
-        new_anchor_block = self._block_for_anchor_id(anchor_item_id)
+        new_anchor_block = self._block_for_anchor_id(pending_anchor.item_id)
         if new_anchor_block is None:
             # Defensive: top-visible item somehow not in the new blocks.
             # Fall back to the active user prompt (loses px precision
             # but keeps the view in the same conversational section),
             # then to the first user prompt, then to 0.
-            new_anchor_block = self._block_for_message_id(fallback_user_id)
+            new_anchor_block = self._block_for_message_id(
+                pending_anchor.fallback_user_id
+            )
         if new_anchor_block is None and self._user_anchor_blocks:
             new_anchor_block = self._user_anchor_blocks[0]
         if new_anchor_block is None:
             new_anchor_block = 0 if self._all_blocks else None
 
-        focus = new_anchor_block if new_anchor_block is not None else 0
-        self._set_window_centered_on(focus)
+        if new_anchor_block is not None:
+            self._set_window_with_prepend_headroom(
+                new_anchor_block, pending_anchor
+            )
+        else:
+            self._window_start = 0
+            self._window_end = min(_WINDOW_SIZE, self._view_size())
+        self._render_token += 1
+        token = self._render_token
         self._suppress_edge_slide = True
+
         try:
-            self._clear_timeline()
-            self._build_window_widgets(
-                self._window_start, self._window_end, prepend=False
+            self._reconcile_window_widgets(
+                self._window_start,
+                self._window_end,
+                rendered_snapshots,
             )
             self._timeline_container.adjustSize()
             self._timeline_container.layout().activate()
-        finally:
+        except Exception:
             self._suppress_edge_slide = False
+            self._hide_timeline_overlay()
+            raise
 
-        # Defer the scroll restore so Qt has propagated geometry —
-        # widget.y() is unreliable in the same tick as the activate().
         if new_anchor_block is not None:
-            QTimer.singleShot(
-                0,
-                lambda b=new_anchor_block, off=anchor_offset, raw=raw_scroll:
-                    self._apply_prepend_anchor(b, off, raw),
+            self._hide_timeline_overlay()
+            self._apply_prepend_anchor_and_release(
+                new_anchor_block,
+                pending_anchor.pixel_offset,
+                pending_anchor.raw_scroll,
+                token=token,
+                hide_overlay=False,
             )
-        self._refresh_status_label()
-        self._refresh_minimap()
+        else:
+            self._suppress_edge_slide = False
+            self._refresh_status_label()
+            self._hide_timeline_overlay()
+            self._schedule_paging_minimap_refresh()
 
     def append_newer_items(
         self,
@@ -5682,6 +6443,8 @@ class _SessionDetailPanel(QFrame):
         self._loading_newer = False
         if not items:
             self._timeline_total = max(self._timeline_total, total)
+            self._suppress_edge_slide = False
+            self._hide_timeline_overlay()
             return
         expected_offset = self._loaded_end_offset()
         if sql_offset < expected_offset:
@@ -5691,6 +6454,8 @@ class _SessionDetailPanel(QFrame):
             items = items[skip:]
         if not items:
             self._timeline_total = max(self._timeline_total, total)
+            self._suppress_edge_slide = False
+            self._hide_timeline_overlay()
             return
 
         old_view_size = self._view_size()
@@ -5705,11 +6470,15 @@ class _SessionDetailPanel(QFrame):
             if kind == "single" and payload.type == "message:user"
         ]
         self._recompute_filtered_view()
-        if was_at_loaded_bottom and self._view_size() > old_view_size:
-            self._slide_window_down()
-        else:
-            self._refresh_status_label()
-            self._refresh_minimap()
+        try:
+            if was_at_loaded_bottom and self._view_size() > old_view_size:
+                self._slide_window_down()
+            else:
+                self._refresh_status_label()
+                self._schedule_paging_minimap_refresh()
+        finally:
+            self._suppress_edge_slide = False
+            self._hide_timeline_overlay()
 
     def replace_timeline_page(
         self,
@@ -5728,6 +6497,7 @@ class _SessionDetailPanel(QFrame):
         """
         self._loading_older = False
         self._loading_newer = False
+        self._pending_older_anchor = None
         self._all_timeline_items = list(items)
         self._loaded_offset = max(0, sql_offset)
         self._timeline_total = max(total, len(items))
@@ -5758,26 +6528,33 @@ class _SessionDetailPanel(QFrame):
         else:
             self._window_start = 0
             self._window_end = 0
+        self._render_token += 1
+        token = self._render_token
         self._suppress_edge_slide = True
-        try:
-            self._clear_timeline()
-            self._build_window_widgets(
-                self._window_start, self._window_end, prepend=False
-            )
-            self._timeline_container.adjustSize()
-            self._timeline_container.layout().activate()
-        finally:
-            self._suppress_edge_slide = False
+        self._clear_timeline()
 
-        if focus_block is not None:
-            QTimer.singleShot(
-                0,
-                lambda b=focus_block: self._scroll_to_block_center(b),
-            )
-        self._refresh_status_label()
-        self._refresh_minimap()
-        self._hide_timeline_overlay()
-        self._refresh_count_label()
+        def _finish_offset_render() -> None:
+            if token != self._render_token:
+                return
+            if focus_block is not None:
+                QTimer.singleShot(
+                    0,
+                    lambda b=focus_block, t=token:
+                        self._scroll_to_block_center_and_release(b, token=t),
+                )
+                return
+            self._suppress_edge_slide = False
+            self._refresh_status_label()
+            self._refresh_minimap()
+            self._hide_timeline_overlay()
+            self._refresh_count_label()
+
+        self._render_window_or_defer(
+            self._window_start,
+            self._window_end,
+            token=token,
+            on_done=_finish_offset_render,
+        )
 
     def _topmost_visible_widget(self) -> QWidget | None:
         """The first materialized bubble whose bottom edge sits below the
@@ -5804,14 +6581,7 @@ class _SessionDetailPanel(QFrame):
         block_index = widget.property("blockIndex")
         if not isinstance(block_index, int):
             return None
-        if not 0 <= block_index < len(self._all_blocks):
-            return None
-        kind, payload = self._all_blocks[block_index]
-        if kind == "single":
-            return getattr(payload, "id", None)
-        if kind == "tool_group" and payload:
-            return getattr(payload[0], "id", None)
-        return None
+        return self._anchor_id_for_block(block_index)
 
     def _block_for_anchor_id(self, item_id: str | None) -> int | None:
         """Find the block (post-recoalesce) that contains ``item_id``.
@@ -5829,15 +6599,13 @@ class _SessionDetailPanel(QFrame):
                         return index
         return None
 
-    def _apply_prepend_anchor(
+    def _set_prepend_anchor_scroll(
         self, block_index: int, offset: int, raw_scroll: int
-    ) -> None:
-        """Restore scroll so the anchored bubble sits at the same viewport
-        offset as before the older-page prepend. Falls back to the raw
-        pre-prepend scroll value (clamped) when the anchor widget isn't
-        materialized — defensive only; ``_set_window_centered_on`` should
-        have brought it into the window."""
+    ) -> int:
         bar = self._timeline_scroll.verticalScrollBar()
+        layout = self._timeline_container.layout()
+        if layout is not None:
+            layout.activate()
         target_y: int | None = None
         for i in range(self._timeline_layout.count() - 1):
             item = self._timeline_layout.itemAt(i)
@@ -5847,14 +6615,83 @@ class _SessionDetailPanel(QFrame):
             if widget.property("blockIndex") == block_index:
                 target_y = widget.y()
                 break
+        if target_y is not None:
+            target = min(max(0, target_y + offset), bar.maximum())
+        else:
+            target = min(max(0, raw_scroll), bar.maximum())
+        bar.setValue(target)
+        return target
+
+    def _apply_prepend_anchor_and_release(
+        self,
+        block_index: int,
+        offset: int,
+        raw_scroll: int,
+        *,
+        token: int | None = None,
+        hide_overlay: bool = False,
+        remaining_passes: int = _PREPEND_ANCHOR_SETTLE_PASSES,
+        only_if_scroll_at: int | None = None,
+    ) -> None:
+        if token is not None and token != self._render_token:
+            return
+        if only_if_scroll_at is not None and not hide_overlay:
+            current = self._timeline_scroll.verticalScrollBar().value()
+            if abs(current - only_if_scroll_at) > _PREPEND_ANCHOR_SCROLL_TOLERANCE:
+                self._suppress_edge_slide = False
+                self._schedule_paging_minimap_refresh()
+                return
         self._suppress_edge_slide = True
-        try:
-            if target_y is not None:
-                bar.setValue(min(max(0, target_y + offset), bar.maximum()))
-            else:
-                bar.setValue(min(max(0, raw_scroll), bar.maximum()))
-        finally:
-            self._suppress_edge_slide = False
+        target = self._set_prepend_anchor_scroll(block_index, offset, raw_scroll)
+        # During older-page prepend, chunked rendering can finish before the
+        # scroll area's range has caught up with the rebuilt child geometry.
+        # If we hide the overlay on that first clamped-to-zero restore, the
+        # user briefly sees the headroom top, then a later settle pass jumps
+        # back to the real anchor. Keep the scroll transaction private until
+        # the settle passes have applied against a real range.
+        if hide_overlay and remaining_passes > 1:
+            QTimer.singleShot(
+                0,
+                lambda b=block_index,
+                off=offset,
+                raw=raw_scroll,
+                t=token,
+                last=target,
+                p=remaining_passes - 1: self._apply_prepend_anchor_and_release(
+                    b,
+                    off,
+                    raw,
+                    token=t,
+                    hide_overlay=True,
+                    remaining_passes=p,
+                    only_if_scroll_at=last,
+                ),
+            )
+            return
+        self._suppress_edge_slide = False
+        self._refresh_status_label()
+        if hide_overlay:
+            self._hide_timeline_overlay()
+        self._schedule_paging_minimap_refresh()
+        if remaining_passes > 1:
+            QTimer.singleShot(
+                0,
+                lambda b=block_index,
+                off=offset,
+                raw=raw_scroll,
+                t=token,
+                last=target,
+                p=remaining_passes - 1: self._apply_prepend_anchor_and_release(
+                    b,
+                    off,
+                    raw,
+                    token=t,
+                    hide_overlay=False,
+                    remaining_passes=p,
+                    only_if_scroll_at=last,
+                ),
+            )
+        return
 
     def _current_user_anchor_id(self) -> str | None:
         if self._current_user_block is None:
@@ -5889,11 +6726,23 @@ class _SessionDetailPanel(QFrame):
             return
         self._scroll_throttle.start()
 
-    def _schedule_minimap_refresh(self) -> None:
+    def _schedule_minimap_refresh(self, delay_ms: int = 16) -> None:
         if not self._minimap_refresh_timer.isActive():
+            self._minimap_refresh_timer.setInterval(delay_ms)
             self._minimap_refresh_timer.start()
 
+    def _schedule_paging_minimap_refresh(self) -> None:
+        # Page joins are interaction-sensitive: as soon as a page lands,
+        # minimap hit-testing must reflect the new materialized window. The
+        # exact widget geometry scan can wait a beat; the rail cannot.
+        if self._minimap_refresh_timer.isActive():
+            self._minimap_refresh_timer.stop()
+        self._refresh_minimap_fast()
+        self._schedule_minimap_refresh(_PAGING_MINIMAP_REFRESH_DELAY_MS)
+
     def _on_scroll_settled(self) -> None:
+        if self._timeline_scroll_locked():
+            return
         viewport_h = self._timeline_scroll.viewport().height()
         if viewport_h <= 0:
             return
@@ -5995,25 +6844,21 @@ class _SessionDetailPanel(QFrame):
             if token != self._render_token:
                 return
             self._suppress_edge_slide = True
-            try:
-                self._clear_timeline()
-                self._build_window_widgets(
-                    self._window_start, self._window_end, prepend=False
-                )
-                self._timeline_container.adjustSize()
-                self._timeline_container.layout().activate()
-            finally:
-                self._suppress_edge_slide = False
+            self._clear_timeline()
             # Defer the anchor to the next tick so Qt has propagated layout
             # geometry — widget.y() is unreliable in the same tick where its
             # parent layout was activated, making the reanchor calculation
             # snap to scrollbar = 0 (top of timeline).
-            QTimer.singleShot(0, _do_anchor)
+            self._render_window_or_defer(
+                self._window_start,
+                self._window_end,
+                token=token,
+                on_done=lambda: QTimer.singleShot(0, _do_anchor),
+            )
 
         def _do_anchor() -> None:
             if token != self._render_token:
                 return
-            self._suppress_edge_slide = True
             try:
                 on_anchor()
             finally:
@@ -6033,6 +6878,50 @@ class _SessionDetailPanel(QFrame):
         """
         with _perf_timer("ui.detail_panel.refresh_minimap"):
             self._refresh_minimap_impl()
+
+    def _refresh_minimap_fast(self) -> None:
+        """Immediately sync the rail to the logical window after paging.
+
+        This deliberately avoids scanning the just-rebuilt widget tree. Qt can
+        still be settling wrapped-text geometry in that frame, but the minimap
+        already needs the correct block/window ids for hover and drag math.
+        A delayed full refresh replaces these evenly-spaced markers with exact
+        y/height data once layout is stable.
+        """
+        view_n = self._view_size()
+        start = max(0, min(self._window_start, view_n))
+        end = max(start, min(self._window_end, view_n))
+        count = end - start
+
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        viewport_h = max(0, self._timeline_scroll.viewport().height())
+        content_h = max(1, scrollbar.maximum() + viewport_h)
+
+        markers: list[_MinimapMarker] = []
+        if count > 0:
+            for ordinal, view_pos in enumerate(range(start, end)):
+                block_index = self._block_index_for_view(view_pos)
+                y = int(round((ordinal * content_h) / count))
+                next_y = int(round(((ordinal + 1) * content_h) / count))
+                markers.append(
+                    _MinimapMarker(
+                        block_index=block_index,
+                        y=max(0, y),
+                        height=max(1, next_y - y),
+                        kind=self._minimap_kind_for_block(block_index),
+                        label=self._minimap_label_for_block(block_index),
+                    )
+                )
+
+        self._navigator.set_viewport(
+            markers,
+            content_height=content_h,
+            scroll_value=scrollbar.value(),
+            viewport_height=viewport_h,
+            scroll_maximum=scrollbar.maximum(),
+        )
+        if self._time_travel_popup is not None and self._time_travel_popup.isVisible():
+            self._push_time_travel_data()
 
     def _refresh_minimap_impl(self) -> None:
         layout = self._timeline_container.layout()
@@ -6141,6 +7030,20 @@ class _SessionDetailPanel(QFrame):
         self._suppress_edge_slide = False
         self._refresh_status_label()
         self._refresh_minimap()
+
+    def _scroll_to_block_center_and_release(
+        self, block_index: int, *, token: int
+    ) -> None:
+        if token != self._render_token:
+            return
+        try:
+            self._scroll_to_block_center(block_index)
+        finally:
+            self._suppress_edge_slide = False
+        self._refresh_status_label()
+        self._refresh_minimap()
+        self._hide_timeline_overlay()
+        self._refresh_count_label()
 
     # --------------------------------------------------------------- helpers
 
@@ -8980,9 +9883,8 @@ QFrame#SessionsDetailCard {{
     border: 1px solid {SURFACE_PANEL_BORDER};
     border-radius: 12px;
 }}
-/* Toolbar buttons (clock placeholder, screenshot, export, reset). Slim
-   chip-style with subtle hover/press feedback so the row reads as a
-   group of equal-weight controls — none of them is a primary action. */
+/* Toolbar buttons (export, reset). Slim chip-style with subtle hover/press
+   feedback so secondary toolbar actions stay visually subordinate. */
 QPushButton#SessionsDetailToolbarButton {{
     background: rgba(255, 255, 255, 18);
     border: 1px solid rgba(255, 255, 255, 30);
@@ -8997,6 +9899,23 @@ QPushButton#SessionsDetailToolbarButton:hover {{
 }}
 QPushButton#SessionsDetailToolbarButton:pressed {{
     background: {PRIMARY_SOFT};
+    border-color: {PRIMARY_BAND};
+}}
+QPushButton#SessionsTimeTravelButton {{
+    background: {PRIMARY};
+    border: 1px solid {PRIMARY_BAND};
+    border-radius: 8px;
+    color: #ffffff;
+    padding: 4px 14px;
+    font-size: 12px;
+    font-weight: 600;
+}}
+QPushButton#SessionsTimeTravelButton:hover {{
+    background: {PRIMARY_HOVER};
+    border-color: {PRIMARY_STRONG};
+}}
+QPushButton#SessionsTimeTravelButton:pressed {{
+    background: {PRIMARY_PRESSED};
     border-color: {PRIMARY_BAND};
 }}
 
@@ -9079,7 +9998,7 @@ QPushButton#SessionsDetailFilterChip:hover {{
     border-color: rgba(255, 255, 255, 50);
 }}
 QPushButton#SessionsDetailFilterChip:checked {{
-    background: {PRIMARY_GHOST};
+    background: {PRIMARY_TINT};
     border-color: {PRIMARY_BAND};
     color: #ffffff;
 }}
@@ -9104,11 +10023,30 @@ QPushButton#SessionsDetailQuickFilterButton:hover {{
     border-color: rgba(255, 255, 255, 50);
 }}
 QPushButton#SessionsDetailQuickFilterButton:pressed {{
-    background: {PRIMARY_GHOST};
+    background: {PRIMARY_TINT};
     border-color: {PRIMARY_BAND};
     color: #ffffff;
 }}
 QPushButton#SessionsDetailQuickFilterButton[active="true"] {{
+    background: {PRIMARY_TINT};
+    border-color: {PRIMARY_BAND};
+    color: #ffffff;
+}}
+
+QPushButton#SessionsExportMenuItem {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: rgba(235, 235, 245, 225);
+    padding: 7px 10px;
+    font-size: 12px;
+    text-align: left;
+}}
+QPushButton#SessionsExportMenuItem:hover {{
+    background: rgba(255, 255, 255, 22);
+    border-color: rgba(255, 255, 255, 48);
+}}
+QPushButton#SessionsExportMenuItem:pressed {{
     background: {PRIMARY_GHOST};
     border-color: {PRIMARY_BAND};
     color: #ffffff;
@@ -9164,7 +10102,8 @@ QPushButton#SessionsDetailFilterButton[hasActiveFilter="true"] {{
    is overridden by the inherited buffered paintEvent
    (CompositionMode_Source) but having the QSS rule here keeps the
    intent legible and gives the bg a fallback if the paint is skipped. */
-QFrame#SessionsFilterPopup {{
+QFrame#SessionsFilterPopup,
+QFrame#SessionsExportPopup {{
     background: {SURFACE_FROSTED};
     border: 1px solid {SURFACE_FROSTED_BORDER};
     border-radius: 12px;
