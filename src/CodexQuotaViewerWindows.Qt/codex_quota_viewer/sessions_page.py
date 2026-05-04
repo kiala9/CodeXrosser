@@ -1022,6 +1022,12 @@ class _TimeTravelVerticalModel(QAbstractListModel):
             return row.item_id or ""
         return None
 
+    def row_for_jump_offset(self, offset: int) -> int | None:
+        for row_index, row in enumerate(self._rows):
+            if row.jump_offset == offset:
+                return row_index
+        return None
+
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
         if not index.isValid():
             return Qt.NoItemFlags
@@ -1298,11 +1304,13 @@ class _TimeTravelVerticalView(QWidget):
     ) -> None:
         self._model.refresh_index(items)
         if current_offset is not None:
-            source_index = self._model.index(current_offset, 0)
-            proxy_index = self._proxy.mapFromSource(source_index)
-            if proxy_index.isValid():
-                self._list.setCurrentIndex(proxy_index)
-                self._list.scrollTo(proxy_index, QAbstractItemView.PositionAtCenter)
+            row = self._model.row_for_jump_offset(current_offset)
+            if row is not None:
+                source_index = self._model.index(row, 0)
+                proxy_index = self._proxy.mapFromSource(source_index)
+                if proxy_index.isValid():
+                    self._list.setCurrentIndex(proxy_index)
+                    self._list.scrollTo(proxy_index, QAbstractItemView.PositionAtCenter)
 
     def focus_search(self) -> None:
         self._search_input.setFocus()
@@ -4274,6 +4282,8 @@ _PREPEND_RENDER_CHUNK_BLOCKS = _WINDOW_HALF
 _PREPEND_RENDER_CHUNK_DELAY_MS = 1
 _PREPEND_ANCHOR_SETTLE_PASSES = 3
 _PREPEND_ANCHOR_SCROLL_TOLERANCE = 2
+_JUMP_ANCHOR_SETTLE_PASSES = 4
+_JUMP_ANCHOR_SETTLE_DELAY_MS = 16
 _PREPEND_HEADROOM_BLOCKS = _WINDOW_SIZE // 4
 _PAGING_MINIMAP_REFRESH_DELAY_MS = 80
 _PAGING_INPUT_QUARANTINE_MS = 160
@@ -5088,10 +5098,7 @@ class _SessionDetailPanel(QFrame):
         rapid-browsing until they ESC or click outside."""
         if not (0 <= block_index < len(self._all_blocks)):
             return
-        self._recenter_async(
-            block_index,
-            on_anchor=lambda b=block_index: self._scroll_to_block_center(b),
-        )
+        self._recenter_async(block_index)
         # The async rebuild's overlay spinner can briefly steal focus from
         # the popup, which would trigger DISMISS_ON_DEACTIVATE — re-arm
         # the popup as the active window so it stays put.
@@ -5142,7 +5149,7 @@ class _SessionDetailPanel(QFrame):
             self._filtered_block_indices,
             self._window_start,
             self._window_end,
-            self._current_user_block,
+            self._current_navigation_block(),
         )
 
     def _needs_time_travel_index(self) -> bool:
@@ -7130,8 +7137,48 @@ class _SessionDetailPanel(QFrame):
                 return getattr(payload, "id", None)
         return None
 
+    def _current_navigation_block(self) -> int | None:
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        viewport = self._timeline_scroll.viewport()
+        viewport_h = viewport.height() if viewport is not None else 0
+        if viewport_h <= 0:
+            return self._current_user_block
+        viewport_top = scrollbar.value()
+        center_y = viewport_top + viewport_h // 2
+        top_visible_block: int | None = None
+        previous_block: int | None = None
+        for layout_index in range(self._timeline_layout.count() - 1):
+            item = self._timeline_layout.itemAt(layout_index)
+            widget = item.widget() if item is not None else None
+            if widget is None or widget.isHidden():
+                continue
+            block_index = widget.property("blockIndex")
+            if not isinstance(block_index, int):
+                continue
+            if not (0 <= block_index < len(self._all_blocks)):
+                continue
+            top = widget.y()
+            bottom = top + max(1, widget.height())
+            if top_visible_block is None and bottom > viewport_top:
+                top_visible_block = block_index
+            if top <= center_y < bottom:
+                return block_index
+            if top > center_y:
+                return previous_block or top_visible_block or block_index
+            previous_block = block_index
+        return top_visible_block or previous_block or self._current_user_block
+
+    def _current_navigation_anchor_id(self) -> str | None:
+        block_index = self._current_navigation_block()
+        if block_index is None:
+            return self._current_user_anchor_id()
+        ids = self._item_ids_for_block(block_index)
+        if ids:
+            return ids[0]
+        return self._current_user_anchor_id()
+
     def _current_timeline_offset(self) -> int | None:
-        anchor_id = self._current_user_anchor_id()
+        anchor_id = self._current_navigation_anchor_id()
         if anchor_id:
             for index, item in enumerate(self._all_timeline_items):
                 if item.id == anchor_id:
@@ -7249,8 +7296,6 @@ class _SessionDetailPanel(QFrame):
     def _recenter_async(
         self,
         focus_block: int,
-        *,
-        on_anchor: Callable[[], None],
     ) -> None:
         """Defer the heavy widget rebuild to the next event-loop tick so the
         UI can paint a "Loading..." overlay first. The user's click feels
@@ -7285,17 +7330,24 @@ class _SessionDetailPanel(QFrame):
                 on_done=lambda: QTimer.singleShot(0, _do_anchor),
             )
 
-        def _do_anchor() -> None:
+        def _release_after_anchor() -> None:
             if token != self._render_token:
                 return
-            try:
-                on_anchor()
-            finally:
-                self._finish_paging_scroll_transaction()
-                self._suppress_edge_slide = False
+            self._finish_paging_scroll_transaction()
+            self._suppress_edge_slide = False
             self._hide_timeline_overlay()
             self._refresh_status_label()
             self._refresh_minimap()
+
+        def _do_anchor() -> None:
+            if token != self._render_token:
+                return
+            self._suppress_edge_slide = True
+            self._settle_block_center(
+                focus_block,
+                token=token,
+                on_done=_release_after_anchor,
+            )
 
         QTimer.singleShot(0, _do_rebuild)
 
@@ -7447,10 +7499,15 @@ class _SessionDetailPanel(QFrame):
         self._scroll_throttle.start()
         self._refresh_minimap()
 
-    def _scroll_to_block_center(self, block_index: int) -> None:
+    def _scroll_to_block_center(
+        self,
+        block_index: int,
+        *,
+        keep_suppressed: bool = False,
+    ) -> bool:
         widget = self._find_widget_for_block(block_index)
         if widget is None:
-            return
+            return False
         self._timeline_container.layout().activate()
         scrollbar = self._timeline_scroll.verticalScrollBar()
         viewport_h = self._timeline_scroll.viewport().height()
@@ -7459,24 +7516,62 @@ class _SessionDetailPanel(QFrame):
         target = max(0, min(target, scrollbar.maximum()))
         self._suppress_edge_slide = True
         scrollbar.setValue(target)
-        self._suppress_edge_slide = False
+        if not keep_suppressed:
+            self._suppress_edge_slide = False
         self._refresh_status_label()
         self._refresh_minimap()
+        return True
+
+    def _settle_block_center(
+        self,
+        block_index: int,
+        *,
+        token: int,
+        on_done: Callable[[], None],
+        remaining_passes: int = _JUMP_ANCHOR_SETTLE_PASSES,
+    ) -> None:
+        if token != self._render_token:
+            return
+        try:
+            self._scroll_to_block_center(block_index, keep_suppressed=True)
+        finally:
+            if remaining_passes > 1:
+                QTimer.singleShot(
+                    _JUMP_ANCHOR_SETTLE_DELAY_MS,
+                    lambda b=block_index,
+                    t=token,
+                    cb=on_done,
+                    p=remaining_passes - 1: self._settle_block_center(
+                        b,
+                        token=t,
+                        on_done=cb,
+                        remaining_passes=p,
+                    ),
+                )
+                return
+            on_done()
 
     def _scroll_to_block_center_and_release(
         self, block_index: int, *, token: int
     ) -> None:
         if token != self._render_token:
             return
-        try:
-            self._scroll_to_block_center(block_index)
-        finally:
+
+        def _release_after_center() -> None:
+            if token != self._render_token:
+                return
             self._finish_paging_scroll_transaction()
             self._suppress_edge_slide = False
-        self._refresh_status_label()
-        self._refresh_minimap()
-        self._hide_timeline_overlay()
-        self._refresh_count_label()
+            self._refresh_status_label()
+            self._refresh_minimap()
+            self._hide_timeline_overlay()
+            self._refresh_count_label()
+
+        self._settle_block_center(
+            block_index,
+            token=token,
+            on_done=_release_after_center,
+        )
 
     # --------------------------------------------------------------- helpers
 

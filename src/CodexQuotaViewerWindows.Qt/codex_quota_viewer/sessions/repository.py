@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -18,6 +19,20 @@ from .models import (
     SessionTimelineItem,
     SessionTimelinePage,
 )
+
+
+@dataclass(frozen=True)
+class SessionScanMetadata:
+    """Lightweight per-session row used by the incremental-rescan cache
+    check. Just enough to decide whether a file's path/mtime matches
+    what we last parsed — the full ``CatalogSessionEntry`` is only
+    rebuilt when the cache misses."""
+    session_id: str
+    active_path: str | None
+    archive_path: str | None
+    snapshot_path: str | None
+    primary_mtime_ns: int
+    parser_version: int
 
 
 SCHEMA_FILE_NAME = "schema.sql"
@@ -109,14 +124,71 @@ class SessionRepository:
         return bool(self._fts_available)
 
     def replace_catalog(self, entries: list[CatalogSessionEntry]) -> list[SessionRecord]:
+        # Thin wrapper over upsert_catalog: every entry treated as fresh,
+        # nothing kept → DB rows not present in ``entries`` get deleted.
+        # Same end-state as the old all-delete-then-insert path; kept for
+        # callers (e.g. existing tests) that don't have stat metadata.
+        return self.upsert_catalog(
+            fresh_entries=entries,
+            fresh_metadata={},
+            kept_session_ids=set(),
+        )
+
+    def upsert_catalog(
+        self,
+        *,
+        fresh_entries: list[CatalogSessionEntry],
+        fresh_metadata: dict[str, tuple[int, int]],
+        kept_session_ids: set[str],
+    ) -> list[SessionRecord]:
+        """Selective catalog rewrite for the incremental-rescan path.
+
+        - ``fresh_entries``: sessions that were re-parsed this scan. Their
+          ``sessions`` row is upserted, ``timeline_items`` and
+          ``session_search`` rows are deleted-then-reinserted.
+          ``fresh_metadata[session_id] == (primary_mtime_ns, parser_version)``
+          is written into the cache columns; defaults to (0, 0) when absent.
+        - ``kept_session_ids``: cache hits — DB rows are left untouched
+          (no timeline rewrite, no search rewrite). ``indexed_at`` is
+          refreshed so the UI knows we saw them this scan.
+        - Anything in DB but in neither set: deleted (file removed from
+          disk between scans)."""
         indexed_at = _now_iso()
-        with _perf_timer("repository.replace_catalog", entries=len(entries)):
+        fresh_ids = {entry.summary.id for entry in fresh_entries}
+        with _perf_timer(
+            "repository.upsert_catalog",
+            fresh=len(fresh_entries),
+            kept=len(kept_session_ids),
+        ):
             with self._lock, self._transaction():
                 existing = self._read_all_session_rows()
-                self._connection.execute("delete from timeline_items")
-                self._connection.execute("delete from sessions")
-                self._clear_session_search()
-                for entry in entries:
+                # 1. Delete sessions absent from disk (orphaned).
+                obsolete_ids = [
+                    sid
+                    for sid in existing.keys()
+                    if sid not in fresh_ids and sid not in kept_session_ids
+                ]
+                for sid in obsolete_ids:
+                    self._connection.execute(
+                        "delete from timeline_items where session_id = ?", (sid,)
+                    )
+                    self._connection.execute(
+                        "delete from session_search where session_id = ?", (sid,)
+                    )
+                    self._connection.execute(
+                        "delete from sessions where id = ?", (sid,)
+                    )
+                # 2. Refresh ``indexed_at`` for kept rows so they don't
+                # look stale to the UI. No content change.
+                for sid in kept_session_ids:
+                    if sid in existing:
+                        self._connection.execute(
+                            "update sessions set indexed_at = ? where id = ?",
+                            (indexed_at, sid),
+                        )
+                # 3. Upsert fresh entries — same per-entry behavior as the
+                # old replace_catalog, but per-row instead of nuke-and-pave.
+                for entry in fresh_entries:
                     prior = existing.get(entry.summary.id)
                     created_at = prior["created_at"] if prior else indexed_at
                     updated_at = (
@@ -124,10 +196,51 @@ class SessionRepository:
                         if prior and not _did_catalog_entry_change(prior, entry)
                         else indexed_at
                     )
-                    self._insert_session(entry, created_at=created_at, updated_at=updated_at, indexed_at=indexed_at)
+                    mtime_ns, parser_version = fresh_metadata.get(
+                        entry.summary.id, (0, 0)
+                    )
+                    self._connection.execute(
+                        "delete from timeline_items where session_id = ?",
+                        (entry.summary.id,),
+                    )
+                    self._connection.execute(
+                        "delete from session_search where session_id = ?",
+                        (entry.summary.id,),
+                    )
+                    self._upsert_session(
+                        entry,
+                        created_at=created_at,
+                        updated_at=updated_at,
+                        indexed_at=indexed_at,
+                        primary_mtime_ns=mtime_ns,
+                        parser_version=parser_version,
+                    )
                     self._insert_session_search(entry)
                     self._insert_timeline_items(entry)
         return self.list_sessions()
+
+    def list_session_scan_metadata(self) -> list[SessionScanMetadata]:
+        """Lightweight per-session read used by the incremental-rescan
+        cache check. Returns just the columns needed to decide whether
+        the on-disk primary file's path/mtime match what we last parsed."""
+        rows = self._connection.execute(
+            """
+            select id, active_path, archive_path, snapshot_path,
+                   primary_mtime_ns, parser_version
+            from sessions
+            """
+        ).fetchall()
+        return [
+            SessionScanMetadata(
+                session_id=str(row["id"]),
+                active_path=row["active_path"],
+                archive_path=row["archive_path"],
+                snapshot_path=row["snapshot_path"],
+                primary_mtime_ns=int(row["primary_mtime_ns"] or 0),
+                parser_version=int(row["parser_version"] or 0),
+            )
+            for row in rows
+        ]
 
     def save_catalog_entry(self, entry: CatalogSessionEntry) -> SessionRecord:
         now = _now_iso()
@@ -500,8 +613,17 @@ class SessionRepository:
         created_at: str,
         updated_at: str,
         indexed_at: str,
+        primary_mtime_ns: int = 0,
+        parser_version: int = 0,
     ) -> None:
-        self._connection.execute(_INSERT_SESSION_SQL, _entry_to_params(entry, created_at, updated_at, indexed_at))
+        self._connection.execute(
+            _INSERT_SESSION_SQL,
+            _entry_to_params(
+                entry, created_at, updated_at, indexed_at,
+                primary_mtime_ns=primary_mtime_ns,
+                parser_version=parser_version,
+            ),
+        )
 
     def _upsert_session(
         self,
@@ -510,8 +632,17 @@ class SessionRepository:
         created_at: str,
         updated_at: str,
         indexed_at: str,
+        primary_mtime_ns: int = 0,
+        parser_version: int = 0,
     ) -> None:
-        self._connection.execute(_UPSERT_SESSION_SQL, _entry_to_params(entry, created_at, updated_at, indexed_at))
+        self._connection.execute(
+            _UPSERT_SESSION_SQL,
+            _entry_to_params(
+                entry, created_at, updated_at, indexed_at,
+                primary_mtime_ns=primary_mtime_ns,
+                parser_version=parser_version,
+            ),
+        )
 
     def _insert_session_search(self, entry: CatalogSessionEntry) -> None:
         if not self.fts_available:
@@ -563,6 +694,18 @@ class SessionRepository:
             self._connection.execute(
                 "update sessions set indexed_at = coalesce(indexed_at, updated_at, created_at, CURRENT_TIMESTAMP)"
             )
+        # P1.5 incremental-rescan freshness columns. Existing rows default
+        # to 0 → mismatches the current PARSER_VERSION → first post-upgrade
+        # rescan reparses everything (same cost as today's behavior), then
+        # writes real values and subsequent rescans are incremental.
+        if "primary_mtime_ns" not in column_names:
+            self._connection.execute(
+                "alter table sessions add column primary_mtime_ns integer not null default 0"
+            )
+        if "parser_version" not in column_names:
+            self._connection.execute(
+                "alter table sessions add column parser_version integer not null default 0"
+            )
         timeline_rows = self._connection.execute("pragma table_info(timeline_items)").fetchall()
         timeline_columns = {str(row["name"]) for row in timeline_rows if row and row["name"]}
         if "attachments_json" not in timeline_columns:
@@ -604,13 +747,15 @@ insert into sessions (
     cwd, started_at, originator, source, cli_version, model_provider,
     size_bytes, line_count, event_count, tool_call_count,
     user_prompt_excerpt, latest_agent_message_excerpt, status,
-    created_at, updated_at, indexed_at
+    created_at, updated_at, indexed_at,
+    primary_mtime_ns, parser_version
 ) values (
     :id, :active_path, :archive_path, :snapshot_path, :original_relative_path,
     :cwd, :started_at, :originator, :source, :cli_version, :model_provider,
     :size_bytes, :line_count, :event_count, :tool_call_count,
     :user_prompt_excerpt, :latest_agent_message_excerpt, :status,
-    :created_at, :updated_at, :indexed_at
+    :created_at, :updated_at, :indexed_at,
+    :primary_mtime_ns, :parser_version
 )
 """
 
@@ -621,13 +766,15 @@ insert into sessions (
     cwd, started_at, originator, source, cli_version, model_provider,
     size_bytes, line_count, event_count, tool_call_count,
     user_prompt_excerpt, latest_agent_message_excerpt, status,
-    created_at, updated_at, indexed_at
+    created_at, updated_at, indexed_at,
+    primary_mtime_ns, parser_version
 ) values (
     :id, :active_path, :archive_path, :snapshot_path, :original_relative_path,
     :cwd, :started_at, :originator, :source, :cli_version, :model_provider,
     :size_bytes, :line_count, :event_count, :tool_call_count,
     :user_prompt_excerpt, :latest_agent_message_excerpt, :status,
-    :created_at, :updated_at, :indexed_at
+    :created_at, :updated_at, :indexed_at,
+    :primary_mtime_ns, :parser_version
 )
 on conflict(id) do update set
     active_path = excluded.active_path,
@@ -649,7 +796,9 @@ on conflict(id) do update set
     status = excluded.status,
     created_at = excluded.created_at,
     updated_at = excluded.updated_at,
-    indexed_at = excluded.indexed_at
+    indexed_at = excluded.indexed_at,
+    primary_mtime_ns = excluded.primary_mtime_ns,
+    parser_version = excluded.parser_version
 """
 
 
@@ -687,7 +836,15 @@ _MUTATION_KEY_COLUMNS = {
 }
 
 
-def _entry_to_params(entry: CatalogSessionEntry, created_at: str, updated_at: str, indexed_at: str) -> dict[str, Any]:
+def _entry_to_params(
+    entry: CatalogSessionEntry,
+    created_at: str,
+    updated_at: str,
+    indexed_at: str,
+    *,
+    primary_mtime_ns: int = 0,
+    parser_version: int = 0,
+) -> dict[str, Any]:
     return {
         "id": entry.summary.id,
         "active_path": entry.active_path,
@@ -710,6 +867,8 @@ def _entry_to_params(entry: CatalogSessionEntry, created_at: str, updated_at: st
         "created_at": created_at,
         "updated_at": updated_at,
         "indexed_at": indexed_at,
+        "primary_mtime_ns": primary_mtime_ns,
+        "parser_version": parser_version,
     }
 
 

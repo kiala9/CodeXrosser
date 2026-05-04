@@ -3641,7 +3641,7 @@ def test_time_travel_row_click_jumps_without_closing_popup() -> None:
 
     captured: list[int] = []
     panel._recenter_async = (  # type: ignore[method-assign]
-        lambda focus_block, *, on_anchor: captured.append(focus_block)
+        lambda focus_block: captured.append(focus_block)
     )
 
     target = 7
@@ -3665,12 +3665,49 @@ def test_time_travel_jump_clamps_to_block_range() -> None:
 
     captured: list[int] = []
     panel._recenter_async = (  # type: ignore[method-assign]
-        lambda focus_block, *, on_anchor: captured.append(focus_block)
+        lambda focus_block: captured.append(focus_block)
     )
 
     panel._on_time_travel_jump(-1)
     panel._on_time_travel_jump(99999)
     assert captured == []
+    panel.close()
+
+
+def test_time_travel_current_row_tracks_viewport_center_block() -> None:
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TT_BLOCK_INDEX_ROLE,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 360)
+    panel.show()
+    panel.set_detail(
+        _make_time_travel_detail("tt-current-block", user_count=1, asst_per_user=8),
+        CodexHomeTarget.SANDBOX,
+    )
+    panel._timeline_container.adjustSize()
+    panel._timeline_container.layout().activate()
+    app.processEvents()
+
+    target_block = 3
+    target_widget = panel._find_widget_for_block(target_block)
+    assert target_widget is not None
+    viewport_h = 120
+    panel._timeline_scroll.viewport().resize(800, viewport_h)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, max(0, panel._timeline_container.height() - viewport_h))
+    scrollbar.setValue(target_widget.y() + target_widget.height() // 2 - viewport_h // 2)
+
+    popup = _open_time_travel_for_test(panel)
+    current = popup._vertical._list.currentIndex()
+    source = popup._vertical._proxy.mapToSource(current)
+
+    assert panel._current_user_block == 0
+    assert source.data(_TT_BLOCK_INDEX_ROLE) == target_block
+    panel._dismiss_time_travel_popup()
     panel.close()
 
 
@@ -3714,6 +3751,67 @@ def test_time_travel_global_index_replaces_loaded_slice_rows() -> None:
 
     assert popup._vertical._model.rowCount() == 1000
     assert popup._vertical._model.index(100, 0).data(_TT_JUMP_OFFSET_ROLE) == 100
+    panel.close()
+
+
+def test_time_travel_global_index_current_row_uses_jump_offset_lookup() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"tail {i}",
+        )
+        for i in range(800, 840)
+    ]
+    rec = _record("tt-global-current-offset")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 360)
+    panel.show()
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._timeline_container.adjustSize()
+    panel._timeline_container.layout().activate()
+    app.processEvents()
+
+    focus_block = panel._block_for_anchor_id("e-803")
+    assert focus_block is not None
+    focus_widget = panel._find_widget_for_block(focus_block)
+    assert focus_widget is not None
+    viewport_h = 120
+    panel._timeline_scroll.viewport().resize(800, viewport_h)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, max(0, panel._timeline_container.height() - viewport_h))
+    scrollbar.setValue(focus_widget.y() + focus_widget.height() // 2 - viewport_h // 2)
+
+    popup = _open_time_travel_for_test(panel)
+    index_items = [
+        SessionTimelineIndexItem(
+            ordinal=i,
+            item_id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            preview=f"global {i}",
+        )
+        for i in range(800, 840)
+    ]
+
+    panel.set_time_travel_index(rec.id, index_items)
+    current = popup._vertical._list.currentIndex()
+    source = popup._vertical._proxy.mapToSource(current)
+
+    assert source.data(_TT_JUMP_OFFSET_ROLE) == 803
+    panel._dismiss_time_travel_popup()
     panel.close()
 
 
@@ -3799,6 +3897,51 @@ def test_time_travel_offset_page_replaces_slice_and_centers_focus() -> None:
     assert panel._window_start <= focus_block < panel._window_end
     rendered = panel._timeline_layout.count() - 1
     assert rendered <= _WINDOW_SIZE
+    panel.close()
+
+
+def test_time_travel_offset_page_reanchors_after_layout_settles() -> None:
+    from codex_quota_viewer.sessions_page import (
+        _JUMP_ANCHOR_SETTLE_DELAY_MS,
+        _JUMP_ANCHOR_SETTLE_PASSES,
+        _SessionDetailPanel,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel._render_token = 42
+
+    scroll_calls: list[tuple[int, bool]] = []
+    finished: list[bool] = []
+    hidden: list[bool] = []
+
+    panel._scroll_to_block_center = (  # type: ignore[method-assign]
+        lambda block_index, *, keep_suppressed=False: scroll_calls.append(
+            (block_index, keep_suppressed)
+        )
+        or True
+    )
+    panel._finish_paging_scroll_transaction = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: finished.append(True)
+    )
+    panel._hide_timeline_overlay = lambda: hidden.append(True)  # type: ignore[method-assign]
+    panel._refresh_status_label = lambda: None  # type: ignore[method-assign]
+    panel._refresh_minimap = lambda: None  # type: ignore[method-assign]
+    panel._refresh_count_label = lambda: None  # type: ignore[method-assign]
+
+    panel._scroll_to_block_center_and_release(7, token=42)
+    deadline = time.monotonic() + 1.0
+    while (
+        len(scroll_calls) < _JUMP_ANCHOR_SETTLE_PASSES
+        and time.monotonic() < deadline
+    ):
+        QTest.qWait(max(1, _JUMP_ANCHOR_SETTLE_DELAY_MS))
+        app.processEvents()
+
+    assert scroll_calls == [(7, True)] * _JUMP_ANCHOR_SETTLE_PASSES
+    assert finished == [True]
+    assert hidden == [True]
+    assert panel._suppress_edge_slide is False
     panel.close()
 
 

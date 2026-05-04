@@ -21,6 +21,7 @@ from .helpers import (
 )
 from .jsonl_parser import (
     DEFAULT_TIMELINE_PAGE_SIZE,
+    PARSER_VERSION,
     clamp_timeline_page_size,
     parse_session_catalog,
 )
@@ -391,30 +392,56 @@ class SessionsManager:
 
     def _scan_and_index_sessions(self) -> list[CatalogSessionEntry]:
         self._ensure_roots()
-        active_entries = collect_sessions(self.roots.sessions_root)
-        archived_entries = collect_sessions(self.roots.archive_root)
-        snapshot_entries = collect_sessions(self.roots.snapshot_root)
+
+        # Incremental rescan cache check: pull DB metadata once, then for
+        # each single-root session whose primary file's mtime + parser
+        # fingerprint match what's recorded, skip re-parse. Multi-root
+        # sessions (active + archive simultaneously, mid-transition) fall
+        # through to fresh parse so the path/state combo stays accurate.
+        skip_paths: set[Path] = set()
+        kept_session_ids: set[str] = set()
+        for meta in self.repository.list_session_scan_metadata():
+            if meta.parser_version != PARSER_VERSION:
+                continue
+            present_paths = [
+                p for p in (meta.active_path, meta.archive_path, meta.snapshot_path) if p
+            ]
+            if len(present_paths) != 1:
+                continue
+            primary = present_paths[0]
+            try:
+                st = os.stat(primary)
+            except OSError:
+                continue
+            if st.st_mtime_ns == meta.primary_mtime_ns:
+                skip_paths.add(Path(primary))
+                kept_session_ids.add(meta.session_id)
+
+        active_entries = collect_sessions(self.roots.sessions_root, skip_paths=skip_paths)
+        archived_entries = collect_sessions(self.roots.archive_root, skip_paths=skip_paths)
+        snapshot_entries = collect_sessions(self.roots.snapshot_root, skip_paths=skip_paths)
 
         latest_audit_by_id = {entry.session_id: entry for entry in self.repository.list_latest_audit_entries()}
 
-        active_by_id: dict[str, tuple[Path, ParsedSessionCatalog]] = {}
-        for path, parsed in active_entries:
-            active_by_id[parsed.summary.id] = (path, parsed)
+        active_by_id: dict[str, tuple[Path, ParsedSessionCatalog, int]] = {}
+        for path, parsed, mtime_ns in active_entries:
+            active_by_id[parsed.summary.id] = (path, parsed, mtime_ns)
 
-        archived_by_id: dict[str, tuple[Path, ParsedSessionCatalog]] = {}
+        archived_by_id: dict[str, tuple[Path, ParsedSessionCatalog, int]] = {}
         archived_relative_paths: dict[str, str] = {}
-        for path, parsed in archived_entries:
+        for path, parsed, mtime_ns in archived_entries:
             normalized_path, original_relative = self._canonicalize_archived_entry(
                 path, parsed, build_fallback_relative_path(parsed.summary.started_at, parsed.summary.id)
             )
-            archived_by_id[parsed.summary.id] = (normalized_path, parsed)
+            archived_by_id[parsed.summary.id] = (normalized_path, parsed, mtime_ns)
             archived_relative_paths[parsed.summary.id] = original_relative
 
-        snapshot_by_id: dict[str, tuple[Path, ParsedSessionCatalog]] = {}
-        for path, parsed in snapshot_entries:
-            snapshot_by_id[parsed.summary.id] = (path, parsed)
+        snapshot_by_id: dict[str, tuple[Path, ParsedSessionCatalog, int]] = {}
+        for path, parsed, mtime_ns in snapshot_entries:
+            snapshot_by_id[parsed.summary.id] = (path, parsed, mtime_ns)
 
         catalog_entries: list[CatalogSessionEntry] = []
+        fresh_metadata: dict[str, tuple[int, int]] = {}
         all_ids = set(active_by_id) | set(archived_by_id) | set(snapshot_by_id)
         for session_id in all_ids:
             active = active_by_id.get(session_id)
@@ -423,7 +450,7 @@ class SessionsManager:
             primary = active or archived or snapshot
             if primary is None:
                 continue
-            primary_path, primary_parsed = primary
+            primary_path, primary_parsed, primary_mtime_ns = primary
             latest_audit = latest_audit_by_id.get(session_id)
             active_path = active[0] if active else None
             archive_path = archived[0] if archived else None
@@ -451,7 +478,17 @@ class SessionsManager:
                     status=_resolve_catalog_status(active_path, archive_path, latest_audit.action if latest_audit else None),
                 )
             )
-        self.repository.replace_catalog(catalog_entries)
+            fresh_metadata[session_id] = (primary_mtime_ns, PARSER_VERSION)
+            # If a session was provisionally cached but reappeared as fresh
+            # (e.g. file was modified between the cache check and walk, or
+            # multi-root cross-fertilization), the fresh path wins.
+            kept_session_ids.discard(session_id)
+
+        self.repository.upsert_catalog(
+            fresh_entries=catalog_entries,
+            fresh_metadata=fresh_metadata,
+            kept_session_ids=kept_session_ids,
+        )
         return catalog_entries
 
     def _canonicalize_archived_entry(

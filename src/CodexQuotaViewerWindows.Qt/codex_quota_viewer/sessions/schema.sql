@@ -23,7 +23,9 @@ create table if not exists sessions (
   status text not null,
   created_at text not null,
   updated_at text not null,
-  indexed_at text not null
+  indexed_at text not null,
+  primary_mtime_ns integer not null default 0,
+  parser_version integer not null default 0
 );
 
 create table if not exists timeline_items (

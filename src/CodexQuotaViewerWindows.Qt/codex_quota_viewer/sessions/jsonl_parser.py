@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import OrderedDict
@@ -16,6 +17,27 @@ from .models import (
     SessionTimelineItem,
     SessionTimelinePage,
 )
+
+
+# Bump this when you change parser-output-relevant code OUTSIDE this file
+# (e.g. add a field in models.py that the parser fills). Editing this file
+# already invalidates PARSER_VERSION via the source hash below.
+_PARSER_BUMP = 1
+
+
+def _compute_parser_version() -> int:
+    # First 8 hex chars of sha256 over this file's source + the manual bump,
+    # cast to a 32-bit int for the SQLite ``parser_version`` column. Any
+    # change to this file (including comments/whitespace) flips the value
+    # and invalidates the incremental-rescan cache for every session row —
+    # the next scan does a full reparse, then subsequent scans go incremental.
+    digest = hashlib.sha256(
+        Path(__file__).read_bytes() + str(_PARSER_BUMP).encode("ascii")
+    ).hexdigest()[:8]
+    return int(digest, 16)
+
+
+PARSER_VERSION: int = _compute_parser_version()
 
 
 _DATA_URI_MIME_RE = re.compile(r"^data:(image/[a-z0-9.+\-]+);base64,", re.IGNORECASE)
