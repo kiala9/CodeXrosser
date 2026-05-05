@@ -95,10 +95,18 @@ def test_account_row_buttons_call_account_actions() -> None:
         "config.toml",
     )
     window = MainWindow.__new__(MainWindow)
-    window.services = Mock(active_target=CodexHomeTarget.SANDBOX)
+    services_mock = Mock(active_target=CodexHomeTarget.SANDBOX)
+    services_mock.vault.read_chatgpt_plan_type.return_value = None
+    services_mock.quota_cache.get.return_value = None
+    window.services = services_mock
+    window._idle_quota_bars = {}
+    window._locked_action_keys = set()
+    window._tr = lambda key, **kwargs: key
+    window._language = UiLanguage.ENGLISH
     window.switch_account = Mock()
     window.rename_account = Mock()
     window.delete_account = Mock()
+    window._refresh_idle_account_quota = Mock()
 
     row = MainWindow._account_row(window, account, False)
     buttons = row.findChildren(QPushButton)
@@ -109,6 +117,7 @@ def test_account_row_buttons_call_account_actions() -> None:
     window.switch_account.assert_called_once_with(account)
     window.rename_account.assert_called_once_with(account)
     window.delete_account.assert_called_once_with(account)
+    window._refresh_idle_account_quota.assert_called_once_with(account)
 
 
 def test_clear_removes_nested_layout_buttons() -> None:

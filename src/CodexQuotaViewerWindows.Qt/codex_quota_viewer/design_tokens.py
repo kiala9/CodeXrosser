@@ -137,6 +137,7 @@ colours."""
 
 SUCCESS = "#30D158"
 WARNING = "#FFD60A"
+CAUTION = "#FF9F0A"
 DANGER = "#FF453A"
 DANGER_TINT = "#FF6961"
 
@@ -167,6 +168,7 @@ __all__ = [
     "SURFACE_FROSTED_BORDER",
     "SUCCESS",
     "WARNING",
+    "CAUTION",
     "DANGER",
     "DANGER_TINT",
 ]

@@ -508,6 +508,107 @@ class RuntimeConfig:
         return text if text.endswith("\n") else text + "\n"
 
 
+def parse_codex_id_token_plan(auth_data: bytes) -> tuple[str | None, str | None]:
+    """Decode the OAuth ``id_token`` JWT in a Codex ``auth.json`` and pull out
+    ``(chatgpt_plan_type, chatgpt_account_id)``.
+
+    Mirrors the claims layout in ``CLIProxyAPI/internal/auth/codex/jwt_parser.go``:
+    custom claims live under the ``https://api.openai.com/auth`` namespace.
+    Pure stdlib, returns ``(None, None)`` on any parse failure.
+    """
+    try:
+        payload = json.loads(auth_data)
+    except (ValueError, TypeError):
+        return (None, None)
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    id_token = tokens.get("id_token") if isinstance(tokens, dict) else None
+    if not isinstance(id_token, str) or id_token.count(".") != 2:
+        return (None, None)
+    claims_segment = id_token.split(".")[1]
+    padding = "=" * (-len(claims_segment) % 4)
+    try:
+        claims_bytes = base64.urlsafe_b64decode(claims_segment + padding)
+        claims = json.loads(claims_bytes)
+    except (ValueError, TypeError, base64.binascii.Error):
+        return (None, None)
+    if not isinstance(claims, dict):
+        return (None, None)
+    auth_info = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_info, dict):
+        return (None, None)
+    plan_raw = auth_info.get("chatgpt_plan_type")
+    account_raw = auth_info.get("chatgpt_account_id")
+    plan = str(plan_raw).strip().lower() if isinstance(plan_raw, str) and plan_raw.strip() else None
+    account_id = str(account_raw).strip() if isinstance(account_raw, str) and account_raw.strip() else None
+    return (plan, account_id)
+
+
+class VaultQuotaCache:
+    """Persistent per-account quota snapshot store.
+
+    Mirrors the macOS app's ``VaultQuotaCacheStore`` at a smaller scale: a
+    single JSON file at the vault root keyed by ``account_id``. Atomic write
+    via ``<path>.tmp`` + replace; tolerant load (corrupt / missing file
+    yields an empty dict instead of raising).
+    """
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, cache_path: Path):
+        self.cache_path = cache_path
+        self._lock = threading.RLock()
+
+    def load(self) -> dict[str, CodexSnapshot]:
+        with self._lock:
+            return self._load_locked()
+
+    def _load_locked(self) -> dict[str, CodexSnapshot]:
+        if not self.cache_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        snapshots = payload.get("snapshots")
+        if not isinstance(snapshots, dict):
+            return {}
+        out: dict[str, CodexSnapshot] = {}
+        for account_id, raw in snapshots.items():
+            snapshot = CodexSnapshot.from_json(raw)
+            if snapshot is not None:
+                out[str(account_id)] = snapshot
+        return out
+
+    def get(self, account_id: str) -> CodexSnapshot | None:
+        return self.load().get(account_id)
+
+    def upsert(self, account_id: str, snapshot: CodexSnapshot) -> None:
+        with self._lock:
+            current = self._load_locked()
+            current[account_id] = snapshot
+            self._save_locked(current)
+
+    def delete(self, account_id: str) -> None:
+        with self._lock:
+            current = self._load_locked()
+            if account_id not in current:
+                return
+            current.pop(account_id, None)
+            self._save_locked(current)
+
+    def _save_locked(self, snapshots: dict[str, CodexSnapshot]) -> None:
+        payload = {
+            "schemaVersion": self.SCHEMA_VERSION,
+            "snapshots": {account_id: snap.to_json() for account_id, snap in snapshots.items()},
+        }
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp_path, self.cache_path)
+
+
 class AccountVault:
     OAUTH_COMMON_DIR = "oauth-common"
     OAUTH_COMMON_CONFIG = "config.toml"
@@ -599,6 +700,16 @@ class AccountVault:
         config_path = Path(record.config_path)
         config = config_path.read_bytes() if config_path.exists() else None
         return AccountRuntimeMaterial(auth, config)
+
+    def read_chatgpt_plan_type(self, record: AccountRecord) -> str | None:
+        if record.metadata.auth_mode != AuthMode.CHAT_GPT:
+            return None
+        try:
+            auth = Path(record.auth_path).read_bytes()
+        except OSError:
+            return None
+        plan, _account = parse_codex_id_token_plan(auth)
+        return plan
 
     def read_oauth_config(self, record: AccountRecord) -> bytes | None:
         for path in self.oauth_config_candidates(record):
@@ -1212,9 +1323,15 @@ class CodexCommandResolver:
 
 
 class CodexRpcClient:
-    def __init__(self, command_resolver: Callable[[], CodexCommand] | None = None, timeout_seconds: float = 8):
+    def __init__(
+        self,
+        command_resolver: Callable[[], CodexCommand] | None = None,
+        timeout_seconds: float = 8,
+        logs_root: Path | None = None,
+    ):
         self.command_resolver = command_resolver or CodexCommandResolver.resolve
         self.timeout_seconds = timeout_seconds
+        self.logs_root = logs_root
         self._active_processes: set[subprocess.Popen[Any]] = set()
         self._active_processes_lock = threading.Lock()
 
@@ -1245,6 +1362,24 @@ class CodexRpcClient:
         finally:
             self._untrack_process(process)
             self._try_kill(process)
+
+    def fetch_snapshot_for_account(
+        self,
+        runtime: AccountRuntimeMaterial,
+        timeout_seconds: float | None = None,
+    ) -> CodexSnapshot:
+        """Fetch quota for a saved account without changing the active home.
+
+        Materializes the account's auth/config bytes into a throwaway
+        ``<tmp>/.codex/`` directory and reuses :meth:`fetch_snapshot`.
+        """
+        with tempfile.TemporaryDirectory(prefix="cqv-quota-") as tmp:
+            codex_home = Path(tmp) / ".codex"
+            codex_home.mkdir(parents=True, exist_ok=True)
+            (codex_home / "auth.json").write_bytes(runtime.auth_data)
+            if runtime.config_data:
+                (codex_home / "config.toml").write_bytes(runtime.config_data)
+            return self.fetch_snapshot(codex_home, timeout_seconds=timeout_seconds)
 
     def dispose(self) -> None:
         with self._active_processes_lock:
@@ -1351,8 +1486,7 @@ class CodexRpcClient:
             raise CodexRpcError("The current account is not signed in, or auth.json is invalid.")
         return CodexAccount(str(account.get("type") or ""), account.get("email"), account.get("planType"))
 
-    @staticmethod
-    def _parse_rate_limits(message: dict[str, Any]) -> RateLimitSnapshot:
+    def _parse_rate_limits(self, message: dict[str, Any]) -> RateLimitSnapshot:
         node = (message.get("result") or {}).get("rateLimits")
         if not isinstance(node, dict):
             raise CodexRpcError("account/rateLimits/read is missing rateLimits.")
@@ -1362,7 +1496,18 @@ class CodexRpcClient:
                 return None
             return RateLimitWindow(float(value.get("usedPercent") or 0), value.get("windowDurationMins"), value.get("resetsAt"))
 
-        return RateLimitSnapshot(node.get("limitId"), node.get("limitName"), window(node.get("primary")), window(node.get("secondary")), node.get("planType"))
+        primary = window(node.get("primary"))
+        secondary = window(node.get("secondary"))
+        if primary is None and secondary is None and self.logs_root is not None:
+            try:
+                app_log(
+                    self.logs_root,
+                    "rateLimits returned with no windows (keys=%s, planType=%r, limitId=%r)"
+                    % (sorted(node.keys()), node.get("planType"), node.get("limitId")),
+                )
+            except Exception:
+                pass
+        return RateLimitSnapshot(node.get("limitId"), node.get("limitName"), primary, secondary, node.get("planType"))
 
     @staticmethod
     def _read_error(message: dict[str, Any]) -> str | None:

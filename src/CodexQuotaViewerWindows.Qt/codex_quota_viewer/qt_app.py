@@ -6,6 +6,7 @@ import re
 import sys
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,9 +74,13 @@ from PySide6.QtWidgets import (
 )
 
 from .design_tokens import (
+    CAUTION,
+    DANGER,
     PRIMARY_BAND,
     PRIMARY_GHOST,
     PRIMARY_SOFT,
+    SUCCESS,
+    WARNING,
 )
 from .frosted_surface import _FrostedSurface
 from .models import (
@@ -84,6 +89,9 @@ from .models import (
     CodexHomeTarget,
     CodexSnapshot,
     OfficialRepairSummary,
+    QuotaDisplayWindow,
+    RateLimitSnapshot,
+    RateLimitWindow,
     RestorePointManifest,
     SandboxRealSessionSyncResult,
     SnapshotKind,
@@ -92,7 +100,7 @@ from .models import (
 )
 from .localization import translate
 from .services import AppServices
-from .sessions_page import SessionsPage
+from .sessions_page import SessionsPage, _rescan_icon as _quota_refresh_icon
 
 
 APP_DISPLAY_NAME = "CodeXrosser"
@@ -658,7 +666,7 @@ class QuotaRingWidget(QWidget):
 
         percent = self.percent
         if percent is not None:
-            accent = QColor("#30D158" if percent >= 70 else "#FFD60A" if percent >= 35 else "#FF453A")
+            accent = _accent_color_for_remaining(percent)
             accent_pen = QPen(accent, 5)
             accent_pen.setCapStyle(Qt.RoundCap)
             painter.setPen(accent_pen)
@@ -686,6 +694,197 @@ class QuotaRingWidget(QWidget):
         painter.setFont(font)
         painter.setPen(QColor(235, 235, 245, 120))
         painter.drawText(self.rect().adjusted(0, 80, 0, -6), Qt.AlignHCenter | Qt.AlignTop, self.caption)
+
+
+def _accent_color_for_remaining(percent: float | None) -> QColor:
+    """Severity gradient by **remaining** percent.
+
+    ≥70 green / ≥50 yellow / ≥30 orange / <30 red. Shared by the active
+    rings and the idle bars so the two readouts agree on health colour
+    at every step. Returns the neutral track tint for unknown values
+    (cold cache, error states); callers that don't want that fallback
+    should branch on ``percent is None`` themselves.
+    """
+    if percent is None:
+        return QColor(255, 255, 255, 28)
+    if percent >= 70:
+        return QColor(SUCCESS)
+    if percent >= 50:
+        return QColor(WARNING)
+    if percent >= 30:
+        return QColor(CAUTION)
+    return QColor(DANGER)
+
+
+def _format_reset_at(epoch_seconds: int | None) -> str:
+    """Format a Codex ``resets_at`` epoch as ``MM/DD HH:MM`` in local time.
+
+    Image 2 / image 4 in the design brief use this compact format; we mirror
+    it on the bar widgets to keep the row legible at narrow widths.
+    """
+    if not epoch_seconds:
+        return ""
+    try:
+        local = datetime.fromtimestamp(int(epoch_seconds))
+    except (ValueError, OSError, OverflowError):
+        return ""
+    return local.strftime("%m/%d %H:%M")
+
+
+class _QuotaBarRow(QWidget):
+    """One row of the quota bar widget: ``[label] [percent timestamp] / [bar]``.
+
+    Custom paint instead of nested QLabels so the bar's rounded ends and
+    track/fill alignment are pixel-tight.
+    """
+
+    BAR_HEIGHT = 6
+    HEADER_TO_BAR_GAP = 4
+    BOTTOM_PADDING = 6
+    LABEL_FONT_PT = 9
+    VALUE_FONT_PT = 9
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._label = ""
+        self._percent: float | None = None
+        self._right_text = "--"
+        self.setMinimumHeight(self.LABEL_FONT_PT + 4 + self.HEADER_TO_BAR_GAP + self.BAR_HEIGHT + self.BOTTOM_PADDING)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def set_data(self, label: str, percent: float | None, right_text: str) -> None:
+        self._label = label
+        self._percent = percent
+        self._right_text = right_text or "--"
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect()
+        font = painter.font()
+
+        # Header: label on the left, percent + timestamp on the right.
+        font.setPointSize(self.LABEL_FONT_PT)
+        font.setBold(False)
+        painter.setFont(font)
+        painter.setPen(QColor(235, 235, 245, 200))
+        header_height = painter.fontMetrics().height()
+        header_rect = rect.adjusted(0, 0, 0, -(rect.height() - header_height))
+        painter.drawText(header_rect, Qt.AlignLeft | Qt.AlignVCenter, self._label)
+        painter.setPen(QColor(235, 235, 245, 153))
+        painter.drawText(header_rect, Qt.AlignRight | Qt.AlignVCenter, self._right_text)
+
+        # Bar geometry: full width, rounded ends, sits below the header row.
+        bar_top = header_height + self.HEADER_TO_BAR_GAP
+        bar_rect_full = rect.adjusted(0, bar_top, 0, -(rect.height() - bar_top - self.BAR_HEIGHT))
+        radius = self.BAR_HEIGHT / 2
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 28))
+        painter.drawRoundedRect(bar_rect_full, radius, radius)
+
+        if self._percent is not None and self._percent > 0:
+            ratio = max(0.0, min(1.0, self._percent / 100.0))
+            fill_width = int(bar_rect_full.width() * ratio)
+            if fill_width > 0:
+                fill_rect = bar_rect_full.adjusted(0, 0, fill_width - bar_rect_full.width(), 0)
+                painter.setBrush(_accent_color_for_remaining(self._percent))
+                painter.drawRoundedRect(fill_rect, radius, radius)
+
+
+class QuotaBarWidget(QWidget):
+    """Compact horizontal-bar quota readout for idle ChatGPT account rows.
+
+    Renders 1 row for Free plans (weekly only) and 2 rows for Plus/Pro
+    (5-hour + weekly). Uses the JWT plan type from disk when available so
+    the row count is correct even on a cold cache, and reflows when a real
+    snapshot disagrees (e.g. user upgraded plan since last refresh).
+    """
+
+    BAR_WIDTH = 280
+    ROW_SPACING = 6
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        translator: Callable[[str], str] | None = None,
+    ):
+        super().__init__(parent)
+        self._tr = translator or (lambda text: text)
+        self._rows: list[_QuotaBarRow] = []
+        self._row_count = 2
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(self.ROW_SPACING)
+        self._layout = layout
+        self.setFixedWidth(self.BAR_WIDTH)
+        self._rebuild_rows(2)
+        self._render_placeholder()
+
+    def _rebuild_rows(self, count: int) -> None:
+        count = max(1, min(2, count))
+        if count == len(self._rows):
+            return
+        for row in self._rows:
+            self._layout.removeWidget(row)
+            row.deleteLater()
+        self._rows = []
+        for _ in range(count):
+            row = _QuotaBarRow(self)
+            self._layout.addWidget(row)
+            self._rows.append(row)
+        self._row_count = count
+
+    def _render_placeholder(self) -> None:
+        if self._row_count == 1:
+            keys = ["Weekly limit"]
+        else:
+            keys = ["5h limit", "Weekly limit"]
+        for row, key in zip(self._rows, keys):
+            row.set_data(self._tr(key), None, "--")
+
+    def set_plan_type(self, plan_type: str | None) -> None:
+        """Pick the row count from the JWT plan type. Free → 1, else 2.
+
+        Idempotent; re-applies the placeholder so the widget is ready
+        before any snapshot lands.
+        """
+        is_free = isinstance(plan_type, str) and plan_type.strip().lower() == "free"
+        self._rebuild_rows(1 if is_free else 2)
+        self._render_placeholder()
+
+    def set_snapshot(self, snapshot: CodexSnapshot | None) -> None:
+        """Populate rows from a real snapshot's :meth:`display_windows`.
+
+        If the snapshot disagrees with the configured row count, prefer
+        the snapshot (handles plan upgrades since the JWT was issued).
+        """
+        if snapshot is None:
+            self._render_placeholder()
+            return
+        windows = snapshot.display_windows()
+        if not windows:
+            # Keep current row count; fall through to placeholder rendering.
+            self._render_placeholder()
+            return
+        self._rebuild_rows(len(windows))
+        for index, item in enumerate(windows):
+            if index >= len(self._rows):
+                break
+            label = self._human_label(item)
+            remaining = item.window.remaining_percent
+            right_text = f"{int(round(remaining))}% {_format_reset_at(item.window.resets_at)}".rstrip()
+            self._rows[index].set_data(label, remaining, right_text)
+
+    def _human_label(self, item: QuotaDisplayWindow) -> str:
+        duration = item.window.window_duration_mins or 0
+        if duration and duration % 10080 == 0:
+            return self._tr("Weekly limit")
+        if duration and duration % 60 == 0 and duration < 1440:
+            hours = duration // 60
+            return self._tr("5h limit") if hours == 5 else f"{hours}h limit"
+        return item.label.upper() + " limit"
 
 
 def _install_dialog_chrome(window, *, disable_border: bool = False) -> None:
@@ -919,6 +1118,8 @@ class MainWindow(QMainWindow):
         self.current_view = "Accounts"
         self.accounts_quota_label: QLabel | None = None
         self.quota_ring_widgets: list[QuotaRingWidget] = []
+        self._idle_quota_bars: dict[str, QuotaBarWidget] = {}
+        self._refresh_all_inflight = False
         self._latest_quota_snapshot: CodexSnapshot | None = None
         self.tray_icon: QSystemTrayIcon | None = None
         self._language = self.services.ui_language
@@ -1723,6 +1924,7 @@ class MainWindow(QMainWindow):
     def _clear(self, heading: str, heading_actions: list[QWidget] | None = None) -> None:
         self.accounts_quota_label = None
         self.quota_ring_widgets = []
+        self._idle_quota_bars = {}
         preserved = getattr(self, "_sessions_page_widget", None)
         body = getattr(self, "body", None)
         if body is not None:
@@ -2213,7 +2415,15 @@ class MainWindow(QMainWindow):
         actions.addWidget(self._button(codex_label, self.open_codex_app, width=150, accent=True, tooltip=f"{codex_label} tooltip"))
         actions.addWidget(self._button("Use ChatGPT Login", self.add_chatgpt_account, width=140, tooltip="Use ChatGPT Login tooltip"))
         actions.addWidget(self._button("Add API Account", self.add_api_account, width=130, tooltip="Add API Account tooltip"))
-        actions.addWidget(self._button("Refresh Quota", lambda: self.refresh_quota(True, True), width=110, tooltip="Refresh Quota tooltip"))
+        actions.addWidget(
+            self._button(
+                "Refresh All Quotas",
+                self._refresh_all_quotas,
+                width=140,
+                action_key="refresh-all-quotas",
+                tooltip="Refresh All Quotas tooltip",
+            )
+        )
         actions.addWidget(self._button("Open Vault", self.open_vault, width=100, tooltip="Open Vault tooltip"))
         actions.addWidget(self._button("Rollback", self.rollback, width=100, tooltip="Rollback tooltip"))
         actions.addStretch(1)
@@ -2257,10 +2467,21 @@ class MainWindow(QMainWindow):
         name.setObjectName("AccountName")
         details.addWidget(name)
         subtitle = QLabel(self._describe_account(account, is_current))
-        subtitle.setWordWrap(True)
+        # Subtitle is fixed-shape metadata ("Saved - ChatGPT - local vault
+        # - …"); wrapping it makes the row taller and squeezes the quota
+        # bars unpredictably. Keep it on a single line.
+        subtitle.setWordWrap(False)
         subtitle.setObjectName("Muted")
         details.addWidget(subtitle)
-        layout.addWidget(details_widget, 1, Qt.AlignVCenter)
+
+        # Layout strategy:
+        # - Idle ChatGPT row: details takes natural width; bars sit
+        #   immediately next to it (left-aligned) and an action-side
+        #   stretch absorbs the remaining width before the buttons.
+        # - Active row / API idle row: details absorbs all extra width as
+        #   before, so rings (active) or actions (API) hug the right edge.
+        is_idle_chatgpt = (not is_current) and account.metadata.auth_mode == AuthMode.CHAT_GPT
+        layout.addWidget(details_widget, 0 if is_idle_chatgpt else 1, Qt.AlignVCenter)
 
         if is_current:
             rings = QHBoxLayout()
@@ -2270,7 +2491,38 @@ class MainWindow(QMainWindow):
                 self.quota_ring_widgets.append(ring)
                 rings.addWidget(ring)
             layout.addLayout(rings)
+            # Refresh icon sits next to the rings (visually part of the
+            # quota readout), matching the idle-row pattern.
+            refresh_btn = self._icon_button(
+                _quota_refresh_icon(),
+                lambda: self.refresh_quota(force_refresh=True, update_status=True),
+                action_key="refresh-active-quota",
+                tooltip="Refresh Quota tooltip",
+            )
+            layout.addWidget(refresh_btn, 0, Qt.AlignVCenter)
             self._update_quota_widgets(self._latest_quota_snapshot)
+        elif is_idle_chatgpt:
+            bars = QuotaBarWidget(row, translator=lambda key: self._tr(key))
+            try:
+                bars.set_plan_type(self.services.vault.read_chatgpt_plan_type(account))
+            except Exception:
+                pass
+            try:
+                bars.set_snapshot(self.services.quota_cache.get(account.metadata.id))
+            except Exception:
+                pass
+            layout.addWidget(bars, 0, Qt.AlignVCenter)
+            # Refresh icon sits next to the bars (visually part of the
+            # quota readout), not with the Switch/Rename/Remove cluster.
+            refresh_btn = self._icon_button(
+                _quota_refresh_icon(),
+                lambda account=account: self._refresh_idle_account_quota(account),
+                action_key=f"refresh-quota:{account.metadata.id}",
+                tooltip="Refresh quota tooltip",
+            )
+            layout.addWidget(refresh_btn, 0, Qt.AlignVCenter)
+            layout.addStretch(1)
+            self._idle_quota_bars[account.metadata.id] = bars
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
@@ -2826,16 +3078,124 @@ class MainWindow(QMainWindow):
         self._latest_quota_snapshot = None
         self._update_quota_widgets(None)
 
+    _EXHAUSTION_PATTERN = re.compile(r"limit|exceed|exhaust|reach|out of|quota", re.IGNORECASE)
+
+    def _effective_windows(self, snapshot: CodexSnapshot | None) -> list[QuotaDisplayWindow]:
+        """Pick which windows to render for the active rings.
+
+        Three states:
+        1. Snapshot has live windows → use those.
+        2. Snapshot has an exhaustion-shaped error and we've cached a
+           prior snapshot for the active account → synthesize 0%-remaining
+           windows from the cached structure. Fixes the "fully exhausted
+           shows --" bug; cache reuse means we keep the right window
+           count (1 for Free, 2 for Plus/Pro).
+        3. Otherwise → empty (genuine no-data: cold start, network
+           failure, auth invalid, etc.).
+        """
+        if snapshot is None:
+            return []
+        windows = snapshot.display_windows()
+        if windows:
+            return windows
+        error_text = snapshot.quota_error or ""
+        if not error_text or not self._EXHAUSTION_PATTERN.search(error_text):
+            return []
+        active = self.services.resolve_active_account()
+        if active is None:
+            return []
+        cached = self.services.quota_cache.get(active.metadata.id)
+        if cached is None or cached.rate_limits is None:
+            return []
+        synthetic = RateLimitSnapshot(
+            cached.rate_limits.limit_id,
+            cached.rate_limits.limit_name,
+            RateLimitWindow(100.0, cached.rate_limits.primary.window_duration_mins, cached.rate_limits.primary.resets_at) if cached.rate_limits.primary else None,
+            RateLimitWindow(100.0, cached.rate_limits.secondary.window_duration_mins, cached.rate_limits.secondary.resets_at) if cached.rate_limits.secondary else None,
+            cached.rate_limits.plan_type,
+        )
+        return CodexSnapshot(cached.account, synthetic, snapshot.fetched_at, snapshot.quota_error).display_windows()
+
     def _update_quota_widgets(self, snapshot: CodexSnapshot | None) -> None:
-        windows = snapshot.display_windows() if snapshot else []
+        windows = self._effective_windows(snapshot)
         for index, widget in enumerate(self.quota_ring_widgets):
             if index < len(windows):
                 item = windows[index]
                 widget.set_quota(item.label, item.window.remaining_percent, self._tr("remaining"))
+                widget.setVisible(True)
+            elif windows:
+                # Free plan or any partial set — hide the unused ring
+                # rather than leaving it stuck on "--".
+                widget.setVisible(False)
             else:
                 widget.set_quota("--", None, self._tr("remaining"))
-            if widget.parentWidget() is not None:
                 widget.setVisible(True)
+
+    def _refresh_idle_account_quota(self, account: AccountRecord) -> None:
+        action_key = f"refresh-quota:{account.metadata.id}"
+        if action_key in self._locked_action_keys:
+            return
+        self._set_action_locked(action_key, True)
+        bar = self._idle_quota_bars.get(account.metadata.id)
+        if bar is not None:
+            bar.setEnabled(False)
+        self.set_status(self._tr("Refreshing quota for {name}...", name=account.metadata.display_name))
+
+        def on_success(snapshot: CodexSnapshot, account_id: str = account.metadata.id, display_name: str = account.metadata.display_name, key: str = action_key) -> None:
+            self._set_action_locked(key, False)
+            target_bar = self._idle_quota_bars.get(account_id)
+            if target_bar is not None:
+                target_bar.setEnabled(True)
+                target_bar.set_snapshot(snapshot)
+            if snapshot.quota_error:
+                self.set_status(self._tr("Quota refresh failed for {name}: {error}", name=display_name, error=snapshot.quota_error))
+            else:
+                self.set_status(self._tr("Quota refreshed for {name}.", name=display_name))
+
+        def on_error(ex: Exception, account_id: str = account.metadata.id, display_name: str = account.metadata.display_name, key: str = action_key) -> None:
+            self._set_action_locked(key, False)
+            target_bar = self._idle_quota_bars.get(account_id)
+            if target_bar is not None:
+                target_bar.setEnabled(True)
+            self.set_status(self._tr("Quota refresh failed for {name}: {error}", name=display_name, error=str(ex)))
+
+        self.run_task(
+            lambda progress: self.services.refresh_account_quota(account),
+            on_success=on_success,
+            on_error=on_error,
+        )
+
+    def _refresh_all_quotas(self) -> None:
+        if self._refresh_all_inflight:
+            return
+        self._refresh_all_inflight = True
+        self._set_action_locked("refresh-all-quotas", True)
+        self.refresh_quota(force_refresh=True, update_status=False)
+
+        def progress_callback(account: AccountRecord, snapshot: CodexSnapshot, done: int, total: int) -> None:
+            QTimer.singleShot(0, lambda a=account, s=snapshot, d=done, t=total: self._on_refresh_all_progress(a, s, d, t))
+
+        def on_success(_results) -> None:
+            self._refresh_all_inflight = False
+            self._set_action_locked("refresh-all-quotas", False)
+            self.set_status(self._tr("All quotas refreshed."))
+
+        def on_error(ex: Exception) -> None:
+            self._refresh_all_inflight = False
+            self._set_action_locked("refresh-all-quotas", False)
+            self.set_status(self._tr("Refresh All failed: {error}", error=str(ex)))
+
+        self.run_task(
+            lambda progress: self.services.refresh_all_chatgpt_quotas(progress_callback=progress_callback),
+            on_success=on_success,
+            on_error=on_error,
+        )
+
+    def _on_refresh_all_progress(self, account: AccountRecord, snapshot: CodexSnapshot, done: int, total: int) -> None:
+        bar = self._idle_quota_bars.get(account.metadata.id)
+        if bar is not None:
+            bar.set_snapshot(snapshot)
+        self.set_status(self._tr("Refreshing {done}/{total} idle accounts...", done=done, total=total))
 
     def add_api_account(self) -> None:
         dialog = ApiAccountDialog(self, self._tr)

@@ -75,6 +75,15 @@ class CodexAccount:
             return self.email
         return "API Key" if self.type.lower() == "apikey" else "Not signed in"
 
+    def to_json(self) -> dict[str, Any]:
+        return {"type": self.type, "email": self.email, "planType": self.plan_type}
+
+    @staticmethod
+    def from_json(data: dict[str, Any] | None) -> "CodexAccount":
+        if not isinstance(data, dict):
+            return CodexAccount("", None, None)
+        return CodexAccount(str(data.get("type") or ""), data.get("email"), data.get("planType"))
+
 
 @dataclass(frozen=True)
 class RateLimitWindow:
@@ -86,6 +95,23 @@ class RateLimitWindow:
     def remaining_percent(self) -> float:
         return min(max(100.0 - self.used_percent, 0.0), 100.0)
 
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "usedPercent": self.used_percent,
+            "windowDurationMins": self.window_duration_mins,
+            "resetsAt": self.resets_at,
+        }
+
+    @staticmethod
+    def from_json(data: dict[str, Any] | None) -> "RateLimitWindow | None":
+        if not isinstance(data, dict):
+            return None
+        try:
+            used = float(data.get("usedPercent") or 0)
+        except (TypeError, ValueError):
+            used = 0.0
+        return RateLimitWindow(used, data.get("windowDurationMins"), data.get("resetsAt"))
+
 
 @dataclass(frozen=True)
 class RateLimitSnapshot:
@@ -94,6 +120,31 @@ class RateLimitSnapshot:
     primary: RateLimitWindow | None
     secondary: RateLimitWindow | None
     plan_type: str | None
+
+    @property
+    def is_free_only(self) -> bool:
+        return self.primary is None and self.secondary is not None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "limitId": self.limit_id,
+            "limitName": self.limit_name,
+            "primary": self.primary.to_json() if self.primary else None,
+            "secondary": self.secondary.to_json() if self.secondary else None,
+            "planType": self.plan_type,
+        }
+
+    @staticmethod
+    def from_json(data: dict[str, Any] | None) -> "RateLimitSnapshot | None":
+        if not isinstance(data, dict):
+            return None
+        return RateLimitSnapshot(
+            data.get("limitId"),
+            data.get("limitName"),
+            RateLimitWindow.from_json(data.get("primary")),
+            RateLimitWindow.from_json(data.get("secondary")),
+            data.get("planType"),
+        )
 
 
 @dataclass(frozen=True)
@@ -122,6 +173,25 @@ class CodexSnapshot:
             QuotaDisplayWindow(_quota_label(window.window_duration_mins, offset, len(present)), window)
             for offset, (_, window) in enumerate(present)
         ]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "account": self.account.to_json(),
+            "rateLimits": self.rate_limits.to_json() if self.rate_limits else None,
+            "fetchedAt": _format_dt(self.fetched_at),
+            "quotaError": self.quota_error,
+        }
+
+    @staticmethod
+    def from_json(data: dict[str, Any] | None) -> "CodexSnapshot | None":
+        if not isinstance(data, dict):
+            return None
+        return CodexSnapshot(
+            CodexAccount.from_json(data.get("account")),
+            RateLimitSnapshot.from_json(data.get("rateLimits")),
+            _parse_dt(data.get("fetchedAt")),
+            data.get("quotaError"),
+        )
 
 
 @dataclass(frozen=True)

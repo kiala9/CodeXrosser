@@ -21,6 +21,7 @@ from .core import (
     SessionManagerLauncher,
     SessionMetaSynchronizer,
     SnapshotManager,
+    VaultQuotaCache,
     WritePreviewBuilder,
     WindowsCodexDesktopController,
     app_log,
@@ -55,7 +56,8 @@ class AppServices:
         self.active_target = settings.active_codex_home_target
         self.ui_language = settings.language
         self.vault = AccountVault(self.paths.accounts_root)
-        self.rpc_client = CodexRpcClient()
+        self.quota_cache = VaultQuotaCache(self.paths.accounts_root / "quota-cache.json")
+        self.rpc_client = CodexRpcClient(logs_root=self.paths.logs_root)
         self.seeder = SandboxSeeder()
         self.api_accounts = ApiAccountService()
         self.chatgpt_login = ChatGptLoginService()
@@ -109,7 +111,7 @@ class AppServices:
                 "Quota is unavailable for API-key accounts.",
             )
         try:
-            return self.rpc_client.fetch_snapshot(self.paths.codex_home(target))
+            snapshot = self.rpc_client.fetch_snapshot(self.paths.codex_home(target))
         except Exception as ex:
             app_log(self.paths.logs_root, "Quota refresh failed.", ex)
             return CodexSnapshot(
@@ -118,6 +120,65 @@ class AppServices:
                 now_utc(),
                 self._friendly_quota_error(ex),
             )
+        if active is not None and snapshot.rate_limits is not None:
+            try:
+                self.quota_cache.upsert(active.metadata.id, snapshot)
+            except Exception as ex:
+                app_log(self.paths.logs_root, "Quota cache write failed.", ex)
+        return snapshot
+
+    def refresh_account_quota(self, account: AccountRecord) -> CodexSnapshot:
+        """Fetch quota for a saved account without switching the active home.
+
+        API accounts return the existing "unavailable" snapshot. Successful
+        fetches are written back to :attr:`quota_cache` keyed by the
+        account id; failures leave the existing cache entry intact.
+        """
+        if account.metadata.auth_mode == AuthMode.API_KEY:
+            return CodexSnapshot(
+                CodexAccount("apikey", account.metadata.display_name, None),
+                None,
+                now_utc(),
+                "Quota is unavailable for API-key accounts.",
+            )
+        try:
+            runtime = self.vault.read_runtime(account)
+            snapshot = self.rpc_client.fetch_snapshot_for_account(runtime)
+        except Exception as ex:
+            app_log(self.paths.logs_root, f"Per-account quota refresh failed: {account.metadata.display_name}", ex)
+            return CodexSnapshot(
+                CodexAccount("ChatGPT", None, None),
+                None,
+                now_utc(),
+                self._friendly_quota_error(ex),
+            )
+        if snapshot.rate_limits is not None:
+            try:
+                self.quota_cache.upsert(account.metadata.id, snapshot)
+            except Exception as ex:
+                app_log(self.paths.logs_root, "Quota cache write failed.", ex)
+        return snapshot
+
+    def refresh_all_chatgpt_quotas(self, progress_callback=None) -> dict[str, CodexSnapshot]:
+        """Sequentially refresh quota for every saved ChatGPT account.
+
+        Sequential because each fetch spawns its own ``codex app-server``
+        process; running them concurrently would multiply the resource
+        cost without a meaningful latency win. ``progress_callback`` is
+        invoked as ``(account, snapshot, done, total)`` after each fetch.
+        """
+        records = [r for r in self.vault.load() if r.metadata.auth_mode == AuthMode.CHAT_GPT]
+        total = len(records)
+        results: dict[str, CodexSnapshot] = {}
+        for index, account in enumerate(records, start=1):
+            snapshot = self.refresh_account_quota(account)
+            results[account.metadata.id] = snapshot
+            if progress_callback is not None:
+                try:
+                    progress_callback(account, snapshot, index, total)
+                except Exception as ex:
+                    app_log(self.paths.logs_root, "Quota progress callback raised.", ex)
+        return results
 
     def seed_sandbox(self) -> SandboxSeedResult:
         self.quota_buffer.clear(CodexHomeTarget.SANDBOX)
@@ -175,6 +236,10 @@ class AppServices:
 
     def delete_account(self, account: AccountRecord) -> None:
         self.vault.delete(account.metadata.id)
+        try:
+            self.quota_cache.delete(account.metadata.id)
+        except Exception as ex:
+            app_log(self.paths.logs_root, "Quota cache delete failed.", ex)
 
     def switch(self, account: AccountRecord, progress=None) -> SwitchOperationResult:
         target = self.active_target
