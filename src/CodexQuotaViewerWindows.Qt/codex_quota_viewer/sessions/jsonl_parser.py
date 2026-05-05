@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,22 +20,77 @@ from .models import (
 )
 
 
-# Bump this when you change parser-output-relevant code OUTSIDE this file
-# (e.g. add a field in models.py that the parser fills). Editing this file
-# already invalidates PARSER_VERSION via the source hash below.
+# Manual cache buster for parser-output changes.
+#
+# Two mechanisms feed PARSER_VERSION:
+#   1. Source-hash (dev): hashing this file auto-invalidates the cache
+#      whenever you save the parser during dev — see
+#      ``_compute_parser_version_from_source``.
+#   2. Build-time fingerprint (installer): ``scripts/publish.ps1`` calls
+#      ``scripts/compute-parser-fingerprint.py`` right before PyInstaller
+#      and bundles the result as ``parser_fingerprint.json``. The runtime
+#      reads it when ``sys.frozen`` is true. So installer releases get a
+#      deterministic per-build version automatically — no manual ritual.
+#
+# This BUMP is a manual override for the rare case where parser-output
+# changes live in a file the fingerprint doesn't cover (e.g. a new field
+# added in ``models.py`` that the parser fills). Bump it then.
 _PARSER_BUMP = 1
 
 
-def _compute_parser_version() -> int:
-    # First 8 hex chars of sha256 over this file's source + the manual bump,
-    # cast to a 32-bit int for the SQLite ``parser_version`` column. Any
-    # change to this file (including comments/whitespace) flips the value
-    # and invalidates the incremental-rescan cache for every session row —
-    # the next scan does a full reparse, then subsequent scans go incremental.
+_FINGERPRINT_FILENAME = "parser_fingerprint.json"
+
+
+def _fingerprint_path() -> Path:
+    """Where the build-time fingerprint JSON lives. Separated so tests
+    can monkeypatch the lookup without writing into the real package
+    directory."""
+    return Path(__file__).parent / _FINGERPRINT_FILENAME
+
+
+def _compute_parser_version_from_source() -> int:
+    """Pure source-hash + ``_PARSER_BUMP`` — what dev imports use, and
+    what ``scripts/compute-parser-fingerprint.py`` calls at build time
+    to bake the value into the bundled JSON.
+
+    First 8 hex chars of sha256 over this file's bytes + the bump,
+    cast to a 32-bit int for the SQLite ``parser_version`` column. Any
+    change to this file (including comments/whitespace) flips the value
+    and invalidates the incremental-rescan cache for every session row —
+    the next access lazily reparses, then subsequent ones go fast."""
+    try:
+        source_bytes = Path(__file__).read_bytes()
+    except OSError:
+        # PyInstaller bundles don't keep .py source on disk. The
+        # constant keeps the hash deterministic across frozen runs of
+        # the same build (the fingerprint JSON above is the preferred
+        # path; this is a last-resort fallback for broken bundles).
+        source_bytes = b"codex_quota_viewer.sessions.jsonl_parser:frozen"
     digest = hashlib.sha256(
-        Path(__file__).read_bytes() + str(_PARSER_BUMP).encode("ascii")
+        source_bytes + str(_PARSER_BUMP).encode("ascii")
     ).hexdigest()[:8]
     return int(digest, 16)
+
+
+def _compute_parser_version() -> int:
+    """Resolve ``PARSER_VERSION`` at module load.
+
+    Frozen PyInstaller bundles read the build-time fingerprint JSON
+    that ``publish.ps1`` baked in — gives a deterministic version per
+    release without manual ``_PARSER_BUMP`` updates.
+
+    Source checkouts (and frozen builds whose fingerprint went missing
+    or got corrupted) hash this file's source instead. In dev that
+    auto-invalidates the cache whenever the parser is edited."""
+    if getattr(sys, "frozen", False):
+        try:
+            data = json.loads(_fingerprint_path().read_text(encoding="utf-8"))
+            version = int(data["parser_version"])
+            if 0 <= version <= 0xFFFFFFFF:
+                return version
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return _compute_parser_version_from_source()
 
 
 PARSER_VERSION: int = _compute_parser_version()

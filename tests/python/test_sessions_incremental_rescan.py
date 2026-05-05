@@ -24,6 +24,7 @@ from codex_quota_viewer.sessions import (  # noqa: E402
     SessionsManager,
 )
 from codex_quota_viewer.sessions import helpers as sessions_helpers  # noqa: E402
+from codex_quota_viewer.sessions import jsonl_parser as sessions_jsonl_parser  # noqa: E402
 from codex_quota_viewer.sessions import manager as sessions_manager  # noqa: E402
 from codex_quota_viewer.sessions.helpers import (  # noqa: E402
     build_fallback_relative_path,
@@ -41,6 +42,93 @@ def _reset_parser_cache():
     clear_parser_cache()
     yield
     clear_parser_cache()
+
+
+def test_parser_version_falls_back_when_source_is_unavailable(monkeypatch) -> None:
+    """PyInstaller may import from a bundle without this .py source on disk."""
+
+    class MissingSourcePath:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def read_bytes(self) -> bytes:
+            raise FileNotFoundError("frozen source")
+
+    monkeypatch.setattr(sessions_jsonl_parser, "Path", MissingSourcePath)
+
+    version = sessions_jsonl_parser._compute_parser_version()  # noqa: SLF001
+
+    assert isinstance(version, int)
+    assert 0 <= version <= 0xFFFFFFFF
+
+
+def test_parser_version_uses_fingerprint_when_frozen(tmp_path: Path, monkeypatch) -> None:
+    """In frozen PyInstaller bundles ``_compute_parser_version`` must read
+    the build-time fingerprint JSON that publish.ps1 baked in. That's how
+    installer releases get a deterministic per-build version without
+    anyone bumping ``_PARSER_BUMP``."""
+    fp = tmp_path / "parser_fingerprint.json"
+    fp.write_text(json.dumps({"parser_version": 0xDEADBEEF}), encoding="utf-8")
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sessions_jsonl_parser, "_fingerprint_path", lambda: fp)
+
+    assert sessions_jsonl_parser._compute_parser_version() == 0xDEADBEEF  # noqa: SLF001
+
+
+def test_parser_version_falls_through_when_fingerprint_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Frozen build with a missing fingerprint must NOT crash — fall
+    through to the source hash (which itself falls through to the
+    constant when the .py is unavailable)."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        sessions_jsonl_parser,
+        "_fingerprint_path",
+        lambda: tmp_path / "does-not-exist.json",
+    )
+
+    version = sessions_jsonl_parser._compute_parser_version()  # noqa: SLF001
+    expected = sessions_jsonl_parser._compute_parser_version_from_source()  # noqa: SLF001
+
+    assert version == expected
+    assert 0 <= version <= 0xFFFFFFFF
+
+
+def test_parser_version_falls_through_when_fingerprint_corrupted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Corrupted fingerprint (bad JSON, wrong shape, out-of-range value)
+    falls through to source hash. We never want a malformed JSON to
+    permanently brick the cache check."""
+    fp = tmp_path / "parser_fingerprint.json"
+    fp.write_text("{not valid json", encoding="utf-8")
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sessions_jsonl_parser, "_fingerprint_path", lambda: fp)
+
+    version = sessions_jsonl_parser._compute_parser_version()  # noqa: SLF001
+    expected = sessions_jsonl_parser._compute_parser_version_from_source()  # noqa: SLF001
+
+    assert version == expected
+
+
+def test_parser_version_ignores_fingerprint_in_dev(tmp_path: Path, monkeypatch) -> None:
+    """In source checkouts (sys.frozen unset/false), the fingerprint
+    JSON is never consulted — even if one happens to exist next to the
+    module. Dev mode keeps the auto-detect-on-source-edit behaviour."""
+    fp = tmp_path / "parser_fingerprint.json"
+    fp.write_text(json.dumps({"parser_version": 0xDEADBEEF}), encoding="utf-8")
+
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sessions_jsonl_parser, "_fingerprint_path", lambda: fp)
+
+    version = sessions_jsonl_parser._compute_parser_version()  # noqa: SLF001
+    expected = sessions_jsonl_parser._compute_parser_version_from_source()  # noqa: SLF001
+
+    assert version == expected
+    assert version != 0xDEADBEEF
 
 
 def _write_session_jsonl(
