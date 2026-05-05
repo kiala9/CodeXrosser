@@ -93,6 +93,7 @@ from .services import AppServices
 from .sessions_page import SessionsPage
 
 
+APP_DISPLAY_NAME = "CodeXrosser"
 APP_ICON_ASSET = "cqv-app-icon.png"
 
 
@@ -937,7 +938,7 @@ class MainWindow(QMainWindow):
         self._status_auto_hide_timer.setSingleShot(True)
         self._status_auto_hide_timer.timeout.connect(self.clear_status)
 
-        self.setWindowTitle("Codex Quota Viewer Windows")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.setWindowIcon(_asset_icon(APP_ICON_ASSET))
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -1882,7 +1883,7 @@ class MainWindow(QMainWindow):
             self.status_footer.setVisible(True)
             self._position_status_popup()
         if self.tray_icon:
-            self.tray_icon.setToolTip(_trim_tray_text("Codex Quota Viewer: " + summary))
+            self.tray_icon.setToolTip(_trim_tray_text(APP_DISPLAY_NAME + ": " + summary))
         self._schedule_status_auto_hide(kind)
 
     def clear_status(self) -> None:
@@ -1906,7 +1907,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "status_footer"):
             self.status_footer.hide()
         if getattr(self, "tray_icon", None):
-            self.tray_icon.setToolTip("Codex Quota Viewer")
+            self.tray_icon.setToolTip(APP_DISPLAY_NAME)
 
     def _schedule_status_auto_hide(self, severity: str) -> None:
         if not hasattr(self, "_status_auto_hide_timer"):
@@ -2138,7 +2139,7 @@ class MainWindow(QMainWindow):
             on_error(ex)
             return
         self.set_status(str(ex))
-        QMessageBox.warning(self, "Codex Quota Viewer", str(ex))
+        QMessageBox.warning(self, APP_DISPLAY_NAME, str(ex))
 
     def show_accounts(self, refresh_quota: bool = True) -> None:
         self.current_view = "Accounts"
@@ -3488,7 +3489,7 @@ def run_app() -> int:
     window = MainWindow(services)
     icon = app_icon if not app_icon.isNull() else app.style().standardIcon(QStyle.SP_ComputerIcon)
     tray = QSystemTrayIcon(icon, app)
-    tray.setToolTip("Codex Quota Viewer Windows")
+    tray.setToolTip(APP_DISPLAY_NAME)
     menu = QMenu()
     open_action = QAction("Open", menu)
     open_action.triggered.connect(lambda: (window.show(), window.raise_(), window.activateWindow()))

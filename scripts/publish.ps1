@@ -19,6 +19,7 @@ $assetsDir = Join-Path $root "src\CodexQuotaViewerWindows.Qt\codex_quota_viewer\
 $sessionsSchema = Join-Path $root "src\CodexQuotaViewerWindows.Qt\codex_quota_viewer\sessions\schema.sql"
 $iconPath = Join-Path $assetsDir "cqv-app-icon.ico"
 $tempRoot = Join-Path $root ".tmp"
+$binaryName = "CodeXrosser"
 
 function Copy-TreeRobust {
     param(
@@ -88,7 +89,7 @@ Remove-Item -LiteralPath $pyInstallerSpec -Recurse -Force -ErrorAction SilentlyC
     --clean `
     --windowed `
     --onedir `
-    --name CodexQuotaViewerWindowsQt `
+    --name $binaryName `
     --icon $iconPath `
     --paths (Join-Path $root "src\CodexQuotaViewerWindows.Qt") `
     --add-data "$assetsDir;codex_quota_viewer/assets" `
@@ -98,7 +99,7 @@ Remove-Item -LiteralPath $pyInstallerSpec -Recurse -Force -ErrorAction SilentlyC
     --specpath $pyInstallerSpec `
     $entry
 
-Copy-TreeRobust (Join-Path $pyInstallerDist "CodexQuotaViewerWindowsQt") $publishDir
+Copy-TreeRobust (Join-Path $pyInstallerDist $binaryName) $publishDir
 if ($IncludeLegacySessionManager -and (Test-Path -LiteralPath $sessionBundle)) {
     Remove-Item -LiteralPath $publishedSessionBundle -Recurse -Force -ErrorAction SilentlyContinue
     Copy-TreeRobust $sessionBundle $publishedSessionBundle
