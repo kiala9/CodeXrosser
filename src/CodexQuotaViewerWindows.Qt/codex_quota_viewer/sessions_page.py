@@ -15,8 +15,10 @@ from typing import Any, Callable
 from PySide6.QtCore import (
     QAbstractListModel,
     QByteArray,
+    QBuffer,
     QCoreApplication,
     QEvent,
+    QIODevice,
     QItemSelectionModel,
     QModelIndex,
     QPoint,
@@ -43,6 +45,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QImage,
+    QImageReader,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -1468,6 +1471,15 @@ _BROKEN_IMAGE_SVG = (
     '<line x1="3" y1="3" x2="21" y2="21"/>'
     '</g></svg>'
 )
+_IMAGE_THUMBNAIL_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<g fill="none" stroke="#dbe3ee" stroke-width="1.6" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>'
+    '<circle cx="8.5" cy="8.5" r="1.5"/>'
+    '<polyline points="21 15 16 10 5 21"/>'
+    '</g></svg>'
+)
 
 
 @dataclass(frozen=True)
@@ -1509,7 +1521,7 @@ def _attachment_display_name(attachment: Attachment) -> str:
     if name:
         return name
     alt = (attachment.alt or "").strip()
-    if alt:
+    if alt and alt.lower() != "high":
         return alt
     if attachment.path:
         base = Path(attachment.path).name
@@ -1731,6 +1743,9 @@ class _TimeTravelAttachmentDelegate(QStyledItemDelegate):
         self._broken_renderer = QSvgRenderer(
             QByteArray(_BROKEN_IMAGE_SVG.encode("utf-8"))
         )
+        self._image_renderer = QSvgRenderer(
+            QByteArray(_IMAGE_THUMBNAIL_SVG.encode("utf-8"))
+        )
 
     # --------------------------------------------------------------- API
 
@@ -1943,31 +1958,69 @@ class _TimeTravelAttachmentDelegate(QStyledItemDelegate):
         the cell always shows *something*."""
         image: QImage | None = None
         if row.data_uri:
-            image = _decode_data_uri(row.data_uri)
+            attachment = Attachment(
+                kind="image",
+                mime=row.mime or "image/unknown",
+                data_uri=row.data_uri,
+                alt=row.display_name,
+            )
+            image = _load_attachment_image_scaled(
+                attachment, _ATTACHMENT_THUMB_SIZE
+            )
         if image is None and row.path:
-            fallback = QImage()
-            if fallback.load(row.path):
-                image = fallback
+            attachment = Attachment(
+                kind="image",
+                mime=row.mime or "image/unknown",
+                path=row.path,
+                alt=row.display_name,
+            )
+            image = _load_attachment_image_scaled(
+                attachment, _ATTACHMENT_THUMB_SIZE
+            )
+        if image is None and not row.data_uri and not row.path:
+            return self._render_image_placeholder_pixmap()
         if image is None or image.isNull():
             return self._render_broken_pixmap()
-        scaled = image.scaled(
-            _ATTACHMENT_THUMB_SIZE,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
+        scaled = (
+            image
+            if image.size().boundedTo(_ATTACHMENT_THUMB_SIZE) == image.size()
+            else image.scaled(
+                _ATTACHMENT_THUMB_SIZE,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
         )
         return QPixmap.fromImage(scaled)
+
+    def _render_image_placeholder_pixmap(self) -> QPixmap:
+        """Neutral placeholder for memory-light full-session rows whose
+        inline bytes were deliberately not loaded into the attachment model."""
+        return self._render_vector_placeholder_pixmap(
+            self._image_renderer,
+            QColor(255, 255, 255, 18),
+        )
 
     def _render_broken_pixmap(self) -> QPixmap:
         """Vector-render the broken-image placeholder once at the
         thumb size. Only called when an image fails to decode — files
         never reach this path."""
+        return self._render_vector_placeholder_pixmap(
+            self._broken_renderer,
+            QColor(255, 100, 100, 32),
+        )
+
+    def _render_vector_placeholder_pixmap(
+        self,
+        renderer: QSvgRenderer,
+        background: QColor,
+    ) -> QPixmap:
         size = _ATTACHMENT_THUMB_SIZE
         pixmap = QPixmap(size)
         pixmap.fill(QColor(0, 0, 0, 0))
         painter = QPainter(pixmap)
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setBrush(QColor(255, 100, 100, 32))
+            painter.setBrush(background)
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(
                 QRectF(0, 0, size.width(), size.height()),
@@ -1977,9 +2030,7 @@ class _TimeTravelAttachmentDelegate(QStyledItemDelegate):
             glyph = int(size.width() * 0.5)
             x = (size.width() - glyph) // 2
             y = (size.height() - glyph) // 2
-            self._broken_renderer.render(
-                painter, QRectF(x, y, glyph, glyph)
-            )
+            renderer.render(painter, QRectF(x, y, glyph, glyph))
         finally:
             painter.end()
         return pixmap
@@ -5191,7 +5242,7 @@ class SessionsPage(QWidget):
         menu.exec(self._tree.viewport().mapToGlobal(pos))
 
 
-_WINDOW_SIZE = 120  # max blocks alive in the sliding window
+_WINDOW_SIZE = 48  # max blocks alive in the sliding window
 _WINDOW_HALF = _WINDOW_SIZE // 2  # offset used when recentering on a focus block
 _RECENTER_THRESHOLD = _WINDOW_SIZE // 4  # natural-scroll drift before recenter
 _EDGE_TRIGGER_RATIO = 0.18  # scroll within this fraction of an edge → slide
@@ -5292,7 +5343,7 @@ class _SessionDetailPanel(QFrame):
     # rows after the user scrolls past the loaded edge. Mirrors
     # DEFAULT_TIMELINE_PAGE_SIZE on the parser side; kept inline so the
     # panel doesn't need to depend on the parser module.
-    _OLDER_PAGE_SIZE = 200
+    _OLDER_PAGE_SIZE = 64
 
     # Emitted when the user reaches the loaded edge and there's still
     # older history in the repository to fetch. SessionsPage routes this
@@ -5515,6 +5566,7 @@ class _SessionDetailPanel(QFrame):
         scrollbar.valueChanged.connect(self._update_scroll_jump_buttons)
         scrollbar.rangeChanged.connect(
             lambda _min, _max: (
+                self._refresh_visible_image_previews(),
                 self._schedule_minimap_refresh(),
                 self._update_scroll_jump_buttons(),
             )
@@ -7266,6 +7318,7 @@ class _SessionDetailPanel(QFrame):
                     self._timeline_layout.insertWidget(
                         self._timeline_layout.count() - 1, widget
                     )
+        QTimer.singleShot(0, self._refresh_visible_image_previews)
         return added_height
 
     def _build_window_widget(self, block_index: int) -> QWidget | None:
@@ -7397,6 +7450,7 @@ class _SessionDetailPanel(QFrame):
                 continue
             widget.hide()
             widget.deleteLater()
+        QTimer.singleShot(0, self._refresh_visible_image_previews)
 
     def _drop_widgets_at(self, layout_indexes: list[int]) -> int:
         """Delete the widgets at the given layout indexes (descending order
@@ -8274,10 +8328,41 @@ class _SessionDetailPanel(QFrame):
     # --------------------------------------------------------- scroll/anchor
 
     def _on_scroll_changed(self, _value: int) -> None:
+        self._refresh_visible_image_previews()
+        self._sync_minimap_scroll_state()
         self._schedule_minimap_refresh()
         if self._timeline_scroll_locked():
             return
         self._scroll_throttle.start()
+
+    def _sync_minimap_scroll_state(self) -> None:
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        self._navigator.set_scroll_state(
+            scroll_value=scrollbar.value(),
+            viewport_height=self._timeline_scroll.viewport().height(),
+            scroll_maximum=scrollbar.maximum(),
+        )
+
+    def _refresh_visible_image_previews(self) -> None:
+        viewport = self._timeline_scroll.viewport()
+        viewport_h = viewport.height()
+        if viewport_h <= 0:
+            return
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        preload = max(120, viewport_h // 2)
+        active_rect = QRect(
+            0,
+            max(0, scrollbar.value() - preload),
+            max(1, viewport.width()),
+            viewport_h + preload * 2,
+        )
+        for card in self._timeline_container.findChildren(_ImageCard):
+            if not card.isVisible():
+                card.set_preview_active(False)
+                continue
+            top_left = card.mapTo(self._timeline_container, QPoint(0, 0))
+            card_rect = QRect(top_left, card.size())
+            card.set_preview_active(card_rect.intersects(active_rect))
 
     def _schedule_minimap_refresh(self, delay_ms: int = 16) -> None:
         if not self._minimap_refresh_timer.isActive():
@@ -8575,7 +8660,8 @@ class _SessionDetailPanel(QFrame):
         finally:
             self._suppress_edge_slide = False
         self._scroll_throttle.start()
-        self._refresh_minimap()
+        self._sync_minimap_scroll_state()
+        self._schedule_minimap_refresh()
 
     def _scroll_to_block_center(
         self,
@@ -8597,7 +8683,8 @@ class _SessionDetailPanel(QFrame):
         if not keep_suppressed:
             self._suppress_edge_slide = False
         self._refresh_status_label()
-        self._refresh_minimap()
+        self._sync_minimap_scroll_state()
+        self._schedule_minimap_refresh()
         return True
 
     def _settle_block_center(
@@ -8756,6 +8843,7 @@ class _TimelineNavigatorRail(QFrame):
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setMouseTracking(True)
         self._markers: list[_MinimapMarker] = []
+        self._marker_rect_cache: list[tuple[int, _MinimapMarker, QRectF]] | None = None
         self._content_height = 1
         self._scroll_value = 0
         self._viewport_height = 0
@@ -8784,6 +8872,36 @@ class _TimelineNavigatorRail(QFrame):
         self._viewport_height = max(0, int(viewport_height))
         self._scroll_maximum = max(0, int(scroll_maximum))
         self._hover_marker_index = None
+        self._marker_rect_cache = None
+        self.update()
+
+    def set_scroll_state(
+        self,
+        *,
+        scroll_value: int,
+        viewport_height: int,
+        scroll_maximum: int,
+    ) -> None:
+        """Update only the viewport thumb state.
+
+        Dragging the minimap and normal wheel scrolling can fire dozens of
+        valueChanged signals per second. Marker geometry is unchanged during
+        those frames, so the panel can update the rail thumb immediately and
+        defer the expensive widget-geometry scan to the coalesced minimap
+        refresh timer.
+        """
+        new_scroll = max(0, int(scroll_value))
+        new_viewport = max(0, int(viewport_height))
+        new_maximum = max(0, int(scroll_maximum))
+        if (
+            new_scroll == self._scroll_value
+            and new_viewport == self._viewport_height
+            and new_maximum == self._scroll_maximum
+        ):
+            return
+        self._scroll_value = new_scroll
+        self._viewport_height = new_viewport
+        self._scroll_maximum = new_maximum
         self.update()
 
     def suspend_drag_until_release(self) -> None:
@@ -8829,6 +8947,8 @@ class _TimelineNavigatorRail(QFrame):
         return float(min(max(self.width(), 1), self._VISUAL_WIDTH))
 
     def _marker_rects(self) -> list[tuple[int, _MinimapMarker, QRectF]]:
+        if self._marker_rect_cache is not None:
+            return self._marker_rect_cache
         scale = self._scale()
         rail_h = float(max(self.height(), 1))
         cap_h = max(2.0, rail_h * 0.05)
@@ -8842,7 +8962,12 @@ class _TimelineNavigatorRail(QFrame):
             y = float(marker.y) * scale
             y = max(0.0, min(y, rail_h - marker_h))
             rects.append((i, marker, QRectF(x, y, marker_w, marker_h)))
+        self._marker_rect_cache = rects
         return rects
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._marker_rect_cache = None
+        return super().resizeEvent(event)
 
     def _thumb_rect(self) -> QRectF:
         if self._viewport_height <= 0:
@@ -10585,6 +10710,7 @@ _MAX_IMAGE_DECODED_BYTES = 16 * 1024 * 1024
 # already capped to the timeline width; this further constrains image
 # pixmaps so a large screenshot doesn't dominate the message column.
 _IMAGE_CARD_MAX_WIDTH = 480
+_IMAGE_CARD_MAX_HEIGHT = 360
 # Markdown image syntax. We extract these into the same attachment channel
 # so MD-attached screenshots get the same card chrome as Codex-payload
 # images. ``http(s)://`` sources are left in the text so Qt can fetch and
@@ -10613,31 +10739,10 @@ def _decode_data_uri(data_uri: str) -> QImage | None:
     decode, the decoded byte count exceeds the safety cap, or Qt declines
     to load the bytes (unsupported MIME / corrupt header).
     """
-    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+    decoded = _decode_data_uri_to_bytes(data_uri)
+    if decoded is None:
         return None
-    comma = data_uri.find(",")
-    if comma < 0:
-        return None
-    payload = data_uri[comma + 1 :]
-    # ``base64.b64decode`` is forgiving with whitespace but will raise on
-    # invalid padding/characters; treat any failure as a decode miss so the
-    # caller can swap in the failure placeholder.
-    try:
-        encoded = payload.encode("ascii", errors="ignore")
-        # Cheap pre-check: a base64 string of length L decodes to ~3*L/4
-        # bytes. Bail before the expensive decode if the upper bound
-        # already breaches the cap.
-        if len(encoded) // 4 * 3 > _MAX_IMAGE_DECODED_BYTES:
-            return None
-        decoded = base64.b64decode(encoded, validate=False)
-    except (binascii.Error, ValueError):
-        return None
-    if len(decoded) > _MAX_IMAGE_DECODED_BYTES:
-        return None
-    image = QImage()
-    if not image.loadFromData(decoded):
-        return None
-    return image
+    return _load_image_bytes(decoded)
 
 
 def _extract_markdown_attachments(
@@ -10738,6 +10843,72 @@ def _load_attachment_image(attachment: Attachment) -> QImage | None:
         except (OSError, ValueError):
             return None
     return None
+
+
+def _load_attachment_image_scaled(
+    attachment: Attachment,
+    target_size: QSize,
+) -> QImage | None:
+    """Resolve an attachment to a display-sized ``QImage``.
+
+    ``_load_attachment_image`` intentionally preserves full resolution for
+    download/conversion actions. The timeline only needs a bounded preview, so
+    this path asks Qt's image reader to decode directly into the target size
+    whenever the backend supports it. That keeps both peak and retained memory
+    proportional to the visible preview, not the screenshot's source pixels.
+    """
+    if attachment.data_uri:
+        decoded = _decode_data_uri_to_bytes(attachment.data_uri)
+        if decoded is not None:
+            image = _load_image_bytes(decoded, target_size=target_size)
+            if image is not None:
+                return image
+    if attachment.path:
+        try:
+            resolved = Path(attachment.path)
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+            if resolved.exists():
+                reader = QImageReader(str(resolved))
+                image = _read_image(reader, target_size=target_size)
+                if image is not None:
+                    return image
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _attachment_image_size(attachment: Attachment) -> QSize | None:
+    """Read image dimensions without decoding full pixel data."""
+    reader: QImageReader | None = None
+    buffer: QBuffer | None = None
+    if attachment.data_uri:
+        decoded = _decode_data_uri_to_bytes(attachment.data_uri)
+        if decoded is None:
+            return None
+        data = QByteArray(decoded)
+        buffer = QBuffer()
+        buffer.setData(data)
+        if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+            return None
+        reader = QImageReader(buffer)
+    elif attachment.path:
+        try:
+            resolved = Path(attachment.path)
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+            if not resolved.exists():
+                return None
+            reader = QImageReader(str(resolved))
+        except (OSError, ValueError):
+            return None
+    if reader is None:
+        return None
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.width() <= 0 or size.height() <= 0:
+        return None
+    return QSize(size)
 
 
 _ATTACHMENT_CARD_QSS = (
@@ -11147,8 +11318,10 @@ class _ImageCard(_AttachmentCard):
     """
 
     def __init__(self, attachment: Attachment, parent: QWidget) -> None:
-        self._image: QImage | None = None
-        self._pixmap: QPixmap | None = None
+        self._display_pixmap: QPixmap | None = None
+        self._display_target_size: QSize | None = None
+        self._image_load_failed = False
+        self._source_size: QSize | None = None
         self._body_label: QLabel | None = None
         self._image_index: int = 0
         # Cache of the temp-file path written by
@@ -11258,17 +11431,14 @@ class _ImageCard(_AttachmentCard):
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
-        if self._image is None:
-            self._image = _load_attachment_image(self._attachment)
-            if self._image is None:
-                self._show_failure_placeholder()
-            else:
-                self._pixmap = QPixmap.fromImage(self._image)
-        self._update_pixmap_for_width()
+        self._reserve_body_height_for_width()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         super().resizeEvent(event)
-        self._update_pixmap_for_width()
+        if self._display_pixmap is None or self._display_pixmap.isNull():
+            self._reserve_body_height_for_width()
+        else:
+            self._update_pixmap_for_width()
         if self._open_overlay is not None:
             self._open_overlay.setGeometry(self.rect())
 
@@ -11283,27 +11453,79 @@ class _ImageCard(_AttachmentCard):
         body.setMinimumSize(200, 120)
         body.setMaximumHeight(160)
 
+    def set_preview_active(self, active: bool) -> None:
+        if active:
+            self._update_pixmap_for_width()
+        else:
+            self._release_display_pixmap()
+
+    def _release_display_pixmap(self) -> None:
+        if self._display_pixmap is None:
+            return
+        self._display_pixmap = None
+        self._display_target_size = None
+        body = self._body_label
+        if body is not None:
+            body.clear()
+        self._reserve_body_height_for_width()
+
+    def _target_width(self) -> int:
+        card_width = max(self.width() - 20, 0)
+        return min(card_width, _IMAGE_CARD_MAX_WIDTH)
+
+    def _reserve_body_height_for_width(self) -> None:
+        body = self._body_label
+        if body is None or self._image_load_failed:
+            return
+        target_width = self._target_width()
+        if target_width <= 0:
+            return
+        if self._source_size is None:
+            self._source_size = _attachment_image_size(self._attachment)
+        height = 120
+        if self._source_size is not None:
+            target_size = QSize(target_width, _IMAGE_CARD_MAX_HEIGHT)
+            scaled_size = self._source_size.scaled(target_size, Qt.KeepAspectRatio)
+            if scaled_size.width() > 0 and scaled_size.height() > 0:
+                height = min(scaled_size.height(), _IMAGE_CARD_MAX_HEIGHT)
+        body.setMinimumHeight(height)
+        body.setMaximumHeight(height)
+
     def _update_pixmap_for_width(self) -> None:
         body = self._body_label
-        if body is None or self._pixmap is None or self._pixmap.isNull():
+        if body is None or self._image_load_failed:
             return
         # Available width = card width minus card padding (10 + 10) so the
         # pixmap fits the body precisely.
-        card_width = max(self.width() - 20, 0)
-        target_width = min(card_width, _IMAGE_CARD_MAX_WIDTH)
+        target_width = self._target_width()
         if target_width <= 0:
             return
-        pixmap_width = self._pixmap.width()
-        pixmap_height = self._pixmap.height()
-        if pixmap_width <= 0 or pixmap_height <= 0:
-            return
-        if pixmap_width <= target_width:
-            scaled = self._pixmap
-        else:
-            scaled = self._pixmap.scaledToWidth(target_width, Qt.SmoothTransformation)
-        body.setPixmap(scaled)
-        body.setMinimumHeight(min(scaled.height(), 360))
-        body.setMaximumHeight(scaled.height())
+        target_size = QSize(target_width, _IMAGE_CARD_MAX_HEIGHT)
+        if (
+            self._display_pixmap is None
+            or self._display_pixmap.isNull()
+            or self._display_target_size != target_size
+        ):
+            image = _load_attachment_image_scaled(self._attachment, target_size)
+            if image is None:
+                self._image_load_failed = True
+                self._show_failure_placeholder()
+                return
+            scaled = (
+                image
+                if image.size().boundedTo(target_size) == image.size()
+                else image.scaled(
+                    target_size,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+            self._display_pixmap = QPixmap.fromImage(scaled)
+            self._display_target_size = target_size
+        body.setPixmap(self._display_pixmap)
+        display_height = min(self._display_pixmap.height(), _IMAGE_CARD_MAX_HEIGHT)
+        body.setMinimumHeight(display_height)
+        body.setMaximumHeight(display_height)
 
     # ----- Actions ---------------------------------------------------------
 
@@ -11329,7 +11551,7 @@ class _ImageCard(_AttachmentCard):
             path: Path | None = cached
         else:
             path = _materialize_attachment_for_external_open(
-                self._attachment, self._image
+                self._attachment, None
             )
             if path is not None:
                 self._materialized_path = path
@@ -11355,7 +11577,8 @@ class _ImageCard(_AttachmentCard):
             )
 
     def _save_image(self) -> None:
-        if self._image is None:
+        image = _load_attachment_image(self._attachment)
+        if image is None:
             return
         suffix = _suffix_for_mime(self._attachment.mime)
         default_name = f"cqv-image-{self._image_index + 1:03d}{suffix}"
@@ -11371,7 +11594,7 @@ class _ImageCard(_AttachmentCard):
         )
         if not save_path:
             return
-        if not self._image.save(save_path):
+        if not image.save(save_path):
             QMessageBox.warning(
                 self,
                 _t("Save image"),
@@ -11532,6 +11755,59 @@ class _FileCard(_AttachmentCard):
             )
 
 
+def _load_image_bytes(
+    decoded: bytes,
+    *,
+    target_size: QSize | None = None,
+) -> QImage | None:
+    if not decoded:
+        return None
+    data = QByteArray(decoded)
+    buffer = QBuffer()
+    buffer.setData(data)
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        return None
+    reader = QImageReader(buffer)
+    return _read_image(reader, target_size=target_size)
+
+
+def _read_image(
+    reader: QImageReader,
+    *,
+    target_size: QSize | None = None,
+) -> QImage | None:
+    reader.setAutoTransform(True)
+    if (
+        target_size is not None
+        and target_size.width() > 0
+        and target_size.height() > 0
+    ):
+        source_size = reader.size()
+        if source_size.width() > 0 and source_size.height() > 0:
+            scaled_size = source_size.scaled(target_size, Qt.KeepAspectRatio)
+            if (
+                scaled_size.width() > 0
+                and scaled_size.height() > 0
+                and scaled_size != source_size
+            ):
+                reader.setScaledSize(scaled_size)
+    image = reader.read()
+    if image.isNull():
+        return None
+    if (
+        target_size is not None
+        and target_size.width() > 0
+        and target_size.height() > 0
+    ):
+        if image.width() > target_size.width() or image.height() > target_size.height():
+            image = image.scaled(
+                target_size,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+    return image
+
+
 def _decode_data_uri_to_bytes(data_uri: str) -> bytes | None:
     if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
         return None
@@ -11540,9 +11816,15 @@ def _decode_data_uri_to_bytes(data_uri: str) -> bytes | None:
         return None
     payload = data_uri[comma + 1 :]
     try:
-        return base64.b64decode(payload.encode("ascii", errors="ignore"), validate=False)
+        encoded = payload.encode("ascii", errors="ignore")
+        if len(encoded) // 4 * 3 > _MAX_IMAGE_DECODED_BYTES:
+            return None
+        decoded = base64.b64decode(encoded, validate=False)
     except (binascii.Error, ValueError):
         return None
+    if len(decoded) > _MAX_IMAGE_DECODED_BYTES:
+        return None
+    return decoded
 
 
 def _reveal_in_file_manager(path: Path) -> bool:

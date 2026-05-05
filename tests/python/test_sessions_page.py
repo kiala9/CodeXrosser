@@ -23,9 +23,9 @@ from PySide6.QtCore import (  # noqa: E402
     QPointF,
     Qt,
 )
-from PySide6.QtGui import QCursor, QGuiApplication, QMouseEvent  # noqa: E402
+from PySide6.QtGui import QCursor, QGuiApplication, QImage, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from codex_quota_viewer.localization import translate  # noqa: E402
 from codex_quota_viewer.models import CodexHomeTarget, UiLanguage  # noqa: E402
@@ -41,6 +41,8 @@ from codex_quota_viewer.sessions_page import (  # noqa: E402
     _AttachmentCard,
     _FileCard,
     _ImageCard,
+    _IMAGE_CARD_MAX_HEIGHT,
+    _IMAGE_CARD_MAX_WIDTH,
     _MessageBubble,
     _RECORD_SUBTITLE_ROLE,
     _SessionsTreeModel,
@@ -618,6 +620,41 @@ def test_image_card_omits_reveal_button_for_data_uri_only_attachment() -> None:
     assert "Show in folder" not in tooltips
 
 
+def test_image_card_keeps_only_scaled_display_pixmap(tmp_path) -> None:
+    """Large timeline images should not leave a full-resolution QImage and
+    QPixmap resident on the card. The card keeps only the bounded display
+    pixmap; save/open paths re-load on demand."""
+    QApplication.instance() or QApplication([])
+    image_path = tmp_path / "large.png"
+    source = QImage(2000, 1200, QImage.Format_RGB32)
+    source.fill(Qt.red)
+    assert source.save(str(image_path))
+
+    parent = QWidget()
+    card = _ImageCard(
+        Attachment(
+            kind="image",
+            mime="image/png",
+            path=str(image_path),
+            name="large.png",
+        ),
+        parent,
+    )
+    card.resize(900, 500)
+    card._update_pixmap_for_width()
+    card.show()
+    QTest.qWait(20)
+    QApplication.processEvents()
+
+    assert not hasattr(card, "_image")
+    assert not hasattr(card, "_pixmap")
+    assert card._display_pixmap is not None
+    assert card._display_pixmap.width() <= _IMAGE_CARD_MAX_WIDTH
+    assert card._display_pixmap.height() <= _IMAGE_CARD_MAX_HEIGHT
+    card.close()
+    parent.close()
+
+
 def test_image_card_reveal_invokes_helper_for_path_attachment(tmp_path, monkeypatch) -> None:
     """When the attachment carries a local file path the reveal action
     is wired up and clicking it invokes the reveal helper."""
@@ -1071,8 +1108,8 @@ def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
 
     QApplication.instance() or QApplication([])
     rec = _record("paginated")
-    # Pretend the session has 1000 events but only the last 200 are
-    # currently loaded — exactly what the new tail-load path produces.
+    # Pretend the session has 1000 events but only the tail page is
+    # currently loaded — exactly what the bounded tail-load path produces.
     tail = [
         SessionTimelineItem(
             id=f"e-{i}",
@@ -1091,6 +1128,8 @@ def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
         timeline_loaded_offset=800,
     )
     panel = _SessionDetailPanel(translator=lambda s: s)
+    page_size = panel._OLDER_PAGE_SIZE
+    expected_offset = 800 - page_size
     captured: list[tuple[str, int, int]] = []
     panel.older_history_requested.connect(
         lambda sid, off, lim: captured.append((sid, off, lim))
@@ -1102,10 +1141,10 @@ def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
     # Slide-up at the loaded edge → fetch request goes out, single-flight
     # guard prevents duplicates until prepend_older_items lands.
     panel._slide_window_up()
-    assert captured == [(rec.id, 600, 200)]
+    assert captured == [(rec.id, expected_offset, page_size)]
     assert panel._loading_older is True
     panel._slide_window_up()
-    assert captured == [(rec.id, 600, 200)]  # still single-flight
+    assert captured == [(rec.id, expected_offset, page_size)]  # still single-flight
 
     # Older page comes back: items prepend, anchor preserved by id.
     older = [
@@ -1115,12 +1154,12 @@ def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
             timestamp="2026-01-01T00:00:00Z",
             text=f"item {i}",
         )
-        for i in range(600, 800)
+        for i in range(expected_offset, 800)
     ]
-    panel.prepend_older_items(older, 600)
+    panel.prepend_older_items(older, expected_offset)
     assert panel._loading_older is False
-    assert panel._loaded_offset == 600
-    assert len(panel._all_timeline_items) == 400
+    assert panel._loaded_offset == expected_offset
+    assert len(panel._all_timeline_items) == 200 + page_size
     assert panel._current_user_block is not None
     kind, payload = panel._all_blocks[panel._current_user_block]
     assert kind == "single"
@@ -1327,7 +1366,7 @@ def test_first_upward_wheel_at_static_top_requests_older_history() -> None:
     handled = panel.eventFilter(panel._timeline_scroll.viewport(), _WheelEvent(120))
 
     assert handled
-    assert captured == [(rec.id, 600, 200)]
+    assert captured == [(rec.id, 800 - panel._OLDER_PAGE_SIZE, panel._OLDER_PAGE_SIZE)]
     assert panel._loading_older is True
     panel.close()
 
@@ -1476,7 +1515,7 @@ def test_navigator_rail_wheel_at_loaded_edge_requests_older_history() -> None:
     panel._timeline_scroll.verticalScrollBar().setValue(0)
 
     assert panel.eventFilter(panel._navigator, _WheelEvent(120))
-    assert captured == [(rec.id, 600, 200)]
+    assert captured == [(rec.id, 800 - panel._OLDER_PAGE_SIZE, panel._OLDER_PAGE_SIZE)]
     assert panel._loading_older is True
     panel.close()
 
@@ -1525,7 +1564,8 @@ def test_older_result_uses_request_time_anchor() -> None:
 
     panel._maybe_request_older()
 
-    assert requested == [(rec.id, 600, 200)]
+    expected_offset = 800 - panel._OLDER_PAGE_SIZE
+    assert requested == [(rec.id, expected_offset, panel._OLDER_PAGE_SIZE)]
     assert panel._suppress_edge_slide is True
 
     later_top = QWidget()
@@ -1550,9 +1590,9 @@ def test_older_result_uses_request_time_anchor() -> None:
             timestamp="2026-01-01T00:00:00Z",
             text=f"item {i}",
         )
-        for i in range(600, 800)
+        for i in range(expected_offset, 800)
     ]
-    panel.prepend_older_items(older, 600)
+    panel.prepend_older_items(older, expected_offset)
     _wait_detail_panel_ready(panel)
 
     assert captured["block_index"] == panel._block_for_anchor_id("e-803")
@@ -1949,7 +1989,7 @@ def test_downward_wheel_at_static_bottom_requests_newer_history() -> None:
     handled = panel.eventFilter(panel._timeline_scroll.viewport(), _WheelEvent(-120))
 
     assert handled
-    assert captured == [(rec.id, 400, 200)]
+    assert captured == [(rec.id, 400, panel._OLDER_PAGE_SIZE)]
     assert panel._loading_newer is True
     panel.close()
 
@@ -2395,7 +2435,7 @@ def test_scroll_settled_at_top_edge_triggers_older_fetch() -> None:
     panel._scroll_throttle.stop()
     panel._on_scroll_settled()
 
-    assert captured == [(rec.id, 600, 200)]
+    assert captured == [(rec.id, 800 - panel._OLDER_PAGE_SIZE, panel._OLDER_PAGE_SIZE)]
     panel.close()
 
 
@@ -2619,7 +2659,7 @@ def test_large_timeline_window_renders_in_event_loop_chunks() -> None:
             id=f"e-{i}",
             type="message:user" if i % 2 == 0 else "message:assistant",
             timestamp=f"2026-01-01T00:00:{i % 60:02d}Z",
-            text="x" * 512,
+            text="x" * 1024,
         )
         for i in range(_WINDOW_SIZE + 40)
     ]
@@ -2698,6 +2738,46 @@ def test_minimap_click_scrolls_current_window_without_recentering() -> None:
     assert scrollbar.value() == target
     assert panel._scroll_throttle.isActive()
     assert not panel._timeline_overlay.isVisible()
+    panel.close()
+
+
+def test_minimap_drag_updates_thumb_without_full_geometry_refresh() -> None:
+    """Dragging the minimap must stay on the input frame: update the rail
+    thumb immediately, but leave exact marker geometry to the coalesced timer."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("minimap-fast-drag")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(120)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 2400)
+    panel._refresh_minimap = Mock()  # type: ignore[method-assign]
+
+    panel._set_scrollbar_value_from_minimap(1600)
+
+    panel._refresh_minimap.assert_not_called()
+    assert scrollbar.value() == 1600
+    assert panel._navigator._scroll_value == 1600
+    assert panel._minimap_refresh_timer.isActive()
     panel.close()
 
 
@@ -2815,6 +2895,35 @@ def test_minimap_left_interaction_pad_accepts_drag_without_moving_visual_rail() 
 
     assert rail._dragging is True
     assert emitted == [rail._target_value_for_y(120), rail._target_value_for_y(260)]
+    rail.close()
+
+
+def test_minimap_marker_rect_cache_survives_scroll_state_updates() -> None:
+    from codex_quota_viewer.sessions_page import _MinimapMarker
+
+    rail = _configured_timeline_rail()
+    rail.set_viewport(
+        [
+            _MinimapMarker(
+                block_index=0,
+                y=10,
+                height=40,
+                kind="user",
+                label="prompt",
+            )
+        ],
+        content_height=1200,
+        scroll_value=0,
+        viewport_height=200,
+        scroll_maximum=1000,
+    )
+
+    first = rail._marker_rects()
+    second = rail._marker_rects()
+    rail.set_scroll_state(scroll_value=300, viewport_height=200, scroll_maximum=1000)
+
+    assert second is first
+    assert rail._marker_rects() is first
     rail.close()
 
 
@@ -3883,7 +3992,9 @@ def test_time_travel_offset_jump_requests_page_for_unloaded_offset() -> None:
 
     panel._on_time_travel_offset_jump(100, "e-100")
 
-    assert captured == [(rec.id, 0, 200, 100, "e-100")]
+    page_size = panel._OLDER_PAGE_SIZE
+    expected_offset = max(0, 100 - page_size // 2)
+    assert captured == [(rec.id, expected_offset, page_size, 100, "e-100")]
     assert not panel._timeline_overlay.isHidden()
     panel.close()
 
@@ -4013,10 +4124,10 @@ def test_time_travel_middle_page_requests_newer_at_bottom_edge() -> None:
 
     panel._slide_window_down()
 
-    assert captured == [(rec.id, 400, 200)]
+    assert captured == [(rec.id, 400, panel._OLDER_PAGE_SIZE)]
     assert panel._loading_newer is True
     panel._slide_window_down()
-    assert captured == [(rec.id, 400, 200)]
+    assert captured == [(rec.id, 400, panel._OLDER_PAGE_SIZE)]
     panel.close()
 
 

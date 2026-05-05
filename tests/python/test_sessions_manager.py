@@ -1296,6 +1296,52 @@ def test_repository_list_session_attachments_returns_only_attachment_bearing_row
         repository.close()
 
 
+def test_repository_list_session_attachments_uses_inline_thumbnail_data_uri(
+    tmp_path: Path,
+) -> None:
+    """The full Time Travel attachment navigator should not retain every
+    base64 payload in memory. Detail timeline pages still round-trip image
+    bytes; this list endpoint returns a lightweight preview for thumbnails."""
+    repository = SessionRepository(tmp_path / "index.db")
+    session_id = "attach-light-session"
+    timestamp = "2026-04-30T10:00:00Z"
+    try:
+        repository.replace_catalog(
+            [
+                _catalog_entry(
+                    session_id=session_id,
+                    cwd=str(tmp_path),
+                    timeline=[
+                        SessionTimelineItem(
+                            id="inline-image",
+                            type="message:user",
+                            timestamp=timestamp,
+                            text="has inline image",
+                            attachments=(
+                                Attachment(
+                                    kind="image",
+                                    mime="image/png",
+                                    data_uri=_PNG_1X1_DATA_URI,
+                                    name="inline.png",
+                                ),
+                            ),
+                        ),
+                    ],
+                )
+            ]
+        )
+        full_rows = repository.list_session_attachments(session_id)
+        assert len(full_rows) == 1
+        assert full_rows[0].attachment.data_uri is not None
+        assert full_rows[0].attachment.data_uri.startswith("data:image/png;base64,")
+        assert full_rows[0].attachment.name == "inline.png"
+
+        page = repository.list_timeline_page(session_id, offset=0, limit=10)
+        assert page.items[0].attachments[0].data_uri == _PNG_1X1_DATA_URI
+    finally:
+        repository.close()
+
+
 def test_repository_list_session_attachments_picks_up_legacy_markdown_text(
     tmp_path: Path,
 ) -> None:

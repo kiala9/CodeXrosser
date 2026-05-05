@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import sqlite3
 import threading
@@ -7,6 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QSize, Qt
+from PySide6.QtGui import QImageReader
 
 from ._perf import _perf_timer
 from .jsonl_parser import _extract_markdown_image_attachments
@@ -38,6 +43,8 @@ class SessionScanMetadata:
 
 
 SCHEMA_FILE_NAME = "schema.sql"
+_ATTACHMENT_THUMBNAIL_MAX_SOURCE_BYTES = 16 * 1024 * 1024
+_ATTACHMENT_THUMBNAIL_SIZE = QSize(100, 100)
 
 
 SESSION_SELECT_COLUMNS = """
@@ -525,7 +532,7 @@ class SessionRepository:
                             type=normalized_type,  # type: ignore[arg-type]
                             timestamp=str(row["timestamp"]),
                             attachment_index=attachment_index,
-                            attachment=attachment,
+                            attachment=_attachment_with_lightweight_preview(attachment),
                         )
                     )
             return attachment_rows
@@ -1129,6 +1136,90 @@ def _decode_attachments_json(row: sqlite3.Row) -> tuple[Attachment, ...]:
         if attachment is not None:
             attachments.append(attachment)
     return tuple(attachments)
+
+
+def _attachment_with_lightweight_preview(attachment: Attachment) -> Attachment:
+    """Return attachment metadata suitable for the full-session navigator.
+
+    Detail timeline pages still round-trip original ``data_uri`` bytes for
+    visible bubbles. The full Time Travel attachment list can contain hundreds
+    of screenshots, so it replaces inline image bytes with a tiny PNG preview.
+    That keeps the Images tab visually useful while avoiding a cache of every
+    full-resolution screenshot.
+    """
+    if attachment.data_uri is None:
+        return attachment
+    data_uri = None
+    if attachment.kind == "image":
+        data_uri = _build_inline_image_thumbnail_data_uri(attachment.data_uri)
+    return Attachment(
+        kind=attachment.kind,
+        mime=attachment.mime,
+        data_uri=data_uri,
+        path=attachment.path,
+        alt=attachment.alt,
+        name=attachment.name,
+        source=attachment.source,
+    )
+
+
+def _build_inline_image_thumbnail_data_uri(data_uri: str) -> str | None:
+    decoded = _decode_data_uri_bytes(data_uri)
+    if decoded is None:
+        return None
+    buffer = QBuffer()
+    buffer.setData(QByteArray(decoded))
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        return None
+    reader = QImageReader(buffer)
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.width() > 0 and source_size.height() > 0:
+        scaled_size = source_size.scaled(_ATTACHMENT_THUMBNAIL_SIZE, Qt.KeepAspectRatio)
+        if (
+            scaled_size.width() > 0
+            and scaled_size.height() > 0
+            and scaled_size != source_size
+        ):
+            reader.setScaledSize(scaled_size)
+    image = reader.read()
+    if image.isNull():
+        return None
+    if (
+        image.width() > _ATTACHMENT_THUMBNAIL_SIZE.width()
+        or image.height() > _ATTACHMENT_THUMBNAIL_SIZE.height()
+    ):
+        image = image.scaled(
+            _ATTACHMENT_THUMBNAIL_SIZE,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+    out_buffer = QBuffer()
+    if not out_buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+        return None
+    if not image.save(out_buffer, "PNG"):
+        return None
+    encoded = base64.b64encode(bytes(out_buffer.data())).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _decode_data_uri_bytes(data_uri: str) -> bytes | None:
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    comma = data_uri.find(",")
+    if comma < 0:
+        return None
+    payload = data_uri[comma + 1 :]
+    try:
+        encoded = payload.encode("ascii", errors="ignore")
+        if len(encoded) // 4 * 3 > _ATTACHMENT_THUMBNAIL_MAX_SOURCE_BYTES:
+            return None
+        decoded = base64.b64decode(encoded, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) > _ATTACHMENT_THUMBNAIL_MAX_SOURCE_BYTES:
+        return None
+    return decoded
 
 
 def _now_iso() -> str:
