@@ -4927,6 +4927,23 @@ class SessionsPage(QWidget):
         ):
             self._show_floating_actions_after_layout()
         if (
+            tree is not None
+            and obj is tree.viewport()
+            and event.type()
+            in (QEvent.MouseMove, QEvent.HoverMove, QEvent.Leave, QEvent.Wheel)
+        ):
+            tree.viewport().update()
+        # Drive the deferred floating-bar show off the tree viewport's
+        # first paintEvent after a page show — see ``showEvent`` for
+        # the rationale.
+        if (
+            self._floating_actions_pending_show
+            and tree is not None
+            and obj is tree.viewport()
+            and event.type() == QEvent.Paint
+        ):
+            self._show_floating_actions_after_layout()
+        if (
             obj is getattr(self, "_list_container", None)
             and event.type() == QEvent.Resize
         ):
@@ -8807,6 +8824,21 @@ class _SessionDetailPanel(QFrame):
             token=token,
             on_done=_release_after_center,
         )
+
+    def _scroll_to_block_center_and_release(
+        self, block_index: int, *, token: int
+    ) -> None:
+        if token != self._render_token:
+            return
+        try:
+            self._scroll_to_block_center(block_index)
+        finally:
+            self._finish_paging_scroll_transaction()
+            self._suppress_edge_slide = False
+        self._refresh_status_label()
+        self._refresh_minimap()
+        self._hide_timeline_overlay()
+        self._refresh_count_label()
 
     # --------------------------------------------------------------- helpers
 
