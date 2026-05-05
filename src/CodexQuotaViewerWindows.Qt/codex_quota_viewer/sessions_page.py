@@ -122,6 +122,12 @@ from .sessions import (
     SessionsManager,
 )
 from .sessions._perf import _perf_log, _perf_timer
+from .sessions.exporter import (
+    ImageMode,
+    fetch_full_timeline,
+    make_export_filename_stub,
+    session_to_markdown,
+)
 
 
 _SESSION_STATUS_LABELS: dict[str, str] = {
@@ -4284,6 +4290,9 @@ class SessionsPage(QWidget):
         self._detail_panel.full_attachments_requested.connect(
             self._request_full_session_attachments
         )
+        self._detail_panel.export_markdown_requested.connect(
+            self._on_export_markdown_requested
+        )
 
         self._splitter = QSplitter(Qt.Horizontal, self)
         self._splitter.setObjectName("SessionsSplitter")
@@ -4861,6 +4870,53 @@ class SessionsPage(QWidget):
 
         def on_error(_ex: Exception) -> None:
             self._detail_panel.cancel_full_session_attachments_request(session_id)
+
+        self._task_runner(action, on_success, on_error)
+
+    def _on_export_markdown_requested(
+        self, session_id: str, image_mode: str, save_path: str
+    ) -> None:
+        """Run a Markdown export off the UI thread.
+
+        Wired from ``_SessionDetailPanel.export_markdown_requested``. The
+        panel has already shown the file dialog and the loading overlay;
+        this method handles the SQL drain + render + write, then asks
+        the panel to surface success or failure to the user. We capture
+        ``record`` and ``target`` at call time so a session switch
+        mid-export still finishes writing the originally-requested file
+        (the file is the user's deliverable, not the visible session)."""
+        active_target = self._target
+        factory = self._sessions_manager_factory
+        record = self._records_by_id.get(session_id)
+        if record is None:
+            self._detail_panel.fail_markdown_export(
+                self._translator("Session record is no longer available.")
+            )
+            return
+
+        def action() -> str:
+            manager = factory(active_target)
+            timeline = fetch_full_timeline(manager, session_id)
+            content = session_to_markdown(
+                record, timeline, image_mode=image_mode  # type: ignore[arg-type]
+            )
+            Path(save_path).write_text(content, encoding="utf-8", newline="\n")
+            return save_path
+
+        def on_success(written_path: str) -> None:
+            self._detail_panel.finish_markdown_export(written_path)
+
+        def on_error(ex: Exception) -> None:
+            self._detail_panel.fail_markdown_export(str(ex) or repr(ex))
+
+        if self._task_runner is None:
+            try:
+                written_path = action()
+            except Exception as ex:  # noqa: BLE001
+                on_error(ex)
+                return
+            on_success(written_path)
+            return
 
         self._task_runner(action, on_success, on_error)
 
@@ -5461,6 +5517,12 @@ class _SessionDetailPanel(QFrame):
     # SessionsPage routes this through its task_runner and feeds the
     # result back via ``set_full_session_attachments``. Arg: session_id.
     full_attachments_requested = Signal(str)
+    # Markdown export — emitted after the user picks fast/full and
+    # confirms a save path. SessionsPage owns the manager + task_runner
+    # so it does the worker-side fetch + write and reports success or
+    # failure back via ``finish_markdown_export`` / ``fail_markdown_export``.
+    # Args: (session_id, image_mode, save_path).
+    export_markdown_requested = Signal(str, str, str)
 
     def __init__(self, translator: Callable[[str], str], parent: QWidget | None = None):
         super().__init__(parent)
@@ -5503,6 +5565,11 @@ class _SessionDetailPanel(QFrame):
         # ``discard_rendered_timeline`` so a stale fetch can't latch on
         # to the next session.
         self._loaded_session_id: str | None = None
+        # Full record for the currently-loaded session. Stashed so the
+        # export dispatcher can build a default filename without going
+        # back through SessionsPage. Cleared whenever ``set_detail`` is
+        # called with ``None``.
+        self._loaded_record: SessionRecord | None = None
         # Single-flight guard. Set when an older-page request is in
         # flight; cleared when the result lands or the request is
         # canceled (target switch / session change). Prevents the edge-
@@ -5822,21 +5889,45 @@ class _SessionDetailPanel(QFrame):
         )
         body.addWidget(self._export_screenshot_button)
 
-        self._export_markdown_button = QPushButton(
-            self._translator("Export to MD"), self._export_popup
+        # Two MD buttons. ``fast`` skips image attachments — produces a
+        # text-only .md file that's quick to open and trivial to share
+        # in chat. ``full`` inlines images as base64 data URIs (with a
+        # 4 MB total budget) so the file is self-contained at the cost
+        # of size. Default focus goes to fast — that's the option a user
+        # picks 90% of the time when they just want a transcript.
+        self._export_markdown_fast_button = QPushButton(
+            self._translator("Export to MD (fast)"), self._export_popup
         )
-        self._export_markdown_button.setObjectName("SessionsExportMenuItem")
-        self._export_markdown_button.setIcon(_download_icon())
-        self._export_markdown_button.setIconSize(QSize(16, 16))
-        self._export_markdown_button.setMinimumHeight(34)
-        self._export_markdown_button.setCursor(Qt.PointingHandCursor)
-        self._export_markdown_button.setToolTip(
-            self._translator("Export to Markdown (coming soon)")
+        self._export_markdown_fast_button.setObjectName("SessionsExportMenuItem")
+        self._export_markdown_fast_button.setIcon(_download_icon())
+        self._export_markdown_fast_button.setIconSize(QSize(16, 16))
+        self._export_markdown_fast_button.setMinimumHeight(34)
+        self._export_markdown_fast_button.setCursor(Qt.PointingHandCursor)
+        self._export_markdown_fast_button.setToolTip(
+            self._translator("Export as Markdown, skipping image attachments")
         )
-        self._export_markdown_button.clicked.connect(
-            self._on_export_markdown_clicked
+        self._export_markdown_fast_button.clicked.connect(
+            self._on_export_markdown_fast_clicked
         )
-        body.addWidget(self._export_markdown_button)
+        body.addWidget(self._export_markdown_fast_button)
+
+        self._export_markdown_full_button = QPushButton(
+            self._translator("Export to MD (full)"), self._export_popup
+        )
+        self._export_markdown_full_button.setObjectName("SessionsExportMenuItem")
+        self._export_markdown_full_button.setIcon(_download_icon())
+        self._export_markdown_full_button.setIconSize(QSize(16, 16))
+        self._export_markdown_full_button.setMinimumHeight(34)
+        self._export_markdown_full_button.setCursor(Qt.PointingHandCursor)
+        self._export_markdown_full_button.setToolTip(
+            self._translator(
+                "Export as Markdown with inline images (larger file)"
+            )
+        )
+        self._export_markdown_full_button.clicked.connect(
+            self._on_export_markdown_full_clicked
+        )
+        body.addWidget(self._export_markdown_full_button)
 
         self._export_popup.hide()
 
@@ -6053,7 +6144,7 @@ class _SessionDetailPanel(QFrame):
         self._export_popup.raise_()
         self._export_popup.install_dwm_chrome()
         self._export_popup.activateWindow()
-        self._export_markdown_button.setFocus(Qt.PopupFocusReason)
+        self._export_markdown_fast_button.setFocus(Qt.PopupFocusReason)
 
     def _position_export_popup(self) -> None:
         container = self
@@ -6088,10 +6179,66 @@ class _SessionDetailPanel(QFrame):
             self._export_popup.hide()
 
     def _on_screenshot_action_clicked(self) -> None:
+        # Screenshot capture lands in a follow-up. The menu item stays
+        # visible so the export surface keeps its shape; clicking just
+        # dismisses for now.
         self._dismiss_export_popup()
 
-    def _on_export_markdown_clicked(self) -> None:
+    def _on_export_markdown_fast_clicked(self) -> None:
         self._dismiss_export_popup()
+        self._dispatch_export_markdown(image_mode="skip")
+
+    def _on_export_markdown_full_clicked(self) -> None:
+        self._dismiss_export_popup()
+        self._dispatch_export_markdown(image_mode="inline")
+
+    def _dispatch_export_markdown(self, *, image_mode: ImageMode) -> None:
+        record = self._loaded_record
+        if record is None:
+            # No detail loaded — silent return (the export buttons are
+            # only reachable from the detail toolbar, which is hidden
+            # until a session is selected, so this is a defensive guard).
+            return
+        default_name = f"{make_export_filename_stub(record)}.md"
+        filter_label = self._translator("Markdown files (*.md)")
+        all_files = self._translator("All files (*)")
+        save_path, _selected = QFileDialog.getSaveFileName(
+            self,
+            self._translator("Export session as Markdown"),
+            default_name,
+            f"{filter_label};;{all_files}",
+        )
+        if not save_path:
+            return
+        self._show_timeline_overlay(self._translator("Exporting..."))
+        self.export_markdown_requested.emit(record.id, image_mode, save_path)
+
+    def finish_markdown_export(self, save_path: str) -> None:
+        """Called by SessionsPage after a successful background export."""
+        self._hide_timeline_overlay()
+        target = Path(save_path)
+        body = self._translator("Saved to {path}").format(path=str(target))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle(self._translator("Export complete"))
+        box.setText(body)
+        ok_button = box.addButton(QMessageBox.Ok)
+        reveal_button = box.addButton(
+            self._translator("Show in folder"), QMessageBox.ActionRole
+        )
+        box.setDefaultButton(ok_button)
+        box.exec()
+        if box.clickedButton() is reveal_button:
+            _reveal_in_file_manager(target)
+
+    def fail_markdown_export(self, error: str) -> None:
+        """Called by SessionsPage when the background export raises."""
+        self._hide_timeline_overlay()
+        QMessageBox.warning(
+            self,
+            self._translator("Export failed"),
+            self._translator("Failed to export: {error}").format(error=error),
+        )
 
     # ---- filter popup lifecycle -----------------------------------------
 
@@ -7076,6 +7223,7 @@ class _SessionDetailPanel(QFrame):
             self._time_travel_index_pending = False
             self._loading_newer = False
             self._loaded_session_id = None
+            self._loaded_record = None
             self._clear_time_travel_ordinal_map_cache()
             self._timeline_status.setText("")
             self._set_audit_text("")
@@ -7084,6 +7232,7 @@ class _SessionDetailPanel(QFrame):
             self._refresh_count_label()
             return
         self._all_timeline_items = list(detail.timeline)
+        self._loaded_record = detail.record
         self._all_blocks = _coalesce_timeline_blocks(self._all_timeline_items)
         self._timeline_item_count = len(self._all_timeline_items)
         self._loaded_offset = max(0, getattr(detail, "timeline_loaded_offset", 0))

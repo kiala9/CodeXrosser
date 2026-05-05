@@ -857,11 +857,17 @@ def test_detail_toolbar_export_menu_and_time_travel_primary_style() -> None:
     assert "background: #0A84FF" in _DETAIL_PANEL_QSS
 
     assert not hasattr(panel, "_screenshot_button")
+    # The MD button has been split into fast/full so users can pick
+    # whether image attachments inline as base64 or get skipped. The
+    # legacy single ``_export_markdown_button`` no longer exists.
+    assert not hasattr(panel, "_export_markdown_button")
     assert panel._export_popup.objectName() == "SessionsExportPopup"
     assert panel._export_screenshot_button.text() == "Screenshot"
-    assert panel._export_markdown_button.text() == "Export to MD"
+    assert panel._export_markdown_fast_button.text() == "Export to MD (fast)"
+    assert panel._export_markdown_full_button.text() == "Export to MD (full)"
     assert panel._export_screenshot_button.parentWidget() is panel._export_popup
-    assert panel._export_markdown_button.parentWidget() is panel._export_popup
+    assert panel._export_markdown_fast_button.parentWidget() is panel._export_popup
+    assert panel._export_markdown_full_button.parentWidget() is panel._export_popup
     assert "QFrame#SessionsFilterPopup,\nQFrame#SessionsExportPopup" in _DETAIL_PANEL_QSS
     assert "QPushButton#SessionsExportMenuItem" in _DETAIL_PANEL_QSS
 
@@ -881,7 +887,8 @@ def test_detail_filter_quick_buttons_translate_to_chinese() -> None:
     assert panel._time_travel_button.text() == "Time Travel"
     assert panel._export_button.text() == "导出"
     assert panel._export_screenshot_button.text() == "截图"
-    assert panel._export_markdown_button.text() == "导出 MD"
+    assert panel._export_markdown_fast_button.text() == "导出 MD（精简）"
+    assert panel._export_markdown_full_button.text() == "导出 MD（完整）"
 
     panel.close()
 
