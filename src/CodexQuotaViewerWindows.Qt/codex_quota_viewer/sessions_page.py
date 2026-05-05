@@ -3559,6 +3559,14 @@ class SessionsPage(QWidget):
         self._detail_token = 0
         self._pending_detail_id: str | None = None
         self._active_session_id: str | None = None
+        # Targets we've already auto-triggered a rescan on. Prevents the
+        # empty-list auto-trigger from looping forever when codex_home
+        # genuinely has zero sessions for a target.
+        self._auto_rescanned_targets: set[CodexHomeTarget] = set()
+        # Most recent (done, total) from the streaming-rescan progress
+        # channel. Used by the count-label refresh so the textual indicator
+        # stays accurate while batches commit.
+        self._rescan_progress: tuple[int, int] | None = None
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(220)
@@ -3620,7 +3628,24 @@ class SessionsPage(QWidget):
 
     def reload_after_rescan(self) -> None:
         self._is_stale = False
+        # Rescan finished — clear any in-flight progress text.
+        self._rescan_progress = None
         self._refresh()
+
+    def apply_rescan_progress(self, done: int, total: int) -> None:
+        """Per-batch hook called by the host when the worker emits a
+        ``sessions-rescan-batch`` progress message. Triggers a lightweight
+        list refresh so newly-committed sessions appear without waiting
+        for the whole rescan to finish, and updates the count-label text
+        with progress."""
+        self._rescan_progress = (done, total)
+        # Pull the latest committed slice into the tree. Same async path
+        # as a normal refresh — the in-flight list_token guard handles
+        # rapid-fire batch messages.
+        if self._task_runner is not None:
+            self._request_refresh_async()
+        else:
+            self.refresh_list()
 
     def mark_stale(self) -> None:
         self._is_stale = True
@@ -3696,21 +3721,66 @@ class SessionsPage(QWidget):
         self._tree_model.set_records(records)
         self._restore_expansion(prior_expansion)
 
+        streaming = self._rescan_progress is not None
         if records:
-            first_index = self._first_session_index()
-            if first_index is not None:
-                self._tree.setCurrentIndex(first_index)
+            # Streaming-rescan batches arrive frequently — re-selecting
+            # first on each one would prevent the user from clicking
+            # already-loaded sessions while the scan finishes. For
+            # everything else (first load, target switch, search/status
+            # filter change) try to keep the previously-active session
+            # selected; fall back to the first row if it's been filtered
+            # out or removed.
+            if not streaming:
+                target_index: QModelIndex | None = None
+                if (
+                    self._active_session_id
+                    and self._active_session_id in self._records_by_id
+                ):
+                    target_index = self._find_session_index(
+                        QModelIndex(), self._active_session_id
+                    )
+                if target_index is None:
+                    target_index = self._first_session_index()
+                if target_index is not None:
+                    self._tree.setCurrentIndex(target_index)
         else:
             self._set_detail(None)
 
-        # Just the count — the env tabs above already show the active corpus,
+        # Count label: progress text during a streaming rescan, plain
+        # count otherwise. Env tabs above already show the active corpus,
         # so the previous "in Sandbox/Real" suffix was redundant.
-        self._set_record_count_text(
-            self._translator("{count} session(s)").format(count=len(records))
-        )
+        if streaming:
+            done, total = self._rescan_progress  # type: ignore[misc]
+            self._set_record_count_text(
+                self._translator("Indexing... {done} / {total}").format(
+                    done=done, total=total
+                )
+            )
+        else:
+            self._set_record_count_text(
+                self._translator("{count} session(s)").format(count=len(records))
+            )
         self._has_loaded = True
         self._is_stale = False
         self._show_list_overlay(False)
+
+        # Auto-trigger an initial rescan when the catalog DB is empty for
+        # this target — first install would otherwise greet the user with
+        # an empty list and no hint that they need to click Rescan.
+        # Gates: (1) streaming rescan not already running, (2) filters
+        # are at default — otherwise an empty result reflects a user-
+        # narrowed query, not an empty catalog, (3) target hasn't been
+        # auto-rescanned this session.
+        filters = self._current_filters()
+        unfiltered = filters.query is None and filters.status is None
+        if (
+            not records
+            and not streaming
+            and unfiltered
+            and target not in self._auto_rescanned_targets
+        ):
+            self._auto_rescanned_targets.add(target)
+            self.rescan_requested.emit(target)
 
     def _show_list_error(self, ex: Exception) -> None:
         self._set_record_count_text(

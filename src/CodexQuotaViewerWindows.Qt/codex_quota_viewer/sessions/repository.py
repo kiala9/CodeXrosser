@@ -150,54 +150,93 @@ class SessionRepository:
         fresh_metadata: dict[str, tuple[int, int]],
         kept_session_ids: set[str],
     ) -> list[SessionRecord]:
-        """Selective catalog rewrite for the incremental-rescan path.
-
-        - ``fresh_entries``: sessions that were re-parsed this scan. Their
-          ``sessions`` row is upserted, ``timeline_items`` and
-          ``session_search`` rows are deleted-then-reinserted.
-          ``fresh_metadata[session_id] == (primary_mtime_ns, parser_version)``
-          is written into the cache columns; defaults to (0, 0) when absent.
-        - ``kept_session_ids``: cache hits — DB rows are left untouched
-          (no timeline rewrite, no search rewrite). ``indexed_at`` is
-          refreshed so the UI knows we saw them this scan.
-        - Anything in DB but in neither set: deleted (file removed from
-          disk between scans)."""
-        indexed_at = _now_iso()
-        fresh_ids = {entry.summary.id for entry in fresh_entries}
+        """Atomic catalog rewrite — thin wrapper around the batch APIs.
+        The outer ``_transaction()`` makes both phases share one BEGIN/
+        COMMIT (the inner transactions inside batch_start/batch_apply
+        no-op because ``_Transaction`` checks ``in_transaction``), so a
+        failure halfway through rolls back orphan deletes too — same
+        guarantee the pre-batched ``replace_catalog`` had. The streaming
+        rescan path (P1.8) calls ``upsert_catalog_batch_*`` directly,
+        skipping this outer transaction so partial state IS observable
+        between batches — that's the trade-off that lets the UI stream."""
         with _perf_timer(
             "repository.upsert_catalog",
             fresh=len(fresh_entries),
             kept=len(kept_session_ids),
         ):
+            fresh_ids = {entry.summary.id for entry in fresh_entries}
             with self._lock, self._transaction():
-                existing = self._read_all_session_rows()
-                # 1. Delete sessions absent from disk (orphaned).
-                obsolete_ids = [
-                    sid
-                    for sid in existing.keys()
-                    if sid not in fresh_ids and sid not in kept_session_ids
-                ]
-                for sid in obsolete_ids:
-                    self._connection.execute(
-                        "delete from timeline_items where session_id = ?", (sid,)
+                self.upsert_catalog_batch_start(
+                    kept_session_ids=kept_session_ids,
+                    expected_fresh_session_ids=fresh_ids,
+                )
+                if fresh_entries:
+                    self.upsert_catalog_batch_apply(
+                        entries=fresh_entries,
+                        fresh_metadata=fresh_metadata,
                     )
+        return self.list_sessions()
+
+    def upsert_catalog_batch_start(
+        self,
+        *,
+        kept_session_ids: set[str],
+        expected_fresh_session_ids: set[str],
+    ) -> None:
+        """Phase 1 of the streaming catalog rewrite: delete orphan rows
+        (in DB but absent from both kept and the upcoming fresh set) and
+        refresh ``indexed_at`` on kept rows. Single transaction, runs
+        once before any ``upsert_catalog_batch_apply`` calls."""
+        indexed_at = _now_iso()
+        with self._lock, self._transaction():
+            existing = self._read_all_session_rows()
+            obsolete_ids = [
+                sid
+                for sid in existing.keys()
+                if sid not in expected_fresh_session_ids
+                and sid not in kept_session_ids
+            ]
+            for sid in obsolete_ids:
+                self._connection.execute(
+                    "delete from timeline_items where session_id = ?", (sid,)
+                )
+                self._connection.execute(
+                    "delete from session_search where session_id = ?", (sid,)
+                )
+                self._connection.execute(
+                    "delete from sessions where id = ?", (sid,)
+                )
+            for sid in kept_session_ids:
+                if sid in existing:
                     self._connection.execute(
-                        "delete from session_search where session_id = ?", (sid,)
+                        "update sessions set indexed_at = ? where id = ?",
+                        (indexed_at, sid),
                     )
-                    self._connection.execute(
-                        "delete from sessions where id = ?", (sid,)
-                    )
-                # 2. Refresh ``indexed_at`` for kept rows so they don't
-                # look stale to the UI. No content change.
-                for sid in kept_session_ids:
-                    if sid in existing:
-                        self._connection.execute(
-                            "update sessions set indexed_at = ? where id = ?",
-                            (indexed_at, sid),
-                        )
-                # 3. Upsert fresh entries — same per-entry behavior as the
-                # old replace_catalog, but per-row instead of nuke-and-pave.
-                for entry in fresh_entries:
+
+    def upsert_catalog_batch_apply(
+        self,
+        *,
+        entries: list[CatalogSessionEntry],
+        fresh_metadata: dict[str, tuple[int, int]],
+    ) -> None:
+        """Phase 2 of the streaming catalog rewrite: upsert one chunk of
+        fresh entries in a single transaction. Caller invokes this once
+        per batch so partial state becomes visible between batches —
+        the UI can re-query ``list_sessions`` and show progress mid-scan
+        without waiting for the whole rescan to commit."""
+        if not entries:
+            return
+        indexed_at = _now_iso()
+        with _perf_timer(
+            "repository.upsert_catalog_batch_apply",
+            entries=len(entries),
+        ):
+            with self._lock, self._transaction():
+                existing = {
+                    eid: self._read_session_row(eid)
+                    for eid in (entry.summary.id for entry in entries)
+                }
+                for entry in entries:
                     prior = existing.get(entry.summary.id)
                     created_at = prior["created_at"] if prior else indexed_at
                     updated_at = (
@@ -226,7 +265,6 @@ class SessionRepository:
                     )
                     self._insert_session_search(entry)
                     self._insert_timeline_items(entry)
-        return self.list_sessions()
 
     def list_session_scan_metadata(self) -> list[SessionScanMetadata]:
         """Lightweight per-session read used by the incremental-rescan
@@ -251,7 +289,17 @@ class SessionRepository:
             for row in rows
         ]
 
-    def save_catalog_entry(self, entry: CatalogSessionEntry) -> SessionRecord:
+    def save_catalog_entry(
+        self,
+        entry: CatalogSessionEntry,
+        *,
+        primary_mtime_ns: int = 0,
+        parser_version: int = 0,
+    ) -> SessionRecord:
+        """Single-session upsert. Used by the lazy reparse path (P1.5.1)
+        when ``get_session_detail`` discovers the persisted timeline was
+        produced by an older parser. Does NOT touch other sessions —
+        that's the whole point compared to ``upsert_catalog``."""
         now = _now_iso()
         with self._lock, self._transaction():
             existing = self._read_session_row(entry.summary.id)
@@ -261,7 +309,14 @@ class SessionRepository:
                 if existing and not _did_catalog_entry_change(existing, entry)
                 else now
             )
-            self._upsert_session(entry, created_at=created_at, updated_at=updated_at, indexed_at=now)
+            self._upsert_session(
+                entry,
+                created_at=created_at,
+                updated_at=updated_at,
+                indexed_at=now,
+                primary_mtime_ns=primary_mtime_ns,
+                parser_version=parser_version,
+            )
             self._connection.execute(
                 "delete from timeline_items where session_id = ?",
                 (entry.summary.id,),
@@ -276,6 +331,33 @@ class SessionRepository:
         if record is None:
             raise RuntimeError(f"Session disappeared after upsert: {entry.summary.id}")
         return record
+
+    def get_session_parser_version(self, session_id: str) -> int:
+        """One-row lookup used by the lazy-reparse cache check before
+        ``get_session_detail`` does its tail load. Returns 0 if the
+        session row is missing — caller treats that as a cache miss."""
+        row = self._connection.execute(
+            "select parser_version from sessions where id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row["parser_version"] or 0) if row else 0
+
+    def get_session_freshness(self, session_id: str) -> tuple[int, int]:
+        """One-row freshness lookup: (parser_version, primary_mtime_ns).
+        Used by ``get_session_detail`` to decide whether the cached
+        timeline is still valid before serving a tail load. Returns
+        (0, 0) if the session row is missing — caller treats that as
+        a cache miss and falls through to reparse."""
+        row = self._connection.execute(
+            "select parser_version, primary_mtime_ns from sessions where id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return (0, 0)
+        return (
+            int(row["parser_version"] or 0),
+            int(row["primary_mtime_ns"] or 0),
+        )
 
     def update_session(self, session_id: str, mutation: dict[str, Any]) -> SessionRecord:
         with self._lock, self._transaction():

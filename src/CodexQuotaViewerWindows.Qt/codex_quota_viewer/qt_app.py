@@ -2070,11 +2070,35 @@ class MainWindow(QMainWindow):
             return
         message_type = payload.get("type")
         if message_type == "progress":
-            self.set_status(str(payload.get("message") or ""), "info")
+            kind = payload.get("kind")
+            if kind == "sessions-rescan-batch":
+                self._handle_sessions_rescan_progress(payload)
+            else:
+                self.set_status(str(payload.get("message") or ""), "info")
         elif message_type == "result":
             task["result"] = payload
         elif message_type == "error":
             task["error"] = payload
+
+    def _handle_sessions_rescan_progress(self, payload: dict[str, Any]) -> None:
+        # Per-batch progress signal from task_worker.sessions_rescan. Routes
+        # to SessionsPage so the user sees the list filling in live instead
+        # of waiting for the whole rescan to finish. Drop progress for a
+        # target the user has since switched away from — otherwise the
+        # Sandbox rescan's batch counts would briefly clobber the Real
+        # tab's count label and trigger spurious refreshes.
+        page = getattr(self, "_sessions_page_widget", None)
+        if page is None:
+            return
+        target_value = payload.get("target")
+        if isinstance(target_value, str) and target_value != page.target.value:
+            return
+        try:
+            done = int(payload.get("done") or 0)
+            total = int(payload.get("total") or 0)
+        except (TypeError, ValueError):
+            return
+        page.apply_rescan_progress(done, total)
 
     def _process_start_failed(self, process: QProcess, error: QProcess.ProcessError) -> None:
         task = self._process_tasks.get(process)

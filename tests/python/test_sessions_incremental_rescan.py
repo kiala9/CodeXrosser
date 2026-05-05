@@ -24,6 +24,7 @@ from codex_quota_viewer.sessions import (  # noqa: E402
     SessionsManager,
 )
 from codex_quota_viewer.sessions import helpers as sessions_helpers  # noqa: E402
+from codex_quota_viewer.sessions import manager as sessions_manager  # noqa: E402
 from codex_quota_viewer.sessions.helpers import (  # noqa: E402
     build_fallback_relative_path,
     collect_sessions,
@@ -415,5 +416,427 @@ def test_rescan_drops_session_when_file_deleted(tmp_path: Path) -> None:
         clear_parser_cache()
         second = manager.rescan()
         assert {r.id for r in second} == {keep_id}
+    finally:
+        manager.close()
+
+
+# --- P1.5.1 lazy per-session reparse ----------------------------------------
+
+
+def test_get_session_detail_reparses_when_parser_version_stale(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Opening a session whose persisted parser_version is stale must
+    trigger a one-shot reparse + cache update before returning the
+    detail. Subsequent opens see the updated parser_version and don't
+    reparse again."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    sid = "0190d0e1-9999-7000-9000-000000000999"
+    _write_session_jsonl(
+        codex_home / "sessions",
+        session_id=sid,
+        started_at="2026-01-15T10:00:00Z",
+    )
+
+    manager = SessionsManager(codex_home=codex_home, manager_home=manager_home)
+    try:
+        manager.rescan()
+        # Stamp the row with an older parser_version to simulate having
+        # been indexed by a previous app build.
+        manager.repository._connection.execute(  # noqa: SLF001
+            "update sessions set parser_version = 0 where id = ?", (sid,)
+        )
+        assert manager.repository.get_session_parser_version(sid) == 0
+
+        parse_calls: list[Path] = []
+        real_parse = sessions_manager.parse_session_catalog
+
+        def spy_parse(path: Path, *args, **kwargs):
+            parse_calls.append(path)
+            return real_parse(path, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_manager, "parse_session_catalog", spy_parse)
+        clear_parser_cache()
+
+        detail = manager.get_session_detail(sid)
+        assert detail.record.id == sid
+        assert len(parse_calls) == 1   # exactly one reparse, not a full rescan
+        # Cache fingerprint persisted → next open skips reparse.
+        assert manager.repository.get_session_parser_version(sid) == PARSER_VERSION
+
+        manager.get_session_detail(sid)
+        assert len(parse_calls) == 1   # still one — no second reparse
+    finally:
+        manager.close()
+
+
+def test_get_session_detail_skips_reparse_on_parser_version_match(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the persisted parser_version matches current PARSER_VERSION,
+    detail loading takes the fast path — zero parser invocations."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    sid = "0190d0e1-aaaa-7000-9000-0000000aaaaa"
+    _write_session_jsonl(
+        codex_home / "sessions",
+        session_id=sid,
+        started_at="2026-01-15T10:00:00Z",
+    )
+
+    manager = SessionsManager(codex_home=codex_home, manager_home=manager_home)
+    try:
+        manager.rescan()
+        assert manager.repository.get_session_parser_version(sid) == PARSER_VERSION
+
+        parse_calls: list[Path] = []
+        real_parse = sessions_manager.parse_session_catalog
+
+        def spy_parse(path: Path, *args, **kwargs):
+            parse_calls.append(path)
+            return real_parse(path, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_manager, "parse_session_catalog", spy_parse)
+        clear_parser_cache()
+
+        detail = manager.get_session_detail(sid)
+        assert detail.record.id == sid
+        assert parse_calls == []
+    finally:
+        manager.close()
+
+
+def test_get_session_detail_reparses_when_mtime_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Opening a session whose on-disk mtime differs from the persisted
+    primary_mtime_ns must trigger a one-shot reparse — covers the case
+    where Codex CLI (or a manual editor) appended to the jsonl after
+    the last rescan. Same lazy-reparse path as the parser-version check."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    sid = "0190d0e1-bbbb-7000-9000-0000000bbbbb"
+    jsonl = _write_session_jsonl(
+        codex_home / "sessions",
+        session_id=sid,
+        started_at="2026-01-15T10:00:00Z",
+    )
+
+    manager = SessionsManager(codex_home=codex_home, manager_home=manager_home)
+    try:
+        manager.rescan()
+        # Cache should now be aligned: parser_version + mtime both match.
+        db_pv, db_mtime_ns = manager.repository.get_session_freshness(sid)
+        assert db_pv == PARSER_VERSION
+        assert db_mtime_ns == jsonl.stat().st_mtime_ns
+
+        # Bump the file mtime to simulate external append/edit. +5s is
+        # well past NTFS / WSL / network-FS resolution so the comparison
+        # is unambiguous on every platform CI runs on.
+        atime_ns = jsonl.stat().st_atime_ns
+        bumped_mtime_ns = db_mtime_ns + 5_000_000_000
+        os.utime(jsonl, ns=(atime_ns, bumped_mtime_ns))
+        assert jsonl.stat().st_mtime_ns != db_mtime_ns
+
+        parse_calls: list[Path] = []
+        real_parse = sessions_manager.parse_session_catalog
+
+        def spy_parse(path: Path, *args, **kwargs):
+            parse_calls.append(path)
+            return real_parse(path, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_manager, "parse_session_catalog", spy_parse)
+        clear_parser_cache()
+
+        detail = manager.get_session_detail(sid)
+        assert detail.record.id == sid
+        assert len(parse_calls) == 1   # mtime mismatch → exactly one reparse
+
+        # Persisted mtime updated → next open is a cache hit.
+        _, after_mtime_ns = manager.repository.get_session_freshness(sid)
+        assert after_mtime_ns == jsonl.stat().st_mtime_ns
+
+        manager.get_session_detail(sid)
+        assert len(parse_calls) == 1   # still one
+    finally:
+        manager.close()
+
+
+def test_get_session_detail_skips_reparse_when_mtime_matches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Happy path: parser_version + primary_mtime_ns both match the
+    on-disk file → detail load takes the fast path with zero parser
+    invocations. Guards against the mtime branch introducing spurious
+    reparses on the most common code path."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    sid = "0190d0e1-cccc-7000-9000-0000000ccccc"
+    jsonl = _write_session_jsonl(
+        codex_home / "sessions",
+        session_id=sid,
+        started_at="2026-01-15T10:00:00Z",
+    )
+
+    manager = SessionsManager(codex_home=codex_home, manager_home=manager_home)
+    try:
+        manager.rescan()
+        db_pv, db_mtime_ns = manager.repository.get_session_freshness(sid)
+        assert db_pv == PARSER_VERSION
+        assert db_mtime_ns == jsonl.stat().st_mtime_ns
+
+        parse_calls: list[Path] = []
+        real_parse = sessions_manager.parse_session_catalog
+
+        def spy_parse(path: Path, *args, **kwargs):
+            parse_calls.append(path)
+            return real_parse(path, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_manager, "parse_session_catalog", spy_parse)
+        clear_parser_cache()
+
+        detail = manager.get_session_detail(sid)
+        assert detail.record.id == sid
+        assert parse_calls == []
+    finally:
+        manager.close()
+
+
+def test_get_session_detail_tolerates_missing_primary_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If the primary jsonl is gone (deleted out from under us), the
+    mtime stat raises OSError. We swallow it and serve whatever the DB
+    has — better than crashing the detail panel. The next manual Rescan
+    will cleanly drop the orphan row."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    sid = "0190d0e1-dddd-7000-9000-0000000ddddd"
+    jsonl = _write_session_jsonl(
+        codex_home / "sessions",
+        session_id=sid,
+        started_at="2026-01-15T10:00:00Z",
+    )
+
+    manager = SessionsManager(codex_home=codex_home, manager_home=manager_home)
+    try:
+        manager.rescan()
+        db_pv, db_mtime_ns = manager.repository.get_session_freshness(sid)
+        assert db_pv == PARSER_VERSION
+        assert db_mtime_ns > 0
+
+        # Wipe the file on disk; DB row stays.
+        jsonl.unlink()
+
+        parse_calls: list[Path] = []
+        real_parse = sessions_manager.parse_session_catalog
+
+        def spy_parse(path: Path, *args, **kwargs):
+            parse_calls.append(path)
+            return real_parse(path, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_manager, "parse_session_catalog", spy_parse)
+        clear_parser_cache()
+
+        # Should NOT raise. Should NOT reparse (stat failure → fall
+        # through to DB load with the existing cached timeline).
+        detail = manager.get_session_detail(sid)
+        assert detail.record.id == sid
+        assert parse_calls == []
+
+        # DB row freshness fields untouched on the OSError branch.
+        after_pv, after_mtime_ns = manager.repository.get_session_freshness(sid)
+        assert after_pv == PARSER_VERSION
+        assert after_mtime_ns == db_mtime_ns
+    finally:
+        manager.close()
+
+
+def test_upsert_catalog_batch_apply_persists_per_batch(tmp_path: Path) -> None:
+    """Phase-2 of the streaming rescan must commit each chunk in its own
+    transaction so partial state is observable mid-scan — that's what
+    lets the UI re-query and show progress between batches."""
+    repo = SessionRepository(tmp_path / "index.db")
+    try:
+        a_id = "0190d0e1-d001-7000-9000-000000000001"
+        b_id = "0190d0e1-d002-7000-9000-000000000002"
+        # Phase-1: orphan delete + kept refresh (no fresh entries yet).
+        repo.upsert_catalog_batch_start(
+            kept_session_ids=set(),
+            expected_fresh_session_ids={a_id, b_id},
+        )
+        # First batch lands; DB should already have entry A before B is applied.
+        repo.upsert_catalog_batch_apply(
+            entries=[_make_catalog_entry(a_id)],
+            fresh_metadata={a_id: (1, PARSER_VERSION)},
+        )
+        ids_after_first = {r.id for r in repo.list_sessions()}
+        assert a_id in ids_after_first
+        assert b_id not in ids_after_first
+
+        # Second batch lands; both visible now.
+        repo.upsert_catalog_batch_apply(
+            entries=[_make_catalog_entry(b_id)],
+            fresh_metadata={b_id: (2, PARSER_VERSION)},
+        )
+        ids_after_second = {r.id for r in repo.list_sessions()}
+        assert ids_after_second == {a_id, b_id}
+    finally:
+        repo.close()
+
+
+def test_rescan_emits_progress_per_batch(tmp_path: Path) -> None:
+    """``rescan(progress_cb=...)`` must invoke the callback at least once
+    per batch + once for the kept-only initial state. With 120 sessions
+    on disk and batch size 50, expect 4 ticks: initial(0/120),
+    batch1(50/120), batch2(100/120), batch3(120/120)."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    for i in range(120):
+        _write_session_jsonl(
+            codex_home / "sessions",
+            session_id=f"0190d0e1-{i:04x}-7000-9000-{i:012x}",
+            started_at="2026-01-15T10:00:00Z",
+        )
+
+    manager = SessionsManager(codex_home=codex_home, manager_home=manager_home)
+    try:
+        ticks: list[tuple[int, int]] = []
+        manager.rescan(progress_cb=lambda d, t: ticks.append((d, t)))
+        assert len(ticks) >= 4   # initial + at least 3 batches
+        # Final tick must be done == total.
+        final_done, final_total = ticks[-1]
+        assert final_done == final_total == 120
+        # First tick is the kept-only baseline; on first install kept=0.
+        assert ticks[0] == (0, 120)
+    finally:
+        manager.close()
+
+
+def test_first_install_auto_triggers_rescan_when_db_empty(tmp_path: Path) -> None:
+    """SessionsPage's empty-list auto-trigger fires ``rescan_requested``
+    exactly once per target on first install — so the user doesn't have
+    to discover the manual Rescan button before seeing data."""
+    from PySide6.QtWidgets import QApplication
+    from codex_quota_viewer.sessions_page import SessionsPage
+    from codex_quota_viewer.models import CodexHomeTarget
+
+    QApplication.instance() or QApplication([])
+    codex_home, manager_home = _make_homes(tmp_path)
+
+    def factory(target):
+        return SessionsManager(codex_home=codex_home, manager_home=manager_home)
+
+    page = SessionsPage(
+        sessions_manager_factory=factory,
+        translator=lambda s: s,
+        confirm_real_action=lambda action, summary: True,
+    )
+    try:
+        emitted: list[CodexHomeTarget] = []
+        page.rescan_requested.connect(lambda target: emitted.append(target))
+
+        # Force a synchronous list load with empty DB → triggers the
+        # empty-list auto-rescan branch in _apply_loaded_records.
+        page.refresh_list()
+        assert emitted == [page.target]
+
+        # A second refresh on still-empty DB must NOT re-trigger.
+        page.refresh_list()
+        assert emitted == [page.target]
+    finally:
+        page.close()
+
+
+def test_filtered_empty_list_does_not_trigger_auto_rescan(tmp_path: Path) -> None:
+    """Codex-review regression: an empty list resulting from a user
+    search/status filter must NOT trigger a rescan. The auto-trigger is
+    intended for the genuine first-install empty-catalog case only."""
+    from PySide6.QtWidgets import QApplication
+    from codex_quota_viewer.sessions_page import SessionsPage
+
+    QApplication.instance() or QApplication([])
+    codex_home, manager_home = _make_homes(tmp_path)
+    # Seed catalog with one session so DB is non-empty even though the
+    # filtered list comes back empty.
+    seed_manager = SessionsManager(
+        codex_home=codex_home, manager_home=manager_home
+    )
+    _write_session_jsonl(
+        codex_home / "sessions",
+        session_id="0190d0e1-f001-7000-9000-00000000f001",
+        started_at="2026-01-15T10:00:00Z",
+    )
+    seed_manager.rescan()
+    seed_manager.close()
+
+    def factory(target):
+        return SessionsManager(codex_home=codex_home, manager_home=manager_home)
+
+    page = SessionsPage(
+        sessions_manager_factory=factory,
+        translator=lambda s: s,
+        confirm_real_action=lambda action, summary: True,
+    )
+    try:
+        emitted: list = []
+        page.rescan_requested.connect(lambda target: emitted.append(target))
+
+        # Apply a search query that matches nothing → list will be empty
+        # but the catalog itself isn't. Auto-trigger must stay quiet.
+        page._search.setText("definitely-no-match-zzz")
+        page.refresh_list()
+        assert emitted == []
+    finally:
+        page.close()
+
+
+def test_lazy_reparse_does_not_touch_other_sessions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Opening session A with stale parser_version must NOT delete or
+    rewrite session B's timeline_items rows — that's the difference
+    between save_catalog_entry (single) and upsert_catalog (catalog-wide
+    with orphan deletion)."""
+    codex_home, manager_home = _make_homes(tmp_path)
+    sid_a = "0190d0e1-bbbb-7000-9000-0000000bbbbb"
+    sid_b = "0190d0e1-cccc-7000-9000-0000000ccccc"
+    _write_session_jsonl(
+        codex_home / "sessions",
+        session_id=sid_a,
+        started_at="2026-01-15T10:00:00Z",
+    )
+    _write_session_jsonl(
+        codex_home / "sessions",
+        session_id=sid_b,
+        started_at="2026-01-15T11:00:00Z",
+    )
+
+    manager = SessionsManager(codex_home=codex_home, manager_home=manager_home)
+    try:
+        manager.rescan()
+        # Mark only A as stale.
+        manager.repository._connection.execute(  # noqa: SLF001
+            "update sessions set parser_version = 0 where id = ?", (sid_a,)
+        )
+        # Drop a sentinel row into B's timeline; if B gets rewritten,
+        # the sentinel disappears.
+        manager.repository._connection.execute(  # noqa: SLF001
+            """
+            insert into timeline_items (
+                session_id, ordinal, item_id, type, timestamp, text
+            ) values (?, ?, ?, ?, ?, ?)
+            """,
+            (sid_b, 9999, "sentinel-b", "message:assistant", "t", "STAYS"),
+        )
+
+        clear_parser_cache()
+        manager.get_session_detail(sid_a)
+
+        rows = manager.repository._connection.execute(  # noqa: SLF001
+            "select item_id from timeline_items where session_id = ? and ordinal = 9999",
+            (sid_b,),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["item_id"] == "sentinel-b"
+        # Other sessions' parser_version unchanged.
+        assert (
+            manager.repository.get_session_parser_version(sid_b) == PARSER_VERSION
+        )
     finally:
         manager.close()
