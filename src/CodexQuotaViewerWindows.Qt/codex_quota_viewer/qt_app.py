@@ -2100,7 +2100,12 @@ class MainWindow(QMainWindow):
             total = int(payload.get("total") or 0)
         except (TypeError, ValueError):
             return
-        page.apply_rescan_progress(done, total)
+        # Default to "indexing" for older worker payloads that didn't
+        # carry a phase tag — keeps mixed-version host/worker pairs
+        # working during a partial upgrade.
+        phase_value = payload.get("phase")
+        phase = phase_value if isinstance(phase_value, str) else "indexing"
+        page.apply_rescan_progress(phase, done, total)
 
     def _process_start_failed(self, process: QProcess, error: QProcess.ProcessError) -> None:
         task = self._process_tasks.get(process)

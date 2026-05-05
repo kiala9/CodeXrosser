@@ -418,6 +418,18 @@ def parse_session_timeline_page(
     offset: int | None = None,
     limit: int | None = None,
 ) -> SessionTimelinePage:
+    """**Test-only.** Do NOT call from any UI hot path.
+
+    This is a "parse the entire JSONL then slice" implementation — every
+    call constructs the full ``ParsedSessionCatalog`` in memory before
+    returning the requested page. For UI pagination use the SQLite
+    path: ``SessionsManager.get_session_timeline_page`` →
+    ``SessionRepository.list_timeline_page``, which reads only the
+    requested rows.
+
+    Kept around so the manager-level parser tests can verify offset/
+    limit behaviour against fixture JSONL without going through the
+    repository round-trip."""
     items = parse_session_timeline(file_path)
     start = max(offset or 0, 0)
     page_size = clamp_timeline_page_size(limit)

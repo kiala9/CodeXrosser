@@ -803,17 +803,25 @@ class SessionRepository:
         )
 
     def _insert_timeline_items(self, entry: CatalogSessionEntry) -> None:
-        for ordinal, item in enumerate(entry.timeline):
-            self._connection.execute(
-                """
-                insert into timeline_items (
-                    session_id, ordinal, item_id, type, timestamp, text,
-                    tool_name, summary, input_text, output_text, status,
-                    attachments_json
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                _timeline_item_to_params(entry.summary.id, ordinal, item),
-            )
+        if not entry.timeline:
+            return
+        # Batch insert via executemany — large sessions with thousands of
+        # timeline items go from N round-trips to 1, which is the dominant
+        # cost in the rescan + lazy-reparse paths.
+        rows = [
+            _timeline_item_to_params(entry.summary.id, ordinal, item)
+            for ordinal, item in enumerate(entry.timeline)
+        ]
+        self._connection.executemany(
+            """
+            insert into timeline_items (
+                session_id, ordinal, item_id, type, timestamp, text,
+                tool_name, summary, input_text, output_text, status,
+                attachments_json
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
     def _clear_session_search(self) -> None:
         if self.fts_available:

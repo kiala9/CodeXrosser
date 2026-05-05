@@ -5,7 +5,7 @@ import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .jsonl_parser import parse_session_catalog
 from .models import CatalogSessionEntry, ParsedSessionCatalog, SessionRecord
@@ -19,6 +19,7 @@ def collect_sessions(
     root: Path,
     *,
     skip_paths: frozenset[Path] | set[Path] | None = None,
+    progress_cb: Callable[[Path], None] | None = None,
 ) -> list[tuple[Path, ParsedSessionCatalog, int]]:
     """Walk session JSONL files under ``root`` and parse each.
 
@@ -30,7 +31,13 @@ def collect_sessions(
     Files whose absolute path appears in ``skip_paths`` are skipped
     without stat-ing or parsing — caller has already determined they are
     cache-fresh. The cache check itself happens upstream in
-    ``SessionsManager._scan_and_index_sessions``."""
+    ``SessionsManager._scan_and_index_sessions``.
+
+    ``progress_cb`` (if given) is called once per file actually parsed
+    (i.e. not skipped, not a stat/parse failure). Used by the streaming
+    rescan path to push UI ticks during the long parse phase — without
+    it, big first-install scans look frozen until the commit phase
+    starts."""
     if not root.exists():
         return []
     skip = skip_paths or frozenset()
@@ -53,7 +60,29 @@ def collect_sessions(
         if parsed is None:
             continue
         entries.append((file_path, parsed, mtime_ns))
+        if progress_cb is not None:
+            try:
+                progress_cb(file_path)
+            except Exception:
+                # Progress callbacks are best-effort — a buggy UI hook
+                # must not abort the rescan.
+                pass
     return entries
+
+
+def count_jsonl_files(
+    root: Path,
+    *,
+    skip_paths: frozenset[Path] | set[Path] | None = None,
+) -> int:
+    """Cheap pre-walk used by the streaming rescan path to compute the
+    parse-phase total before ``collect_sessions`` actually parses
+    anything. Pure ``os.scandir`` recursion — no parse work, no stat
+    beyond what the dir entry already gives us."""
+    if not root.exists():
+        return 0
+    skip = skip_paths or frozenset()
+    return sum(1 for path in _walk_jsonl_files(root) if path not in skip)
 
 
 def build_fallback_relative_path(started_at: str, session_id: str) -> str:

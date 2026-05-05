@@ -14,6 +14,7 @@ from .helpers import (
     build_fallback_relative_path,
     build_resume_command,
     collect_sessions,
+    count_jsonl_files,
     looks_canonical_session_relative_path,
     make_catalog_entry,
     resolve_session_relative_path,
@@ -90,8 +91,21 @@ class SessionsManager:
     def rescan(
         self,
         *,
-        progress_cb: Callable[[int, int], None] | None = None,
+        progress_cb: Callable[[str, int, int], None] | None = None,
     ) -> list[SessionRecord]:
+        """Run a full incremental rescan.
+
+        ``progress_cb(phase, done, total)`` (if given) is invoked across
+        two phases:
+          - ``phase="parsing"``: ``done`` is files parsed so far,
+            ``total`` is total files to parse this run (excludes
+            cache-skipped files).
+          - ``phase="indexing"``: ``done`` is sessions committed so far
+            (including cache-kept), ``total`` is sessions this run will
+            touch (committed + kept).
+        The two phases are emitted contiguously: parse ticks first,
+        index ticks second. UI uses the phase to label the count
+        differently."""
         with self._mutation_lock:
             self._scan_and_index_sessions(progress_cb=progress_cb)
             return self.repository.list_sessions()
@@ -478,7 +492,7 @@ class SessionsManager:
     def _scan_and_index_sessions(
         self,
         *,
-        progress_cb: Callable[[int, int], None] | None = None,
+        progress_cb: Callable[[str, int, int], None] | None = None,
     ) -> list[CatalogSessionEntry]:
         self._ensure_roots()
 
@@ -506,9 +520,38 @@ class SessionsManager:
                 skip_paths.add(Path(primary))
                 kept_session_ids.add(meta.session_id)
 
-        active_entries = collect_sessions(self.roots.sessions_root, skip_paths=skip_paths)
-        archived_entries = collect_sessions(self.roots.archive_root, skip_paths=skip_paths)
-        snapshot_entries = collect_sessions(self.roots.snapshot_root, skip_paths=skip_paths)
+        # Pre-walk all three roots so the parse-phase progress total is
+        # known before we start parsing. The walk itself is os.scandir
+        # only — no parse, no stat — so even thousands of files come in
+        # under 100ms total. This trades a tiny up-front cost for
+        # genuinely usable progress feedback during the long parse phase.
+        parse_total = (
+            count_jsonl_files(self.roots.sessions_root, skip_paths=skip_paths)
+            + count_jsonl_files(self.roots.archive_root, skip_paths=skip_paths)
+            + count_jsonl_files(self.roots.snapshot_root, skip_paths=skip_paths)
+        )
+        parsed_done = 0
+
+        def _on_parsed(_path: Path) -> None:
+            nonlocal parsed_done
+            parsed_done += 1
+            if progress_cb is not None:
+                progress_cb("parsing", parsed_done, parse_total)
+
+        if progress_cb is not None:
+            # Initial 0/N tick so the UI can flip into "parsing" mode
+            # immediately, even before the first file finishes parsing.
+            progress_cb("parsing", 0, parse_total)
+
+        active_entries = collect_sessions(
+            self.roots.sessions_root, skip_paths=skip_paths, progress_cb=_on_parsed
+        )
+        archived_entries = collect_sessions(
+            self.roots.archive_root, skip_paths=skip_paths, progress_cb=_on_parsed
+        )
+        snapshot_entries = collect_sessions(
+            self.roots.snapshot_root, skip_paths=skip_paths, progress_cb=_on_parsed
+        )
 
         latest_audit_by_id = {entry.session_id: entry for entry in self.repository.list_latest_audit_entries()}
 
@@ -586,7 +629,7 @@ class SessionsManager:
         total = len(catalog_entries) + len(kept_session_ids)
         done = len(kept_session_ids)
         if progress_cb:
-            progress_cb(done, total)
+            progress_cb("indexing", done, total)
         for batch_start in range(0, len(catalog_entries), _RESCAN_BATCH_SIZE):
             batch = catalog_entries[batch_start : batch_start + _RESCAN_BATCH_SIZE]
             self.repository.upsert_catalog_batch_apply(
@@ -595,7 +638,7 @@ class SessionsManager:
             )
             done += len(batch)
             if progress_cb:
-                progress_cb(done, total)
+                progress_cb("indexing", done, total)
         return catalog_entries
 
     def _canonicalize_archived_entry(

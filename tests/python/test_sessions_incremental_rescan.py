@@ -770,10 +770,15 @@ def test_upsert_catalog_batch_apply_persists_per_batch(tmp_path: Path) -> None:
 
 
 def test_rescan_emits_progress_per_batch(tmp_path: Path) -> None:
-    """``rescan(progress_cb=...)`` must invoke the callback at least once
-    per batch + once for the kept-only initial state. With 120 sessions
-    on disk and batch size 50, expect 4 ticks: initial(0/120),
-    batch1(50/120), batch2(100/120), batch3(120/120)."""
+    """``rescan(progress_cb=...)`` emits ticks across two phases:
+
+      - parsing: one tick per file parsed + an initial 0/N tick so the
+        UI can flip into "parsing" mode immediately.
+      - indexing: one tick per commit batch + an initial kept-only tick.
+
+    With 120 sessions on disk and batch size 50, expect at least
+    121 parsing ticks (initial + 120 files) and 4 indexing ticks
+    (initial + 3 batches). Final tick must be ``("indexing", 120, 120)``."""
     codex_home, manager_home = _make_homes(tmp_path)
     for i in range(120):
         _write_session_jsonl(
@@ -784,16 +789,77 @@ def test_rescan_emits_progress_per_batch(tmp_path: Path) -> None:
 
     manager = SessionsManager(codex_home=codex_home, manager_home=manager_home)
     try:
-        ticks: list[tuple[int, int]] = []
-        manager.rescan(progress_cb=lambda d, t: ticks.append((d, t)))
-        assert len(ticks) >= 4   # initial + at least 3 batches
-        # Final tick must be done == total.
-        final_done, final_total = ticks[-1]
-        assert final_done == final_total == 120
-        # First tick is the kept-only baseline; on first install kept=0.
-        assert ticks[0] == (0, 120)
+        ticks: list[tuple[str, int, int]] = []
+        manager.rescan(progress_cb=lambda phase, d, t: ticks.append((phase, d, t)))
+
+        parsing_ticks = [t for t in ticks if t[0] == "parsing"]
+        indexing_ticks = [t for t in ticks if t[0] == "indexing"]
+
+        # Parsing: initial 0/120 + one tick per parsed file.
+        assert parsing_ticks[0] == ("parsing", 0, 120)
+        assert parsing_ticks[-1] == ("parsing", 120, 120)
+        assert len(parsing_ticks) == 121
+
+        # Indexing: initial kept-only baseline + at least 3 batch ticks.
+        assert indexing_ticks[0] == ("indexing", 0, 120)
+        assert indexing_ticks[-1] == ("indexing", 120, 120)
+        assert len(indexing_ticks) >= 4
+
+        # Phases are emitted contiguously: all parsing before any indexing.
+        first_indexing = ticks.index(indexing_ticks[0])
+        assert all(t[0] == "parsing" for t in ticks[:first_indexing])
     finally:
         manager.close()
+
+
+def test_collect_sessions_invokes_progress_cb_per_parsed_file(tmp_path: Path) -> None:
+    """``collect_sessions`` must call ``progress_cb`` once per file it
+    actually parses (not skipped, not stat/parse failures). Used by the
+    streaming-rescan parsing-phase tick."""
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    paths = [
+        _write_session_jsonl(
+            sessions_root,
+            session_id=f"0190d0e1-{i:04x}-7000-9000-{i:012x}",
+            started_at="2026-01-15T10:00:00Z",
+        )
+        for i in range(3)
+    ]
+
+    seen: list[Path] = []
+    entries = collect_sessions(sessions_root, progress_cb=lambda p: seen.append(p))
+    assert len(entries) == 3
+    assert sorted(seen) == sorted(paths)
+
+
+def test_count_jsonl_files_excludes_skip_paths(tmp_path: Path) -> None:
+    """``count_jsonl_files`` walks the tree without parsing and honours
+    ``skip_paths`` so the streaming-rescan total matches what
+    ``collect_sessions`` will actually parse."""
+    from codex_quota_viewer.sessions.helpers import count_jsonl_files
+
+    sessions_root = tmp_path / "sessions"
+    sessions_root.mkdir()
+    target_a = _write_session_jsonl(
+        sessions_root,
+        session_id="0190d0e1-aa01-7000-9000-000000000001",
+        started_at="2026-01-15T10:00:00Z",
+    )
+    _write_session_jsonl(
+        sessions_root,
+        session_id="0190d0e1-aa02-7000-9000-000000000002",
+        started_at="2026-01-15T10:00:00Z",
+    )
+    _write_session_jsonl(
+        sessions_root,
+        session_id="0190d0e1-aa03-7000-9000-000000000003",
+        started_at="2026-01-15T10:00:00Z",
+    )
+
+    assert count_jsonl_files(sessions_root) == 3
+    assert count_jsonl_files(sessions_root, skip_paths={target_a}) == 2
+    assert count_jsonl_files(tmp_path / "missing-root") == 0
 
 
 def test_first_install_auto_triggers_rescan_when_db_empty(tmp_path: Path) -> None:

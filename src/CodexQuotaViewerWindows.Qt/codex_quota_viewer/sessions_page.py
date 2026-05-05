@@ -3566,7 +3566,7 @@ class SessionsPage(QWidget):
         # Most recent (done, total) from the streaming-rescan progress
         # channel. Used by the count-label refresh so the textual indicator
         # stays accurate while batches commit.
-        self._rescan_progress: tuple[int, int] | None = None
+        self._rescan_progress: tuple[str, int, int] | None = None
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(220)
@@ -3632,20 +3632,50 @@ class SessionsPage(QWidget):
         self._rescan_progress = None
         self._refresh()
 
-    def apply_rescan_progress(self, done: int, total: int) -> None:
-        """Per-batch hook called by the host when the worker emits a
-        ``sessions-rescan-batch`` progress message. Triggers a lightweight
-        list refresh so newly-committed sessions appear without waiting
-        for the whole rescan to finish, and updates the count-label text
-        with progress."""
-        self._rescan_progress = (done, total)
-        # Pull the latest committed slice into the tree. Same async path
-        # as a normal refresh — the in-flight list_token guard handles
-        # rapid-fire batch messages.
+    def apply_rescan_progress(self, phase: str, done: int, total: int) -> None:
+        """Per-phase hook called by the host when the worker emits a
+        ``sessions-rescan-batch`` progress message. ``phase`` is
+        ``"parsing"`` during the JSONL walk/parse pass and ``"indexing"``
+        during the SQLite commit pass — the count label uses it to
+        render distinct status text. Triggers a lightweight list refresh
+        only during indexing (parsing pass writes nothing to the DB yet,
+        so re-querying ``list_sessions`` would just churn the tree)."""
+        self._rescan_progress = (phase, done, total)
+        if phase != "indexing":
+            # Parse phase: just refresh the count label via the next
+            # _apply_loaded_records pass. No new DB rows yet, so don't
+            # spam list refreshes — the tree contents haven't changed.
+            self._refresh_count_label_only()
+            return
+        # Indexing phase: pull the latest committed slice into the tree.
+        # Same async path as a normal refresh — the in-flight list_token
+        # guard handles rapid-fire batch messages.
         if self._task_runner is not None:
             self._request_refresh_async()
         else:
             self.refresh_list()
+
+    def _refresh_count_label_only(self) -> None:
+        """Recompute the count-label text from the cached records +
+        current ``_rescan_progress`` without re-querying the DB. Used by
+        the parsing-phase progress path so the label updates without
+        triggering a full list refresh per tick."""
+        progress = self._rescan_progress
+        if progress is None:
+            return
+        phase, done, total = progress
+        if phase == "parsing":
+            self._set_record_count_text(
+                self._translator("Parsing... {done} / {total}").format(
+                    done=done, total=total
+                )
+            )
+        else:
+            self._set_record_count_text(
+                self._translator("Indexing... {done} / {total}").format(
+                    done=done, total=total
+                )
+            )
 
     def mark_stale(self) -> None:
         self._is_stale = True
@@ -3750,11 +3780,14 @@ class SessionsPage(QWidget):
         # count otherwise. Env tabs above already show the active corpus,
         # so the previous "in Sandbox/Real" suffix was redundant.
         if streaming:
-            done, total = self._rescan_progress  # type: ignore[misc]
+            phase, done, total = self._rescan_progress  # type: ignore[misc]
+            template = (
+                "Parsing... {done} / {total}"
+                if phase == "parsing"
+                else "Indexing... {done} / {total}"
+            )
             self._set_record_count_text(
-                self._translator("Indexing... {done} / {total}").format(
-                    done=done, total=total
-                )
+                self._translator(template).format(done=done, total=total)
             )
         else:
             self._set_record_count_text(

@@ -93,19 +93,22 @@ def sessions_rescan(services: AppServices, target: CodexHomeTarget) -> dict[str,
     progress(f"Sessions progress: rescanning {target.value} session files...")
     manager = services.sessions_manager(target)
 
-    def on_batch(done: int, total: int) -> None:
-        # Per-batch tick the Qt host turns into a partial list refresh +
-        # status-bar progress text. Tagged so the host can route it past
-        # the generic textual ``progress`` channel.
+    def on_progress(phase: str, done: int, total: int) -> None:
+        # Per-phase tick the Qt host turns into a partial list refresh +
+        # status-bar progress text. ``phase`` is "parsing" during the JSONL
+        # walk/parse pass and "indexing" during the SQLite commit pass; UI
+        # uses it to label the count appropriately. Tagged so the host can
+        # route it past the generic textual ``progress`` channel.
         emit(
             "progress",
             kind="sessions-rescan-batch",
             target=target.value,
+            phase=phase,
             done=done,
             total=total,
         )
 
-    records = manager.rescan(progress_cb=on_batch)
+    records = manager.rescan(progress_cb=on_progress)
     payload = [record.to_json() for record in records]
     return {
         "result": {"records": payload, "count": len(payload)},
