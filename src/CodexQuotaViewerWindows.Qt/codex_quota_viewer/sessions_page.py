@@ -15,8 +15,10 @@ from typing import Any, Callable
 from PySide6.QtCore import (
     QAbstractListModel,
     QByteArray,
+    QBuffer,
     QCoreApplication,
     QEvent,
+    QIODevice,
     QItemSelectionModel,
     QModelIndex,
     QPoint,
@@ -43,6 +45,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QImage,
+    QImageReader,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -71,6 +74,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QStyle,
     QStyledItemDelegate,
     QTextEdit,
@@ -1022,6 +1026,12 @@ class _TimeTravelVerticalModel(QAbstractListModel):
             return row.item_id or ""
         return None
 
+    def row_for_jump_offset(self, offset: int) -> int | None:
+        for row_index, row in enumerate(self._rows):
+            if row.jump_offset == offset:
+                return row_index
+        return None
+
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
         if not index.isValid():
             return Qt.NoItemFlags
@@ -1298,11 +1308,13 @@ class _TimeTravelVerticalView(QWidget):
     ) -> None:
         self._model.refresh_index(items)
         if current_offset is not None:
-            source_index = self._model.index(current_offset, 0)
-            proxy_index = self._proxy.mapFromSource(source_index)
-            if proxy_index.isValid():
-                self._list.setCurrentIndex(proxy_index)
-                self._list.scrollTo(proxy_index, QAbstractItemView.PositionAtCenter)
+            row = self._model.row_for_jump_offset(current_offset)
+            if row is not None:
+                source_index = self._model.index(row, 0)
+                proxy_index = self._proxy.mapFromSource(source_index)
+                if proxy_index.isValid():
+                    self._list.setCurrentIndex(proxy_index)
+                    self._list.scrollTo(proxy_index, QAbstractItemView.PositionAtCenter)
 
     def focus_search(self) -> None:
         self._search_input.setFocus()
@@ -1417,13 +1429,834 @@ class _TimeTravelFilterProxy(QSortFilterProxyModel):
         return self._needle in tool_name
 
 
+# ---- Attachments grid ----------------------------------------------------
+
+
+_TT_ATT_BLOCK_INDEX_ROLE = Qt.UserRole + 200
+_TT_ATT_ATTACHMENT_INDEX_ROLE = Qt.UserRole + 201
+_TT_ATT_KIND_ROLE = Qt.UserRole + 202
+_TT_ATT_NAME_ROLE = Qt.UserRole + 203
+_TT_ATT_MIME_ROLE = Qt.UserRole + 204
+_TT_ATT_TIMESTAMP_ROLE = Qt.UserRole + 205
+_TT_ATT_FILTERED_OUT_ROLE = Qt.UserRole + 206
+_TT_ATT_ORDINAL_ROLE = Qt.UserRole + 207
+_TT_ATT_ITEM_ID_ROLE = Qt.UserRole + 208
+
+_ATTACHMENT_GRID_CELL = QSize(124, 144)
+_ATTACHMENT_THUMB_SIZE = QSize(100, 100)
+_ATTACHMENT_THUMBNAIL_CACHE_CAP = 64
+
+# Stand-alone SVG bodies rendered crisply in the attachments delegate
+# via QSvgRenderer. We can't reuse the QIcon-based ``_file_icon()`` /
+# ``_image_icon()`` helpers because QIcon caches pixmaps at fixed
+# logical_size × {1×, 2×, 3×, 4×}; painting one of those into a 60–80px
+# thumbnail downscales the closest cached size and looks blurry.
+# Rendering the SVG directly into the target QRectF avoids the
+# resampling step — vector source → vector destination, pixel-perfect
+# at any size. Stroke-width is bumped vs. the QIcon variants so the
+# glyph still reads at the larger thumb size.
+_FILE_THUMBNAIL_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<g fill="none" stroke="#dbe3ee" stroke-width="1.6" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>'
+    '<polyline points="14 2 14 8 20 8"/>'
+    '</g></svg>'
+)
+_BROKEN_IMAGE_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<g fill="none" stroke="#ffb3b3" stroke-width="1.6" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>'
+    '<line x1="3" y1="3" x2="21" y2="21"/>'
+    '</g></svg>'
+)
+_IMAGE_THUMBNAIL_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<g fill="none" stroke="#dbe3ee" stroke-width="1.6" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>'
+    '<circle cx="8.5" cy="8.5" r="1.5"/>'
+    '<polyline points="21 15 16 10 5 21"/>'
+    '</g></svg>'
+)
+
+
+@dataclass(frozen=True)
+class _TimeTravelAttachmentRow:
+    """Precomputed row payload for the attachments grid — built once per
+    ``model.refresh()`` so ``data()`` reads stay O(1) during paint."""
+
+    block_index: int
+    attachment_index: int
+    kind: str  # "image" | "file"
+    display_name: str
+    mime: str
+    data_uri: str | None
+    path: str | None
+    timestamp: str
+    is_filtered_out: bool
+    # Global timeline ordinal (1-based when displayed) for the owning
+    # SessionTimelineItem. ``None`` when the host couldn't resolve it
+    # — the delegate then falls back to ``block_index + 1`` so a missing
+    # ordinal map degrades gracefully instead of raising. In huge
+    # sessions taking the lightweight index path the ordinal comes from
+    # the cached _TimeTravelIndexItems; in normal sessions it's
+    # computed from `_loaded_offset + position_in_all_timeline_items`.
+    ordinal: int | None = None
+    # Owning timeline-item id. When non-empty AND ``ordinal`` is set,
+    # the view emits ``offsetClicked(ordinal, item_id)`` so the host's
+    # offset-jump path can route a click to an item that lives outside
+    # the materialized ``_all_blocks`` slice (huge-session full-load
+    # case). When empty, the view falls back to
+    # ``attachmentJumpRequested(block_index)`` — sliced behavior.
+    item_id: str = ""
+
+
+def _attachment_display_name(attachment: Attachment) -> str:
+    """Best-effort caption for an attachment cell. Falls back through
+    ``name → alt → basename(path) → mime-derived stub`` so even sparse
+    attachments still produce something readable in the grid."""
+    name = (attachment.name or "").strip()
+    if name:
+        return name
+    alt = (attachment.alt or "").strip()
+    if alt and alt.lower() != "high":
+        return alt
+    if attachment.path:
+        base = Path(attachment.path).name
+        if base:
+            return base
+    return "<image>" if attachment.kind == "image" else "<file>"
+
+
+def _attachments_for_item(
+    item: SessionTimelineItem,
+) -> tuple[Attachment, ...]:
+    """Return every attachment associated with one timeline item —
+    payload-level ``item.attachments`` PLUS markdown image links
+    embedded in the body text.
+
+    Mirrors the bubble's ``_make_bubble`` concat at line ~8664 (payload
+    attachments first, then markdown) so the Time Travel attachments
+    grid stays in lockstep with what the user actually sees on each
+    message — without that concat we miss every screenshot the user
+    pasted via ``![](path)`` markdown syntax."""
+    payload_attachments: tuple[Attachment, ...] = (
+        getattr(item, "attachments", ()) or ()
+    )
+    text = getattr(item, "text", "") or ""
+    if "![" not in text:
+        return tuple(payload_attachments)
+    _body, md_attachments = _extract_markdown_attachments(text)
+    return tuple(payload_attachments) + tuple(md_attachments)
+
+
+def _iter_block_attachments(
+    block: Any,
+) -> list[tuple[int, Attachment, SessionTimelineItem]]:
+    """Yield ``(attachment_index, attachment, timestamp_owner_item)`` for
+    every attachment hanging off ``block``. ``tool_group`` blocks fan
+    across their inner items; ``single`` blocks have at most one source
+    item. Indices are flat per item (matching the bubble's
+    concatenated attachments list). Returns a list (rather than a
+    generator) so the model can cheaply count rows during refresh."""
+    out: list[tuple[int, Attachment, SessionTimelineItem]] = []
+    kind, payload = block
+    if kind == "tool_group":
+        for item in payload:
+            for att_idx, att in enumerate(_attachments_for_item(item)):
+                out.append((att_idx, att, item))
+        return out
+    for att_idx, att in enumerate(_attachments_for_item(payload)):
+        out.append((att_idx, att, payload))
+    return out
+
+
+class _TimeTravelAttachmentsModel(QAbstractListModel):
+    """Backs the attachments grid's QListView. Holds a precomputed row
+    list so ``data()`` reads stay O(1) — the grid's IconMode delegate
+    fires ``data()`` heavily during virtualization. ``refresh()`` walks
+    every block in the session and extracts each ``Attachment`` into a
+    grid row."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._rows: list[_TimeTravelAttachmentRow] = []
+
+    def refresh(
+        self,
+        blocks: list[Any],
+        filtered_indices: list[int] | None,
+        ordinal_map: dict[str, int] | None = None,
+    ) -> None:
+        """Rebuild the row list from ``blocks``. ``ordinal_map`` (when
+        provided) maps timeline-item ID to global 0-based ordinal so the
+        delegate can render the same ``#N`` numbering as the messages
+        tab. Without it the delegate falls back to ``block_index + 1``
+        which only matches inside small sessions where loaded blocks
+        ARE the whole session."""
+        self.beginResetModel()
+        try:
+            self._rows = []
+            allowed = set(filtered_indices) if filtered_indices is not None else None
+            for block_index, block in enumerate(blocks):
+                is_dim = allowed is not None and block_index not in allowed
+                for att_idx, attachment, owner in _iter_block_attachments(block):
+                    ordinal: int | None = None
+                    if ordinal_map is not None:
+                        owner_id = getattr(owner, "id", None)
+                        if isinstance(owner_id, str):
+                            ordinal = ordinal_map.get(owner_id)
+                    owner_id = getattr(owner, "id", "") or ""
+                    self._rows.append(
+                        _TimeTravelAttachmentRow(
+                            block_index=block_index,
+                            attachment_index=att_idx,
+                            kind=attachment.kind,
+                            display_name=_attachment_display_name(attachment),
+                            mime=attachment.mime,
+                            data_uri=attachment.data_uri,
+                            path=attachment.path,
+                            timestamp=_format_block_timestamp(owner),
+                            is_filtered_out=is_dim,
+                            ordinal=ordinal,
+                            item_id=owner_id if isinstance(owner_id, str) else "",
+                        )
+                    )
+        finally:
+            self.endResetModel()
+
+    def refresh_full(self, rows: list[Any]) -> None:
+        """Rebuild from a SQL-fetched ``list[SessionAttachmentRow]`` —
+        used by the lazy full-session attachments path so huge sessions
+        (where ``_all_blocks`` is only a slice of the timeline) still
+        show every attachment.
+
+        Each input row carries its own global ordinal directly, so
+        there's no ``ordinal_map`` argument — the SQL query already did
+        that lookup. ``block_index`` becomes a synthetic per-row index
+        (just the row position) since there's no underlying block list
+        to map back to. ``is_filtered_out`` is always False because the
+        full path bypasses the panel-level filter projection by design
+        (Time Travel's "full session" semantics deliberately ignore
+        whatever filter the messages-list happens to have applied)."""
+        self.beginResetModel()
+        try:
+            self._rows = []
+            for synthetic_idx, row in enumerate(rows):
+                attachment = row.attachment
+                self._rows.append(
+                    _TimeTravelAttachmentRow(
+                        block_index=synthetic_idx,
+                        attachment_index=int(row.attachment_index),
+                        kind=attachment.kind,
+                        display_name=_attachment_display_name(attachment),
+                        mime=attachment.mime,
+                        data_uri=attachment.data_uri,
+                        path=attachment.path,
+                        timestamp=row.timestamp,
+                        is_filtered_out=False,
+                        ordinal=int(row.ordinal),
+                        item_id=str(row.item_id),
+                    )
+                )
+        finally:
+            self.endResetModel()
+
+    # ----------------------------------------------------------- Qt API
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
+        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
+            return None
+        row = self._rows[index.row()]
+        if role == _TT_ATT_BLOCK_INDEX_ROLE:
+            return row.block_index
+        if role == _TT_ATT_ATTACHMENT_INDEX_ROLE:
+            return row.attachment_index
+        if role == _TT_ATT_KIND_ROLE:
+            return row.kind
+        if role == _TT_ATT_NAME_ROLE or role == Qt.DisplayRole:
+            return row.display_name
+        if role == _TT_ATT_MIME_ROLE:
+            return row.mime
+        if role == _TT_ATT_TIMESTAMP_ROLE:
+            return row.timestamp
+        if role == _TT_ATT_FILTERED_OUT_ROLE:
+            return row.is_filtered_out
+        if role == _TT_ATT_ORDINAL_ROLE:
+            return row.ordinal
+        if role == _TT_ATT_ITEM_ID_ROLE:
+            return row.item_id
+        return None
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlags:
+        if not index.isValid():
+            return Qt.NoItemFlags
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+
+    # --------------------------------------------------------- helpers
+
+    def row_for(self, model_row: int) -> _TimeTravelAttachmentRow | None:
+        """Direct row accessor used by the delegate's thumbnail cache to
+        key off the underlying ``data_uri`` / ``path`` instead of going
+        back through Qt's role layer."""
+        if not (0 <= model_row < len(self._rows)):
+            return None
+        return self._rows[model_row]
+
+
+class _TimeTravelAttachmentDelegate(QStyledItemDelegate):
+    """Renders one attachment cell as ``thumb / display_name / #N · HH:MM``.
+
+    Image thumbnails are decoded lazily during ``paint`` and cached in a
+    bounded LRU dict so scrolling stays smooth. File and broken-image
+    thumbnails are rendered directly via ``QSvgRenderer`` into the
+    target rect — no QIcon middleman, so they stay crisp at any DPR
+    (the QIcon route caches at fixed pixmap sizes and downscales to
+    the 60-ish px thumb slot, which is what made SVG attachments look
+    blurry). The cell background tints on hover/selected and dims to
+    35% opacity when the attachment's source block is excluded by the
+    panel filter."""
+
+    THUMB_PADDING = 12
+    THUMB_RADIUS = 6.0
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        # LRU thumbnail cache for IMAGE attachments only — file glyphs
+        # are vector-rendered every paint (cheap, DPR-correct) so they
+        # don't share this dict. Key is ``(block_index, attachment_index)``.
+        self._thumb_cache: dict[tuple[int, int], QPixmap] = {}
+        self._cache_cap: int = _ATTACHMENT_THUMBNAIL_CACHE_CAP
+        # Reusable QSvgRenderer instances — building one is cheap-ish
+        # (parses XML once) but doing it per-paint is wasteful. Both
+        # are stateless so a single shared instance is safe.
+        self._file_renderer = QSvgRenderer(
+            QByteArray(_FILE_THUMBNAIL_SVG.encode("utf-8"))
+        )
+        self._broken_renderer = QSvgRenderer(
+            QByteArray(_BROKEN_IMAGE_SVG.encode("utf-8"))
+        )
+        self._image_renderer = QSvgRenderer(
+            QByteArray(_IMAGE_THUMBNAIL_SVG.encode("utf-8"))
+        )
+
+    # --------------------------------------------------------------- API
+
+    def clear_cache(self) -> None:
+        self._thumb_cache.clear()
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt naming
+        del option, index
+        return _ATTACHMENT_GRID_CELL
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        painter.save()
+        try:
+            rect: QRect = option.rect
+            selected = bool(option.state & QStyle.State_Selected)
+            hovered = bool(option.state & QStyle.State_MouseOver)
+            kind = index.data(_TT_ATT_KIND_ROLE) or "file"
+            name = index.data(_TT_ATT_NAME_ROLE) or ""
+            mime = index.data(_TT_ATT_MIME_ROLE) or ""
+            timestamp = index.data(_TT_ATT_TIMESTAMP_ROLE) or ""
+            ordinal = index.data(_TT_ATT_ORDINAL_ROLE)
+            block_idx = index.data(_TT_ATT_BLOCK_INDEX_ROLE)
+            filtered_out = bool(index.data(_TT_ATT_FILTERED_OUT_ROLE))
+
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            # Cell background — same hover/selected language as the
+            # vertical row delegate so the two views feel like one set.
+            inner = rect.adjusted(2, 2, -2, -2)
+            if selected:
+                painter.setBrush(QColor(10, 132, 255, 96))
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(inner, 8.0, 8.0)
+            elif hovered:
+                painter.setBrush(QColor(10, 132, 255, 28))
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(inner, 8.0, 8.0)
+
+            if filtered_out:
+                painter.setOpacity(ROLE_FILTERED_OUT_ALPHA)
+
+            # Thumbnail rect — top half of the cell, left/right padded
+            # so wider thumbs don't bleed into the cell border.
+            thumb_w = _ATTACHMENT_THUMB_SIZE.width()
+            thumb_h = _ATTACHMENT_THUMB_SIZE.height()
+            thumb_x = rect.left() + (rect.width() - thumb_w) // 2
+            thumb_y = rect.top() + 8
+            thumb_rect = QRect(thumb_x, thumb_y, thumb_w, thumb_h)
+
+            if kind == "file":
+                self._paint_file_thumbnail(painter, thumb_rect, mime)
+            else:
+                pixmap = self._thumbnail_for(index)
+                if pixmap is not None and not pixmap.isNull():
+                    self._paint_image_pixmap(painter, thumb_rect, pixmap)
+
+            # Caption: display name (1 line, elided) + #idx · timestamp.
+            metrics = QFontMetrics(painter.font())
+            cap_top = thumb_rect.bottom() + 6
+            cap_h = metrics.height()
+            cap_rect = QRect(rect.left() + 6, cap_top, rect.width() - 12, cap_h)
+            painter.setPen(QColor(230, 235, 240, 230))
+            elided = metrics.elidedText(name, Qt.ElideRight, cap_rect.width())
+            painter.drawText(cap_rect, Qt.AlignHCenter | Qt.AlignVCenter, elided)
+
+            meta_top = cap_rect.bottom() + 2
+            meta_rect = QRect(rect.left() + 6, meta_top, rect.width() - 12, cap_h)
+            # Prefer the global timeline ordinal (matches the messages
+            # tab's ``#N`` numbering) when the host pushed an ordinal
+            # map; otherwise fall back to the local block index so
+            # standalone tests / sessions without an index still
+            # display *something* meaningful.
+            display_index = ordinal if isinstance(ordinal, int) else block_idx
+            meta_text = f"#{(display_index or 0) + 1}"
+            if timestamp:
+                meta_text = f"{meta_text} · {timestamp}"
+            painter.setPen(QColor(255, 255, 255, 130))
+            font = painter.font()
+            font.setPointSizeF(font.pointSizeF() - 1.0)
+            painter.setFont(font)
+            painter.drawText(meta_rect, Qt.AlignHCenter | Qt.AlignVCenter, meta_text)
+        finally:
+            painter.restore()
+
+    # --------------------------------------------------- vector renderers
+
+    def _paint_file_thumbnail(
+        self, painter: QPainter, thumb_rect: QRect, mime: str
+    ) -> None:
+        """Vector-render the file glyph + MIME extension into ``thumb_rect``
+        directly — no QPixmap detour. QSvgRenderer rasterises at the
+        painter's current device pixel ratio so the result is crisp
+        on Retina/HiDPI displays as well as 1× monitors."""
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            # Faint backdrop to give the glyph a card to live on so it
+            # doesn't look like it's floating on the frosted glass.
+            painter.setBrush(QColor(255, 255, 255, 18))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(
+                QRectF(thumb_rect),
+                self.THUMB_RADIUS,
+                self.THUMB_RADIUS,
+            )
+            # Render the SVG glyph centred in the upper portion of the
+            # thumb so the MIME extension label fits beneath it.
+            glyph_size = int(thumb_rect.width() * 0.55)
+            glyph_x = thumb_rect.left() + (thumb_rect.width() - glyph_size) // 2
+            glyph_y = thumb_rect.top() + 12
+            self._file_renderer.render(
+                painter,
+                QRectF(glyph_x, glyph_y, glyph_size, glyph_size),
+            )
+            ext = self._mime_extension_label(mime)
+            if ext:
+                painter.setPen(QColor(220, 226, 236, 220))
+                font = painter.font()
+                font.setBold(True)
+                font.setPointSizeF(font.pointSizeF() + 0.5)
+                painter.setFont(font)
+                ext_rect = QRectF(
+                    thumb_rect.left(),
+                    glyph_y + glyph_size + 2,
+                    thumb_rect.width(),
+                    18,
+                )
+                painter.drawText(
+                    ext_rect, Qt.AlignHCenter | Qt.AlignVCenter, ext
+                )
+        finally:
+            painter.restore()
+
+    def _paint_image_pixmap(
+        self, painter: QPainter, thumb_rect: QRect, pixmap: QPixmap
+    ) -> None:
+        """Centre + clip-round + frame an already-cached image pixmap
+        inside ``thumb_rect``. Factored out of ``paint`` so the file
+        path can branch around it cleanly."""
+        px_w = int(pixmap.width() / pixmap.devicePixelRatio())
+        px_h = int(pixmap.height() / pixmap.devicePixelRatio())
+        px_x = thumb_rect.left() + (thumb_rect.width() - px_w) // 2
+        px_y = thumb_rect.top() + (thumb_rect.height() - px_h) // 2
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(
+            QRectF(thumb_rect), self.THUMB_RADIUS, self.THUMB_RADIUS
+        )
+        painter.save()
+        painter.setClipPath(clip_path)
+        # Frame fill behind the pixmap so transparent PNGs read
+        # against the cell background.
+        painter.fillRect(thumb_rect, QColor(0, 0, 0, 90))
+        painter.drawPixmap(px_x, px_y, pixmap)
+        painter.restore()
+        # 1px frame to separate from background, especially for
+        # bright screenshots on the dark frosted base.
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 40), 1.0))
+        painter.drawRoundedRect(
+            QRectF(thumb_rect).adjusted(0.5, 0.5, -0.5, -0.5),
+            self.THUMB_RADIUS,
+            self.THUMB_RADIUS,
+        )
+
+    # ---------------------------------------------------- thumbnail cache
+
+    def _thumbnail_for(self, index: QModelIndex) -> QPixmap | None:
+        """Return the cached image pixmap for an attachment cell, or
+        decode and cache it on first access. Image kind only —
+        ``_paint_file_thumbnail`` handles files vector-style without
+        ever entering this dict."""
+        block_idx = index.data(_TT_ATT_BLOCK_INDEX_ROLE)
+        att_idx = index.data(_TT_ATT_ATTACHMENT_INDEX_ROLE)
+        if block_idx is None or att_idx is None:
+            return None
+        key = (int(block_idx), int(att_idx))
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            # Bump key to most-recent end of dict for LRU (cheap on
+            # CPython 3.7+ — dict order is insertion order).
+            self._thumb_cache.pop(key)
+            self._thumb_cache[key] = cached
+            return cached
+
+        model = index.model()
+        source = model.sourceModel() if hasattr(model, "sourceModel") else model
+        row = (
+            source.row_for(index.row())
+            if isinstance(source, _TimeTravelAttachmentsModel)
+            else None
+        )
+        if row is None:
+            return None
+        pixmap = self._build_image_pixmap(row)
+        if pixmap is None:
+            return None
+        self._thumb_cache[key] = pixmap
+        if len(self._thumb_cache) > self._cache_cap:
+            # Pop oldest (first) entry. Dict insertion order makes the
+            # first key the least-recently-used.
+            oldest_key = next(iter(self._thumb_cache))
+            self._thumb_cache.pop(oldest_key, None)
+        return pixmap
+
+    def _build_image_pixmap(
+        self, row: _TimeTravelAttachmentRow
+    ) -> QPixmap | None:
+        """Decode an image attachment to a thumbnail-sized QPixmap.
+        Returns the broken-image placeholder pixmap when ``data_uri``
+        and ``path`` both fail — never returns None for image kind so
+        the cell always shows *something*."""
+        image: QImage | None = None
+        if row.data_uri:
+            attachment = Attachment(
+                kind="image",
+                mime=row.mime or "image/unknown",
+                data_uri=row.data_uri,
+                alt=row.display_name,
+            )
+            image = _load_attachment_image_scaled(
+                attachment, _ATTACHMENT_THUMB_SIZE
+            )
+        if image is None and row.path:
+            attachment = Attachment(
+                kind="image",
+                mime=row.mime or "image/unknown",
+                path=row.path,
+                alt=row.display_name,
+            )
+            image = _load_attachment_image_scaled(
+                attachment, _ATTACHMENT_THUMB_SIZE
+            )
+        if image is None and not row.data_uri and not row.path:
+            return self._render_image_placeholder_pixmap()
+        if image is None or image.isNull():
+            return self._render_broken_pixmap()
+        scaled = (
+            image
+            if image.size().boundedTo(_ATTACHMENT_THUMB_SIZE) == image.size()
+            else image.scaled(
+                _ATTACHMENT_THUMB_SIZE,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+        return QPixmap.fromImage(scaled)
+
+    def _render_image_placeholder_pixmap(self) -> QPixmap:
+        """Neutral placeholder for memory-light full-session rows whose
+        inline bytes were deliberately not loaded into the attachment model."""
+        return self._render_vector_placeholder_pixmap(
+            self._image_renderer,
+            QColor(255, 255, 255, 18),
+        )
+
+    def _render_broken_pixmap(self) -> QPixmap:
+        """Vector-render the broken-image placeholder once at the
+        thumb size. Only called when an image fails to decode — files
+        never reach this path."""
+        return self._render_vector_placeholder_pixmap(
+            self._broken_renderer,
+            QColor(255, 100, 100, 32),
+        )
+
+    def _render_vector_placeholder_pixmap(
+        self,
+        renderer: QSvgRenderer,
+        background: QColor,
+    ) -> QPixmap:
+        size = _ATTACHMENT_THUMB_SIZE
+        pixmap = QPixmap(size)
+        pixmap.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(pixmap)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setBrush(background)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(
+                QRectF(0, 0, size.width(), size.height()),
+                self.THUMB_RADIUS,
+                self.THUMB_RADIUS,
+            )
+            glyph = int(size.width() * 0.5)
+            x = (size.width() - glyph) // 2
+            y = (size.height() - glyph) // 2
+            renderer.render(painter, QRectF(x, y, glyph, glyph))
+        finally:
+            painter.end()
+        return pixmap
+
+    @staticmethod
+    def _mime_extension_label(mime: str) -> str:
+        if not mime or "/" not in mime:
+            return ""
+        subtype = mime.split("/", 1)[1].split("+", 1)[0].split(";", 1)[0]
+        # Trim common prefixes ("vnd.openxml...") to keep label short.
+        if "." in subtype:
+            subtype = subtype.split(".")[-1]
+        return subtype.upper()[:6]
+
+
+class _TimeTravelAttachmentsView(QWidget):
+    """The Time Travel popup's attachments tab — a virtualized icon-mode
+    ``QListView`` of every image / file attachment in the session,
+    rendered as a thumbnail grid. Click a thumbnail to jump to its
+    source block (signal forwarded by the popup as
+    ``blockJumpRequested`` for sliced data, ``offsetJumpRequested``
+    for full SQL-loaded data)."""
+
+    attachmentJumpRequested = Signal(int)
+    """Sliced-data path: emit (block_index) — host's
+    ``_on_time_travel_jump`` resolves it inside ``_all_blocks``."""
+
+    offsetClicked = Signal(int, str)
+    """Full SQL-loaded path: emit (ordinal, item_id) — host's
+    ``_on_time_travel_offset_jump`` handles in-slice and
+    out-of-slice routing (loading more timeline if needed)."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("TimeTravelAttachmentsView")
+        self._placeholder_text = "No attachments in this session"
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(8)
+
+        self._model = _TimeTravelAttachmentsModel(self)
+        self._delegate = _TimeTravelAttachmentDelegate(self)
+
+        self._list = QListView(self)
+        self._list.setObjectName("TimeTravelAttachmentsList")
+        self._list.setModel(self._model)
+        self._list.setItemDelegate(self._delegate)
+        # IconMode in a static, wrap-on-resize layout — Qt fills cells
+        # left-to-right, top-to-bottom and re-flows when width changes.
+        self._list.setViewMode(QListView.IconMode)
+        self._list.setMovement(QListView.Static)
+        self._list.setResizeMode(QListView.Adjust)
+        self._list.setUniformItemSizes(True)
+        self._list.setGridSize(_ATTACHMENT_GRID_CELL)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._list.setMouseTracking(True)
+        self._list.setSpacing(4)
+        # Belt-and-braces: QListView's IconMode sometimes paints the
+        # viewport from the widget palette's Base role even when QSS
+        # asks for a transparent background. Disabling autoFillBackground
+        # on the viewport and clearing the Base role keeps the popup's
+        # frosted backdrop visible through the cell gaps.
+        self._list.viewport().setAutoFillBackground(False)
+        self._list.setAutoFillBackground(False)
+        list_palette = self._list.palette()
+        list_palette.setColor(self._list.viewport().backgroundRole(), QColor(0, 0, 0, 0))
+        list_palette.setColor(self._list.backgroundRole(), QColor(0, 0, 0, 0))
+        self._list.setPalette(list_palette)
+        self._list.viewport().setPalette(list_palette)
+        self._list.activated.connect(self._on_activated)
+        self._list.clicked.connect(self._on_activated)
+        layout.addWidget(self._list, 1)
+
+    # ----------------------------------------------------------- public API
+
+    def refresh(
+        self,
+        blocks: list[Any],
+        filtered_indices: list[int] | None,
+        ordinal_map: dict[str, int] | None = None,
+    ) -> None:
+        # New session = new attachment domain — drop any cached
+        # thumbnails so a re-open with a different `blocks` list never
+        # paints stale pixmaps.
+        self._delegate.clear_cache()
+        self._model.refresh(blocks, filtered_indices, ordinal_map)
+        self._list.viewport().update()
+
+    def refresh_full(self, rows: list[Any]) -> None:
+        """Replace the grid with a SQL-fetched full attachment list.
+        Drops the thumbnail cache because the backing rows changed (new
+        block_index / synthetic indexing means cache keys are stale)."""
+        self._delegate.clear_cache()
+        self._model.refresh_full(rows)
+        self._list.viewport().update()
+
+    def attachment_count(self) -> int:
+        return self._model.rowCount()
+
+    # --------------------------------------------------------------- input
+
+    def _on_activated(self, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        # Prefer the offset-jump path whenever we have a valid global
+        # ordinal — it handles both in-slice and out-of-slice items
+        # (the host's ``_on_time_travel_offset_jump`` accepts an empty
+        # ``item_id`` and falls back to ``_all_timeline_items[local].id``
+        # to resolve the anchor). Requiring item_id here was wrong: in
+        # full-load mode the ``block_index`` is a synthetic row position,
+        # so falling through to ``attachmentJumpRequested(block_index)``
+        # would jump to the wrong block in ``_all_blocks``.
+        ordinal = index.data(_TT_ATT_ORDINAL_ROLE)
+        if isinstance(ordinal, int):
+            item_id = index.data(_TT_ATT_ITEM_ID_ROLE) or ""
+            self.offsetClicked.emit(ordinal, item_id)
+            return
+        block_index = index.data(_TT_ATT_BLOCK_INDEX_ROLE)
+        if isinstance(block_index, int):
+            self.attachmentJumpRequested.emit(block_index)
+
+    # --------------------------------------------------------------- paint
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().paintEvent(event)
+        if self._model.rowCount() > 0:
+            return
+        # Empty state placeholder — centred dimmed text on the frosted
+        # surface. No box / border, just a hint.
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(QColor(255, 255, 255, 110))
+            font = painter.font()
+            font.setPointSizeF(font.pointSizeF() + 0.5)
+            painter.setFont(font)
+            painter.drawText(self.rect(), Qt.AlignCenter, self._placeholder_text)
+        finally:
+            painter.end()
+
+
+class _TimeTravelModeBar(QWidget):
+    """Two-tab segmented switcher for the Time Travel popup —
+    ``[ Messages ] [ Attachments (N) ]``. Mutually exclusive checkable
+    buttons in a ``QButtonGroup``; emits ``modeChanged(int)`` with the
+    page index when the active tab changes. The Attachments label is
+    re-rendered with a count badge on every ``set_attachment_count``."""
+
+    modeChanged = Signal(int)
+
+    MODE_MESSAGES = 0
+    MODE_ATTACHMENTS = 1
+
+    def __init__(
+        self,
+        translator: Callable[[str], str],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("TimeTravelModeBar")
+        self._translator = translator
+        self._attachment_count: int = 0
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 0)
+        layout.setSpacing(6)
+
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+
+        self._messages_button = QPushButton(translator("Messages"))
+        self._messages_button.setObjectName("TimeTravelModeTab")
+        self._messages_button.setCheckable(True)
+        self._messages_button.setChecked(True)
+        self._messages_button.setCursor(Qt.PointingHandCursor)
+        self._messages_button.setProperty("mode", "messages")
+        layout.addWidget(self._messages_button)
+
+        self._attachments_button = QPushButton(self._format_attachments_label(0))
+        self._attachments_button.setObjectName("TimeTravelModeTab")
+        self._attachments_button.setCheckable(True)
+        self._attachments_button.setCursor(Qt.PointingHandCursor)
+        self._attachments_button.setProperty("mode", "attachments")
+        layout.addWidget(self._attachments_button)
+
+        layout.addStretch(1)
+
+        self._group.addButton(self._messages_button, self.MODE_MESSAGES)
+        self._group.addButton(self._attachments_button, self.MODE_ATTACHMENTS)
+        self._group.idToggled.connect(self._on_id_toggled)
+
+    # ----------------------------------------------------------- public API
+
+    def set_attachment_count(self, count: int) -> None:
+        self._attachment_count = max(0, int(count))
+        self._attachments_button.setText(
+            self._format_attachments_label(self._attachment_count)
+        )
+
+    def current_mode(self) -> int:
+        return self._group.checkedId()
+
+    # --------------------------------------------------------------- input
+
+    def _on_id_toggled(self, mode_id: int, checked: bool) -> None:
+        # ``QButtonGroup.idToggled`` fires for both the activating button
+        # (checked=True) and the deactivating one (checked=False) — only
+        # forward the activation event to keep the popup's stack switch
+        # idempotent.
+        if checked:
+            self.modeChanged.emit(mode_id)
+
+    def _format_attachments_label(self, count: int) -> str:
+        return self._translator("Attachments ({n})").format(n=count)
+
+
 class _TimeTravelPopup(_FrostedSurface):
-    """Frosted Qt.Tool popup hosting the Time Travel vertical view —
-    a virtualized list of every block in the session, with role-chip
-    filters and debounced text search. Reuses ``_FrostedSurface``'s
-    ESC + click-outside dismissal and DWM acrylic chrome; the host
-    (``_SessionDetailPanel``) owns the geometry computation + show/hide
-    lifecycle.
+    """Frosted Qt.Tool popup hosting the Time Travel popup —
+    a mode-switched view of either the session's messages (vertical
+    list with role-chip filters and search) or its attachments
+    (thumbnail grid). Reuses ``_FrostedSurface``'s ESC + click-outside
+    dismissal and DWM acrylic chrome; the host (``_SessionDetailPanel``)
+    owns the geometry computation + show/hide lifecycle.
 
     Design choices:
       * ``ACCEPT_FOCUS=True`` — needed for the search input and
@@ -1431,6 +2264,8 @@ class _TimeTravelPopup(_FrostedSurface):
       * Painted radius 14 to match ``_SessionsSearchPopup`` — the popup
         is tall enough that the painted curve hides the DWM ring
         artifact (vs. the floating action bar's flatter 8px).
+      * Two pages share one popup height (``preferred_height``); switching
+        modes is just a ``stack.setCurrentIndex`` — no resize jitter.
     """
 
     RADIUS = 14.0
@@ -1442,11 +2277,16 @@ class _TimeTravelPopup(_FrostedSurface):
 
     blockJumpRequested = Signal(int)
     """Emitted with a physical block index when the user picks a row in
-    the vertical view. The host wires this to ``_recenter_async`` and
-    keeps the popup open."""
+    the vertical view OR a thumbnail in the attachments grid. The host
+    wires this to ``_recenter_async`` and keeps the popup open."""
     offsetJumpRequested = Signal(int, str)
     """Emitted with a repository timeline offset and item id when the popup
     is backed by the lightweight global index."""
+    fullAttachmentsRequested = Signal()
+    """Emitted when the user opens the Attachments tab in a session
+    where the full attachment list isn't yet available (sliced view
+    only). The host kicks off a SQL fetch and pushes the result back
+    via ``set_full_attachments``."""
 
     # Height bounds — the popup picks ``min(MAX, max(MIN, host * 0.7))``
     # so it stays usable on small windows but doesn't dominate large
@@ -1467,10 +2307,37 @@ class _TimeTravelPopup(_FrostedSurface):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self._vertical = _TimeTravelVerticalView(translator, self)
+        # Mode switcher at the top — segmented "Messages | Attachments (N)".
+        self._mode_bar = _TimeTravelModeBar(translator, self)
+        outer.addWidget(self._mode_bar, 0)
+
+        # QStackedWidget routes between the two views. Both pages exist
+        # for the popup's lifetime so switching is a cheap setCurrentIndex.
+        self._stack = QStackedWidget(self)
+        outer.addWidget(self._stack, 1)
+
+        self._vertical = _TimeTravelVerticalView(translator, self._stack)
         self._vertical.blockClicked.connect(self.blockJumpRequested.emit)
         self._vertical.offsetClicked.connect(self.offsetJumpRequested.emit)
-        outer.addWidget(self._vertical, 1)
+        self._stack.addWidget(self._vertical)
+
+        self._attachments = _TimeTravelAttachmentsView(self._stack)
+        self._attachments.attachmentJumpRequested.connect(
+            self.blockJumpRequested.emit
+        )
+        self._attachments.offsetClicked.connect(self.offsetJumpRequested.emit)
+        self._stack.addWidget(self._attachments)
+
+        self._mode_bar.modeChanged.connect(self._stack.setCurrentIndex)
+        self._mode_bar.modeChanged.connect(self._on_mode_changed)
+        self._stack.setCurrentIndex(_TimeTravelModeBar.MODE_MESSAGES)
+        # Flips True the first time the user opens the Attachments tab
+        # — the host listens for ``fullAttachmentsRequested`` and
+        # responds with a one-shot SQL fetch (cached per session). This
+        # flag is reset by ``set_full_attachments`` so a second
+        # session-swap-then-back triggers a fresh request.
+        self._full_attachments_requested: bool = False
+        self._full_attachments_rows_id: int | None = None
 
         # Focus the search input on the next tick so the user can type
         # immediately after the popup appears. ``QTimer.singleShot(0,
@@ -1497,7 +2364,76 @@ class _TimeTravelPopup(_FrostedSurface):
         items: list[SessionTimelineIndexItem],
         current_offset: int | None,
     ) -> None:
+        # Index mode = huge session, only the lightweight item index is
+        # available for the messages list. Attachments are pushed
+        # separately via ``set_attachments`` from the materialized
+        # blocks the host has on hand, so they stay populated even when
+        # the messages tab is on the lightweight index path.
         self._vertical.refresh_index(items, current_offset)
+
+    def set_attachments(
+        self,
+        blocks: list[Any],
+        filtered_indices: list[int] | None,
+        ordinal_map: dict[str, int] | None = None,
+    ) -> None:
+        """Push attachments from the materialized blocks. Always called
+        by the host on every data refresh, independent of whether the
+        messages list is on the full or lightweight path — the
+        lightweight global index strips attachment payloads, so we'd
+        otherwise show ``Attachments (0)`` even in sessions that
+        clearly carry attached files.
+
+        ``ordinal_map`` (item.id → 0-based global ordinal) lets the
+        delegate render the same ``#N`` numbering that the messages tab
+        uses. Without it the delegate falls back to the local block
+        index, which only matches when ``_all_blocks`` IS the whole
+        session — for huge sessions that look would be misleading
+        (e.g. ``#117`` when the messages tab shows ``#2538``).
+
+        For sessions where only a slice of the timeline is materialized
+        (huge sessions where the host uses the index path), this still
+        only sees attachments inside that slice. Scrolling to load
+        older chunks will refresh the grid with the new attachments —
+        OR the host can call ``set_full_attachments`` with a SQL-loaded
+        full list to replace this sliced view entirely.
+        """
+        self._full_attachments_rows_id = None
+        self._attachments.refresh(blocks, filtered_indices, ordinal_map)
+        self._mode_bar.set_attachment_count(self._attachments.attachment_count())
+
+    def set_full_attachments(self, rows: list[Any]) -> None:
+        """Replace the (possibly sliced) attachments grid with a full
+        SQL-fetched list. Each ``row`` is a ``SessionAttachmentRow``
+        (duck-typed: needs ``ordinal``, ``item_id``, ``timestamp``,
+        ``attachment_index``, ``attachment``). Updates the count badge
+        to reflect the true session-wide total. Called by the host
+        after the lazy worker job comes back."""
+        rows_id = id(rows)
+        if self._full_attachments_rows_id == rows_id:
+            return
+        self._full_attachments_rows_id = rows_id
+        self._attachments.refresh_full(rows)
+        self._mode_bar.set_attachment_count(self._attachments.attachment_count())
+
+    def reset_full_attachments_request(self) -> None:
+        """Clear the ``already-requested`` flag so the popup will fire
+        ``fullAttachmentsRequested`` again on the next Attachments tab
+        click. Called by the host when the cached full list is
+        invalidated (e.g. session swap)."""
+        self._full_attachments_requested = False
+        self._full_attachments_rows_id = None
+
+    def _on_mode_changed(self, mode_id: int) -> None:
+        """Hook into the mode bar to fire ``fullAttachmentsRequested``
+        the first time the user opens the Attachments tab. Idempotent
+        per popup session — the host's cache handles repeat triggers."""
+        if mode_id != _TimeTravelModeBar.MODE_ATTACHMENTS:
+            return
+        if self._full_attachments_requested:
+            return
+        self._full_attachments_requested = True
+        self.fullAttachmentsRequested.emit()
 
     def preferred_height(self, host_height: int) -> int:
         """Recommended popup height for a given host SessionsPage height.
@@ -2623,6 +3559,14 @@ class SessionsPage(QWidget):
         self._detail_token = 0
         self._pending_detail_id: str | None = None
         self._active_session_id: str | None = None
+        # Targets we've already auto-triggered a rescan on. Prevents the
+        # empty-list auto-trigger from looping forever when codex_home
+        # genuinely has zero sessions for a target.
+        self._auto_rescanned_targets: set[CodexHomeTarget] = set()
+        # Most recent (done, total) from the streaming-rescan progress
+        # channel. Used by the count-label refresh so the textual indicator
+        # stays accurate while batches commit.
+        self._rescan_progress: tuple[int, int] | None = None
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(220)
@@ -2684,7 +3628,24 @@ class SessionsPage(QWidget):
 
     def reload_after_rescan(self) -> None:
         self._is_stale = False
+        # Rescan finished — clear any in-flight progress text.
+        self._rescan_progress = None
         self._refresh()
+
+    def apply_rescan_progress(self, done: int, total: int) -> None:
+        """Per-batch hook called by the host when the worker emits a
+        ``sessions-rescan-batch`` progress message. Triggers a lightweight
+        list refresh so newly-committed sessions appear without waiting
+        for the whole rescan to finish, and updates the count-label text
+        with progress."""
+        self._rescan_progress = (done, total)
+        # Pull the latest committed slice into the tree. Same async path
+        # as a normal refresh — the in-flight list_token guard handles
+        # rapid-fire batch messages.
+        if self._task_runner is not None:
+            self._request_refresh_async()
+        else:
+            self.refresh_list()
 
     def mark_stale(self) -> None:
         self._is_stale = True
@@ -2760,21 +3721,66 @@ class SessionsPage(QWidget):
         self._tree_model.set_records(records)
         self._restore_expansion(prior_expansion)
 
+        streaming = self._rescan_progress is not None
         if records:
-            first_index = self._first_session_index()
-            if first_index is not None:
-                self._tree.setCurrentIndex(first_index)
+            # Streaming-rescan batches arrive frequently — re-selecting
+            # first on each one would prevent the user from clicking
+            # already-loaded sessions while the scan finishes. For
+            # everything else (first load, target switch, search/status
+            # filter change) try to keep the previously-active session
+            # selected; fall back to the first row if it's been filtered
+            # out or removed.
+            if not streaming:
+                target_index: QModelIndex | None = None
+                if (
+                    self._active_session_id
+                    and self._active_session_id in self._records_by_id
+                ):
+                    target_index = self._find_session_index(
+                        QModelIndex(), self._active_session_id
+                    )
+                if target_index is None:
+                    target_index = self._first_session_index()
+                if target_index is not None:
+                    self._tree.setCurrentIndex(target_index)
         else:
             self._set_detail(None)
 
-        # Just the count — the env tabs above already show the active corpus,
+        # Count label: progress text during a streaming rescan, plain
+        # count otherwise. Env tabs above already show the active corpus,
         # so the previous "in Sandbox/Real" suffix was redundant.
-        self._set_record_count_text(
-            self._translator("{count} session(s)").format(count=len(records))
-        )
+        if streaming:
+            done, total = self._rescan_progress  # type: ignore[misc]
+            self._set_record_count_text(
+                self._translator("Indexing... {done} / {total}").format(
+                    done=done, total=total
+                )
+            )
+        else:
+            self._set_record_count_text(
+                self._translator("{count} session(s)").format(count=len(records))
+            )
         self._has_loaded = True
         self._is_stale = False
         self._show_list_overlay(False)
+
+        # Auto-trigger an initial rescan when the catalog DB is empty for
+        # this target — first install would otherwise greet the user with
+        # an empty list and no hint that they need to click Rescan.
+        # Gates: (1) streaming rescan not already running, (2) filters
+        # are at default — otherwise an empty result reflects a user-
+        # narrowed query, not an empty catalog, (3) target hasn't been
+        # auto-rescanned this session.
+        filters = self._current_filters()
+        unfiltered = filters.query is None and filters.status is None
+        if (
+            not records
+            and not streaming
+            and unfiltered
+            and target not in self._auto_rescanned_targets
+        ):
+            self._auto_rescanned_targets.add(target)
+            self.rescan_requested.emit(target)
 
     def _show_list_error(self, ex: Exception) -> None:
         self._set_record_count_text(
@@ -3241,6 +4247,9 @@ class SessionsPage(QWidget):
         )
         self._detail_panel.timeline_offset_requested.connect(
             self._request_timeline_offset_page
+        )
+        self._detail_panel.full_attachments_requested.connect(
+            self._request_full_session_attachments
         )
 
         self._splitter = QSplitter(Qt.Horizontal, self)
@@ -3781,6 +4790,47 @@ class SessionsPage(QWidget):
 
         self._task_runner(action, on_success, on_error)
 
+    def _request_full_session_attachments(self, session_id: str) -> None:
+        """Routes the panel's ``full_attachments_requested`` signal to a
+        worker job that calls ``manager.list_session_attachments(...)``.
+        Mirrors ``_request_time_travel_index`` — same task_runner /
+        sync-fallback / target-guard pattern, but additionally checks
+        that ``_target`` hasn't switched mid-flight: Sandbox and Real
+        roots can hold copies of the same session id, so a session-id-
+        only check would happily apply Sandbox rows on top of a Real
+        manager (or vice versa)."""
+        active_target = self._target
+        factory = self._sessions_manager_factory
+
+        def _deliver(rows: list[Any]) -> None:
+            if (
+                self._active_session_id != session_id
+                or self._target != active_target
+            ):
+                self._detail_panel.cancel_full_session_attachments_request(session_id)
+                return
+            self._detail_panel.set_full_session_attachments(session_id, rows)
+
+        if self._task_runner is None:
+            try:
+                rows = factory(active_target).list_session_attachments(session_id)
+            except Exception:
+                self._detail_panel.cancel_full_session_attachments_request(session_id)
+                return
+            _deliver(rows)
+            return
+
+        def action() -> list[Any]:
+            return factory(active_target).list_session_attachments(session_id)
+
+        def on_success(rows: list[Any]) -> None:
+            _deliver(rows)
+
+        def on_error(_ex: Exception) -> None:
+            self._detail_panel.cancel_full_session_attachments_request(session_id)
+
+        self._task_runner(action, on_success, on_error)
+
     def _request_timeline_offset_page(
         self,
         session_id: str,
@@ -3859,6 +4909,13 @@ class SessionsPage(QWidget):
         ):
             self._reposition_list_overlay()
             self._reposition_floating_actions()
+        if (
+            tree is not None
+            and obj is tree.viewport()
+            and event.type()
+            in (QEvent.MouseMove, QEvent.HoverMove, QEvent.Leave, QEvent.Wheel)
+        ):
+            tree.viewport().update()
         # Drive the deferred floating-bar show off the tree viewport's
         # first paintEvent after a page show — see ``showEvent`` for
         # the rationale.
@@ -4272,7 +5329,7 @@ class SessionsPage(QWidget):
         menu.exec(self._tree.viewport().mapToGlobal(pos))
 
 
-_WINDOW_SIZE = 120  # max blocks alive in the sliding window
+_WINDOW_SIZE = 48  # max blocks alive in the sliding window
 _WINDOW_HALF = _WINDOW_SIZE // 2  # offset used when recentering on a focus block
 _RECENTER_THRESHOLD = _WINDOW_SIZE // 4  # natural-scroll drift before recenter
 _EDGE_TRIGGER_RATIO = 0.18  # scroll within this fraction of an edge → slide
@@ -4284,6 +5341,8 @@ _PREPEND_RENDER_CHUNK_BLOCKS = _WINDOW_HALF
 _PREPEND_RENDER_CHUNK_DELAY_MS = 1
 _PREPEND_ANCHOR_SETTLE_PASSES = 3
 _PREPEND_ANCHOR_SCROLL_TOLERANCE = 2
+_JUMP_ANCHOR_SETTLE_PASSES = 4
+_JUMP_ANCHOR_SETTLE_DELAY_MS = 16
 _PREPEND_HEADROOM_BLOCKS = _WINDOW_SIZE // 4
 _PAGING_MINIMAP_REFRESH_DELAY_MS = 80
 _PAGING_INPUT_QUARANTINE_MS = 160
@@ -4371,7 +5430,7 @@ class _SessionDetailPanel(QFrame):
     # rows after the user scrolls past the loaded edge. Mirrors
     # DEFAULT_TIMELINE_PAGE_SIZE on the parser side; kept inline so the
     # panel doesn't need to depend on the parser module.
-    _OLDER_PAGE_SIZE = 200
+    _OLDER_PAGE_SIZE = 64
 
     # Emitted when the user reaches the loaded edge and there's still
     # older history in the repository to fetch. SessionsPage routes this
@@ -4381,6 +5440,11 @@ class _SessionDetailPanel(QFrame):
     newer_history_requested = Signal(str, int, int)
     time_travel_index_requested = Signal(str)
     timeline_offset_requested = Signal(str, int, int, int, str)
+    # Lazy SQL fetch of every attachment in the session — fired the
+    # first time the user opens the Time Travel Attachments tab. The
+    # SessionsPage routes this through its task_runner and feeds the
+    # result back via ``set_full_session_attachments``. Arg: session_id.
+    full_attachments_requested = Signal(str)
 
     def __init__(self, translator: Callable[[str], str], parent: QWidget | None = None):
         super().__init__(parent)
@@ -4484,6 +5548,20 @@ class _SessionDetailPanel(QFrame):
         # as Optional so the panel can dispose it on session-switch without
         # leaking a stale top-level window into the next session.
         self._time_travel_popup: _TimeTravelPopup | None = None
+        # Cache of full session-wide attachment lists, keyed by session
+        # id. Populated lazily on the first Attachments-tab click via a
+        # SQL fetch on a worker thread; survives popup dismiss/reopen
+        # (the popup itself is recreated each time but the cache lets
+        # us skip the SQL round-trip). Invalidated on session swap.
+        self._full_attachments_cache: dict[str, list[Any]] = {}
+        # In-flight session ids — guards against firing the worker
+        # twice if the user rapidly toggles the Attachments tab while
+        # the first fetch is still pending.
+        self._full_attachments_pending: set[str] = set()
+        self._time_travel_ordinal_map_cache_key: tuple[
+            int | None, int, tuple[str, ...]
+        ] | None = None
+        self._time_travel_ordinal_map_cache: dict[str, int] = {}
         self._export_popup = _SessionsExportPopup(self)
         self._export_popup.setStyleSheet(_DETAIL_PANEL_QSS)
         self._export_popup.dismiss_requested.connect(self._dismiss_export_popup)
@@ -4503,7 +5581,7 @@ class _SessionDetailPanel(QFrame):
         # Timeline body: scroll area + navigator rail side by side.
         body_row = QHBoxLayout()
         body_row.setContentsMargins(0, 0, 0, 0)
-        body_row.setSpacing(6)
+        body_row.setSpacing(0)
 
         self._timeline_scroll = QScrollArea(self)
         self._timeline_scroll.setObjectName("SessionsDetailTimelineScroll")
@@ -4562,6 +5640,7 @@ class _SessionDetailPanel(QFrame):
         self._scroll_jump_window_filter_installed = False
 
         self._navigator = _TimelineNavigatorRail(self)
+        self._navigator.installEventFilter(self)
         self._navigator.scroll_value_requested.connect(
             self._set_scrollbar_value_from_minimap
         )
@@ -4574,6 +5653,7 @@ class _SessionDetailPanel(QFrame):
         scrollbar.valueChanged.connect(self._update_scroll_jump_buttons)
         scrollbar.rangeChanged.connect(
             lambda _min, _max: (
+                self._refresh_visible_image_previews(),
                 self._schedule_minimap_refresh(),
                 self._update_scroll_jump_buttons(),
             )
@@ -5082,6 +6162,9 @@ class _SessionDetailPanel(QFrame):
             self._time_travel_popup.offsetJumpRequested.connect(
                 self._on_time_travel_offset_jump
             )
+            self._time_travel_popup.fullAttachmentsRequested.connect(
+                self._on_full_attachments_requested
+            )
         self._push_time_travel_data()
         self._ensure_time_travel_index()
         self._position_time_travel_popup()
@@ -5097,10 +6180,7 @@ class _SessionDetailPanel(QFrame):
         rapid-browsing until they ESC or click outside."""
         if not (0 <= block_index < len(self._all_blocks)):
             return
-        self._recenter_async(
-            block_index,
-            on_anchor=lambda b=block_index: self._scroll_to_block_center(b),
-        )
+        self._recenter_async(block_index)
         # The async rebuild's overlay spinner can briefly steal focus from
         # the popup, which would trigger DISMISS_ON_DEACTIVATE — re-arm
         # the popup as the active window so it stays put.
@@ -5134,12 +6214,95 @@ class _SessionDetailPanel(QFrame):
             item_id or "",
         )
 
+    def _on_full_attachments_requested(self) -> None:
+        """Triggered by the popup the first time the user opens the
+        Attachments tab. Pushes a cached result if we already have one;
+        otherwise emits ``full_attachments_requested`` so the
+        SessionsPage worker can do the SQL fetch.
+
+        No-op when no session is loaded — defensive against signal
+        timing edge cases (popup still alive across set_detail(None))."""
+        session_id = self._loaded_session_id
+        if not session_id:
+            return
+        cached = self._full_attachments_cache.get(session_id)
+        if cached is not None:
+            self._apply_full_attachments(session_id, cached)
+            return
+        if session_id in self._full_attachments_pending:
+            return
+        self._full_attachments_pending.add(session_id)
+        self.full_attachments_requested.emit(session_id)
+
+    def set_full_session_attachments(
+        self,
+        session_id: str,
+        rows: list[Any],
+    ) -> None:
+        """Receive the SQL-fetched attachment list from the host worker.
+        Caches it (so repeated tab clicks reuse the data) and pushes it
+        into the popup if still open. Drops stale results that arrive
+        after a session swap."""
+        self._full_attachments_pending.discard(session_id)
+        if session_id != self._loaded_session_id:
+            return
+        cached_rows = list(rows)
+        self._full_attachments_cache[session_id] = cached_rows
+        self._apply_full_attachments(session_id, cached_rows)
+
+    def cancel_full_session_attachments_request(self, session_id: str) -> None:
+        """Drop the in-flight marker so a future tab click can re-fire.
+        Called when the worker errored out or the session changed."""
+        self._full_attachments_pending.discard(session_id)
+        if self._time_travel_popup is not None:
+            self._time_travel_popup.reset_full_attachments_request()
+
+    def _apply_full_attachments(
+        self, session_id: str, rows: list[Any]
+    ) -> None:
+        """Internal: push a (cached or fresh) full attachment list into
+        the open popup. No-op if the popup has been dismissed or the
+        session no longer matches."""
+        if session_id != self._loaded_session_id:
+            return
+        if self._time_travel_popup is None:
+            return
+        self._time_travel_popup.set_full_attachments(rows)
+
     def _push_time_travel_data(self) -> None:
         """Snapshot the current panel state into the popup. Invoked on
         open and after every ``_refresh_minimap_impl`` so the rendered
-        window indicator stays in sync."""
+        window indicator stays in sync.
+
+        Attachments are always sourced from the materialized
+        ``_all_blocks`` (independent of the messages-list data path)
+        because the lightweight global timeline index strips attachment
+        payloads — without this, every huge session would render
+        ``Attachments (0)`` in the popup."""
         if self._time_travel_popup is None:
             return
+        # Push attachments first so the mode-bar count is correct even
+        # when the early-return below skips ``set_data``. Prefer the
+        # cached full SQL list when we have one — otherwise a later
+        # `_push_time_travel_data` (minimap refresh, time-travel-index
+        # callback, etc.) would silently revert the popup back to the
+        # sliced view and the user would see the count drop. The
+        # popup's own ``_full_attachments_requested`` flag stays True
+        # after the initial fetch, so without this re-apply path the
+        # user has to dismiss and reopen the popup to recover.
+        session_id = self._loaded_session_id
+        cached_full = (
+            self._full_attachments_cache.get(session_id) if session_id else None
+        )
+        if cached_full is not None:
+            self._time_travel_popup.set_full_attachments(cached_full)
+        else:
+            ordinal_map = self._build_time_travel_ordinal_map()
+            self._time_travel_popup.set_attachments(
+                self._all_blocks,
+                self._filtered_block_indices,
+                ordinal_map,
+            )
         if self._time_travel_index_items and self._needs_time_travel_index():
             self._time_travel_popup.set_index_data(
                 self._time_travel_index_items,
@@ -5151,8 +6314,49 @@ class _SessionDetailPanel(QFrame):
             self._filtered_block_indices,
             self._window_start,
             self._window_end,
-            self._current_user_block,
+            self._current_navigation_block(),
         )
+
+    def _build_time_travel_ordinal_map(self) -> dict[str, int]:
+        """Map every loaded timeline-item ID to its global 0-based
+        ordinal so the attachments grid can render the same ``#N``
+        labels as the messages tab — the lightweight index ordinals
+        when available, else computed from ``_loaded_offset +
+        position_in_all_timeline_items``.
+
+        Returns an empty dict when neither source is populated; the
+        delegate then falls back to the local block index."""
+        loaded_ids = tuple(
+            item_id
+            for item in self._all_timeline_items
+            if isinstance((item_id := getattr(item, "id", None)), str) and item_id
+        )
+        if self._time_travel_index_items:
+            cache_key = (id(self._time_travel_index_items), self._loaded_offset, loaded_ids)
+            if cache_key == self._time_travel_ordinal_map_cache_key:
+                return self._time_travel_ordinal_map_cache
+            needed = set(loaded_ids)
+            ordinal_map: dict[str, int] = {}
+            if needed:
+                for item in self._time_travel_index_items:
+                    if item.item_id in needed:
+                        ordinal_map[item.item_id] = item.ordinal
+                        if len(ordinal_map) >= len(needed):
+                            break
+            self._time_travel_ordinal_map_cache_key = cache_key
+            self._time_travel_ordinal_map_cache = ordinal_map
+            return ordinal_map
+        ordinal_map: dict[str, int] = {}
+        base = self._loaded_offset
+        for position, item in enumerate(self._all_timeline_items):
+            item_id = getattr(item, "id", None)
+            if isinstance(item_id, str) and item_id:
+                ordinal_map[item_id] = base + position
+        return ordinal_map
+
+    def _clear_time_travel_ordinal_map_cache(self) -> None:
+        self._time_travel_ordinal_map_cache_key = None
+        self._time_travel_ordinal_map_cache = {}
 
     def _needs_time_travel_index(self) -> bool:
         return bool(
@@ -5179,6 +6383,7 @@ class _SessionDetailPanel(QFrame):
             return
         self._time_travel_index_pending = False
         self._time_travel_index_items = list(items)
+        self._clear_time_travel_ordinal_map_cache()
         if self._time_travel_popup is not None:
             self._push_time_travel_data()
 
@@ -5422,6 +6627,8 @@ class _SessionDetailPanel(QFrame):
             self._reposition_timeline_overlay()
             self._reposition_scroll_jump_buttons()
             self._schedule_minimap_refresh()
+        if et == QEvent.Wheel and obj is self._navigator:
+            return self._handle_timeline_navigator_wheel(event)
         if et == QEvent.Wheel and self._is_timeline_event_source(obj):
             if self._should_consume_timeline_wheel(event):
                 return True
@@ -5494,6 +6701,7 @@ class _SessionDetailPanel(QFrame):
             self._timeline_scroll,
             self._timeline_scroll.viewport(),
             self._timeline_container,
+            self._navigator,
         ):
             return True
         if not isinstance(obj, QWidget):
@@ -5560,6 +6768,7 @@ class _SessionDetailPanel(QFrame):
             self._timeline_scroll,
             self._timeline_scroll.viewport(),
             self._timeline_container,
+            self._navigator,
         }
         targets.update(self._timeline_container.findChildren(QWidget))
         targets.update(self._timeline_scroll.viewport().findChildren(QWidget))
@@ -5619,6 +6828,64 @@ class _SessionDetailPanel(QFrame):
             return True
         return False
 
+    def _handle_timeline_navigator_wheel(self, event) -> bool:
+        if self._should_consume_timeline_wheel(event):
+            self._accept_event(event)
+            return True
+        if self._handle_timeline_edge_wheel(event):
+            self._accept_event(event)
+            return True
+        if self._scroll_timeline_from_wheel(event):
+            self._accept_event(event)
+            return True
+        return False
+
+    def _scroll_timeline_from_wheel(self, event) -> bool:
+        distance = self._wheel_scroll_distance(event)
+        if distance == 0:
+            return False
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        target = scrollbar.value() - distance
+        target = max(scrollbar.minimum(), min(target, scrollbar.maximum()))
+        scrollbar.setValue(target)
+        return True
+
+    @staticmethod
+    def _accept_event(event) -> None:
+        accept = getattr(event, "accept", None)
+        if callable(accept):
+            accept()
+
+    @staticmethod
+    def _wheel_scroll_distance(event) -> int:
+        pixel_getter = getattr(event, "pixelDelta", None)
+        if callable(pixel_getter):
+            pixel_delta = pixel_getter()
+            y_getter = getattr(pixel_delta, "y", None)
+            if callable(y_getter):
+                value = int(y_getter())
+                if value:
+                    return value
+
+        angle_delta = 0
+        angle_getter = getattr(event, "angleDelta", None)
+        if callable(angle_getter):
+            delta = angle_getter()
+            y_getter = getattr(delta, "y", None)
+            if callable(y_getter):
+                angle_delta = int(y_getter())
+        if angle_delta == 0:
+            return 0
+
+        single_step = 20
+        app_scroll_lines = getattr(QApplication, "wheelScrollLines", None)
+        if callable(app_scroll_lines):
+            single_step *= max(1, int(app_scroll_lines()))
+        distance = int(round((float(angle_delta) / 120.0) * float(single_step)))
+        if distance == 0:
+            return 1 if angle_delta > 0 else -1
+        return distance
+
     @staticmethod
     def _wheel_delta_y(event) -> int:
         for name in ("angleDelta", "pixelDelta"):
@@ -5639,6 +6906,7 @@ class _SessionDetailPanel(QFrame):
     # ---- floating jump-to-top / jump-to-bottom buttons --------------------
 
     _SCROLL_JUMP_MARGIN = 10
+    _SCROLL_JUMP_RAIL_GAP = 6
     _SCROLL_JUMP_GAP = 6
     # Don't show the buttons unless the user has actually scrolled at least
     # this many pixels from the boundary. This keeps the buttons out of the
@@ -5650,16 +6918,26 @@ class _SessionDetailPanel(QFrame):
         if viewport is None:
             return
         # Buttons are top-level Qt.Tool windows, so positioning uses global
-        # screen coordinates. We anchor at the viewport's bottom-right
-        # corner: top button above bottom button, both pulled off the edge
-        # by _SCROLL_JUMP_MARGIN so they don't collide with the scrollbar.
+        # screen coordinates. Anchor them just left of the visible minimap
+        # rail, using the rail's transparent left pad as breathing room.
         global_origin = viewport.mapToGlobal(QPoint(0, 0))
-        right_x = (
+        viewport_right_x = (
             global_origin.x()
             + viewport.width()
             - self._SCROLL_JUMP_MARGIN
             - self._scroll_bottom_btn.width()
         )
+        right_x = viewport_right_x
+        if self._navigator is not None:
+            visual_left = self._navigator.mapToGlobal(
+                QPoint(int(round(self._navigator._visual_left())), 0)
+            ).x()
+            rail_anchor_x = (
+                visual_left
+                - self._SCROLL_JUMP_RAIL_GAP
+                - self._scroll_bottom_btn.width()
+            )
+            right_x = max(viewport_right_x, rail_anchor_x)
         bottom_btn_y = (
             global_origin.y()
             + viewport.height()
@@ -5761,6 +7039,11 @@ class _SessionDetailPanel(QFrame):
         # against the new (briefly empty) state can show stale data
         # before the new session lands.
         self._dismiss_time_travel_popup()
+        # Drop any cached full-attachments lists from previous sessions.
+        # Each entry can hold MBs of base64 image data; survives popup
+        # close/reopen within the same session, but not session swaps.
+        self._full_attachments_cache.clear()
+        self._full_attachments_pending.clear()
         self._clear_timeline()
         if detail is None:
             self._all_blocks = []
@@ -5777,6 +7060,7 @@ class _SessionDetailPanel(QFrame):
             self._time_travel_index_pending = False
             self._loading_newer = False
             self._loaded_session_id = None
+            self._clear_time_travel_ordinal_map_cache()
             self._timeline_status.setText("")
             self._set_audit_text("")
             self._clear_minimap()
@@ -5792,6 +7076,7 @@ class _SessionDetailPanel(QFrame):
         self._time_travel_index_pending = False
         self._loading_newer = False
         self._loaded_session_id = detail.record.id
+        self._clear_time_travel_ordinal_map_cache()
         # Keep user anchors for current-section detection; the minimap itself
         # is driven from every materialized block's widget geometry.
         self._user_anchor_blocks = [
@@ -5845,6 +7130,8 @@ class _SessionDetailPanel(QFrame):
         # Same reason as set_detail: don't leak the popup pointing at the
         # previous session's blocks across a panel reset.
         self._dismiss_time_travel_popup()
+        self._full_attachments_cache.clear()
+        self._full_attachments_pending.clear()
         self._all_blocks = []
         self._all_timeline_items = []
         self._user_anchor_blocks = []
@@ -5857,6 +7144,7 @@ class _SessionDetailPanel(QFrame):
         self._time_travel_index_items = []
         self._time_travel_index_pending = False
         self._loaded_session_id = None
+        self._clear_time_travel_ordinal_map_cache()
         self._clear_timeline()
         self._timeline_status.setText("")
         self._set_audit_text("")
@@ -6117,6 +7405,7 @@ class _SessionDetailPanel(QFrame):
                     self._timeline_layout.insertWidget(
                         self._timeline_layout.count() - 1, widget
                     )
+        QTimer.singleShot(0, self._refresh_visible_image_previews)
         return added_height
 
     def _build_window_widget(self, block_index: int) -> QWidget | None:
@@ -6248,6 +7537,7 @@ class _SessionDetailPanel(QFrame):
                 continue
             widget.hide()
             widget.deleteLater()
+        QTimer.singleShot(0, self._refresh_visible_image_previews)
 
     def _drop_widgets_at(self, layout_indexes: list[int]) -> int:
         """Delete the widgets at the given layout indexes (descending order
@@ -7066,8 +8356,48 @@ class _SessionDetailPanel(QFrame):
                 return getattr(payload, "id", None)
         return None
 
+    def _current_navigation_block(self) -> int | None:
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        viewport = self._timeline_scroll.viewport()
+        viewport_h = viewport.height() if viewport is not None else 0
+        if viewport_h <= 0:
+            return self._current_user_block
+        viewport_top = scrollbar.value()
+        center_y = viewport_top + viewport_h // 2
+        top_visible_block: int | None = None
+        previous_block: int | None = None
+        for layout_index in range(self._timeline_layout.count() - 1):
+            item = self._timeline_layout.itemAt(layout_index)
+            widget = item.widget() if item is not None else None
+            if widget is None or widget.isHidden():
+                continue
+            block_index = widget.property("blockIndex")
+            if not isinstance(block_index, int):
+                continue
+            if not (0 <= block_index < len(self._all_blocks)):
+                continue
+            top = widget.y()
+            bottom = top + max(1, widget.height())
+            if top_visible_block is None and bottom > viewport_top:
+                top_visible_block = block_index
+            if top <= center_y < bottom:
+                return block_index
+            if top > center_y:
+                return previous_block or top_visible_block or block_index
+            previous_block = block_index
+        return top_visible_block or previous_block or self._current_user_block
+
+    def _current_navigation_anchor_id(self) -> str | None:
+        block_index = self._current_navigation_block()
+        if block_index is None:
+            return self._current_user_anchor_id()
+        ids = self._item_ids_for_block(block_index)
+        if ids:
+            return ids[0]
+        return self._current_user_anchor_id()
+
     def _current_timeline_offset(self) -> int | None:
-        anchor_id = self._current_user_anchor_id()
+        anchor_id = self._current_navigation_anchor_id()
         if anchor_id:
             for index, item in enumerate(self._all_timeline_items):
                 if item.id == anchor_id:
@@ -7085,10 +8415,41 @@ class _SessionDetailPanel(QFrame):
     # --------------------------------------------------------- scroll/anchor
 
     def _on_scroll_changed(self, _value: int) -> None:
+        self._refresh_visible_image_previews()
+        self._sync_minimap_scroll_state()
         self._schedule_minimap_refresh()
         if self._timeline_scroll_locked():
             return
         self._scroll_throttle.start()
+
+    def _sync_minimap_scroll_state(self) -> None:
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        self._navigator.set_scroll_state(
+            scroll_value=scrollbar.value(),
+            viewport_height=self._timeline_scroll.viewport().height(),
+            scroll_maximum=scrollbar.maximum(),
+        )
+
+    def _refresh_visible_image_previews(self) -> None:
+        viewport = self._timeline_scroll.viewport()
+        viewport_h = viewport.height()
+        if viewport_h <= 0:
+            return
+        scrollbar = self._timeline_scroll.verticalScrollBar()
+        preload = max(120, viewport_h // 2)
+        active_rect = QRect(
+            0,
+            max(0, scrollbar.value() - preload),
+            max(1, viewport.width()),
+            viewport_h + preload * 2,
+        )
+        for card in self._timeline_container.findChildren(_ImageCard):
+            if not card.isVisible():
+                card.set_preview_active(False)
+                continue
+            top_left = card.mapTo(self._timeline_container, QPoint(0, 0))
+            card_rect = QRect(top_left, card.size())
+            card.set_preview_active(card_rect.intersects(active_rect))
 
     def _schedule_minimap_refresh(self, delay_ms: int = 16) -> None:
         if not self._minimap_refresh_timer.isActive():
@@ -7185,8 +8546,6 @@ class _SessionDetailPanel(QFrame):
     def _recenter_async(
         self,
         focus_block: int,
-        *,
-        on_anchor: Callable[[], None],
     ) -> None:
         """Defer the heavy widget rebuild to the next event-loop tick so the
         UI can paint a "Loading..." overlay first. The user's click feels
@@ -7221,17 +8580,24 @@ class _SessionDetailPanel(QFrame):
                 on_done=lambda: QTimer.singleShot(0, _do_anchor),
             )
 
-        def _do_anchor() -> None:
+        def _release_after_anchor() -> None:
             if token != self._render_token:
                 return
-            try:
-                on_anchor()
-            finally:
-                self._finish_paging_scroll_transaction()
-                self._suppress_edge_slide = False
+            self._finish_paging_scroll_transaction()
+            self._suppress_edge_slide = False
             self._hide_timeline_overlay()
             self._refresh_status_label()
             self._refresh_minimap()
+
+        def _do_anchor() -> None:
+            if token != self._render_token:
+                return
+            self._suppress_edge_slide = True
+            self._settle_block_center(
+                focus_block,
+                token=token,
+                on_done=_release_after_anchor,
+            )
 
         QTimer.singleShot(0, _do_rebuild)
 
@@ -7381,12 +8747,18 @@ class _SessionDetailPanel(QFrame):
         finally:
             self._suppress_edge_slide = False
         self._scroll_throttle.start()
-        self._refresh_minimap()
+        self._sync_minimap_scroll_state()
+        self._schedule_minimap_refresh()
 
-    def _scroll_to_block_center(self, block_index: int) -> None:
+    def _scroll_to_block_center(
+        self,
+        block_index: int,
+        *,
+        keep_suppressed: bool = False,
+    ) -> bool:
         widget = self._find_widget_for_block(block_index)
         if widget is None:
-            return
+            return False
         self._timeline_container.layout().activate()
         scrollbar = self._timeline_scroll.verticalScrollBar()
         viewport_h = self._timeline_scroll.viewport().height()
@@ -7395,9 +8767,63 @@ class _SessionDetailPanel(QFrame):
         target = max(0, min(target, scrollbar.maximum()))
         self._suppress_edge_slide = True
         scrollbar.setValue(target)
-        self._suppress_edge_slide = False
+        if not keep_suppressed:
+            self._suppress_edge_slide = False
         self._refresh_status_label()
-        self._refresh_minimap()
+        self._sync_minimap_scroll_state()
+        self._schedule_minimap_refresh()
+        return True
+
+    def _settle_block_center(
+        self,
+        block_index: int,
+        *,
+        token: int,
+        on_done: Callable[[], None],
+        remaining_passes: int = _JUMP_ANCHOR_SETTLE_PASSES,
+    ) -> None:
+        if token != self._render_token:
+            return
+        try:
+            self._scroll_to_block_center(block_index, keep_suppressed=True)
+        finally:
+            if remaining_passes > 1:
+                QTimer.singleShot(
+                    _JUMP_ANCHOR_SETTLE_DELAY_MS,
+                    lambda b=block_index,
+                    t=token,
+                    cb=on_done,
+                    p=remaining_passes - 1: self._settle_block_center(
+                        b,
+                        token=t,
+                        on_done=cb,
+                        remaining_passes=p,
+                    ),
+                )
+                return
+            on_done()
+
+    def _scroll_to_block_center_and_release(
+        self, block_index: int, *, token: int
+    ) -> None:
+        if token != self._render_token:
+            return
+
+        def _release_after_center() -> None:
+            if token != self._render_token:
+                return
+            self._finish_paging_scroll_transaction()
+            self._suppress_edge_slide = False
+            self._refresh_status_label()
+            self._refresh_minimap()
+            self._hide_timeline_overlay()
+            self._refresh_count_label()
+
+        self._settle_block_center(
+            block_index,
+            token=token,
+            on_done=_release_after_center,
+        )
 
     def _scroll_to_block_center_and_release(
         self, block_index: int, *, token: int
@@ -7501,8 +8927,11 @@ class _TimelineNavigatorRail(QFrame):
 
     scroll_value_requested = Signal(int)
 
-    _RAIL_WIDTH = 22
+    _VISUAL_WIDTH = 22
+    _LEFT_INTERACTION_PAD = 18
+    _RAIL_WIDTH = _VISUAL_WIDTH + _LEFT_INTERACTION_PAD
     _HIT_PAD = 3
+    _DRAG_SUSPENSION_TIMEOUT_MS = 1000
     # Tooltip-only wider hit pad for user-prompt markers — hovering near
     # (not just on) a user marker still surfaces its prompt preview.
     # Click/drag scroll deliberately keeps the regular _HIT_PAD so the
@@ -7516,6 +8945,7 @@ class _TimelineNavigatorRail(QFrame):
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setMouseTracking(True)
         self._markers: list[_MinimapMarker] = []
+        self._marker_rect_cache: list[tuple[int, _MinimapMarker, QRectF]] | None = None
         self._content_height = 1
         self._scroll_value = 0
         self._viewport_height = 0
@@ -7523,6 +8953,11 @@ class _TimelineNavigatorRail(QFrame):
         self._hover_marker_index: int | None = None
         self._dragging = False
         self._drag_suspended_until_release = False
+        self._drag_suspension_timer = QTimer(self)
+        self._drag_suspension_timer.setSingleShot(True)
+        self._drag_suspension_timer.timeout.connect(
+            self._resume_suspended_drag_after_timeout
+        )
 
     def set_viewport(
         self,
@@ -7539,6 +8974,36 @@ class _TimelineNavigatorRail(QFrame):
         self._viewport_height = max(0, int(viewport_height))
         self._scroll_maximum = max(0, int(scroll_maximum))
         self._hover_marker_index = None
+        self._marker_rect_cache = None
+        self.update()
+
+    def set_scroll_state(
+        self,
+        *,
+        scroll_value: int,
+        viewport_height: int,
+        scroll_maximum: int,
+    ) -> None:
+        """Update only the viewport thumb state.
+
+        Dragging the minimap and normal wheel scrolling can fire dozens of
+        valueChanged signals per second. Marker geometry is unchanged during
+        those frames, so the panel can update the rail thumb immediately and
+        defer the expensive widget-geometry scan to the coalesced minimap
+        refresh timer.
+        """
+        new_scroll = max(0, int(scroll_value))
+        new_viewport = max(0, int(viewport_height))
+        new_maximum = max(0, int(scroll_maximum))
+        if (
+            new_scroll == self._scroll_value
+            and new_viewport == self._viewport_height
+            and new_maximum == self._scroll_maximum
+        ):
+            return
+        self._scroll_value = new_scroll
+        self._viewport_height = new_viewport
+        self._scroll_maximum = new_maximum
         self.update()
 
     def suspend_drag_until_release(self) -> None:
@@ -7547,28 +9012,64 @@ class _TimelineNavigatorRail(QFrame):
         The rail's coordinate system changes when the timeline window is
         rebuilt. Continuing to emit move events from the old mouse-down
         gesture would reinterpret the same cursor position against a new
-        scroll range and can immediately page again. The next mouse press
-        starts a fresh gesture in the updated coordinates.
+        scroll range and can immediately page again. Release still ends the
+        gesture immediately; if the user keeps holding the button, a short
+        timeout resumes the drag against the updated coordinates.
         """
-        if self._dragging:
-            self._drag_suspended_until_release = True
+        if not self._dragging:
+            self._drag_suspension_timer.stop()
+            self._drag_suspended_until_release = False
+            return
+        self._drag_suspended_until_release = True
+        self._drag_suspension_timer.start(self._DRAG_SUSPENSION_TIMEOUT_MS)
+
+    def _resume_suspended_drag_after_timeout(self) -> None:
+        if not self._dragging:
+            self._drag_suspended_until_release = False
+            return
+        if not self._drag_suspended_until_release:
+            return
+        if not (QGuiApplication.mouseButtons() & Qt.LeftButton):
+            self._dragging = False
+            self._drag_suspended_until_release = False
+            return
+        self._drag_suspended_until_release = False
+        global_pos = QCursor.pos()
+        y = self.mapFromGlobal(global_pos).y()
+        self.scroll_value_requested.emit(self._target_value_for_y(y))
+        self._update_hover_tooltip(y, None, global_pos=global_pos)
 
     def _scale(self) -> float:
         return float(max(self.height(), 1)) / float(max(self._content_height, 1))
 
+    def _visual_left(self) -> float:
+        return float(max(0, self.width() - self._VISUAL_WIDTH))
+
+    def _visual_width(self) -> float:
+        return float(min(max(self.width(), 1), self._VISUAL_WIDTH))
+
     def _marker_rects(self) -> list[tuple[int, _MinimapMarker, QRectF]]:
+        if self._marker_rect_cache is not None:
+            return self._marker_rect_cache
         scale = self._scale()
         rail_h = float(max(self.height(), 1))
         cap_h = max(2.0, rail_h * 0.05)
-        marker_w = max(4.0, float(self.width() - 12))
-        x = (float(self.width()) - marker_w) / 2.0
+        visual_left = self._visual_left()
+        visual_width = self._visual_width()
+        marker_w = max(4.0, visual_width - 12.0)
+        x = visual_left + (visual_width - marker_w) / 2.0
         rects: list[tuple[int, _MinimapMarker, QRectF]] = []
         for i, marker in enumerate(self._markers):
             marker_h = min(max(2.0, float(marker.height) * scale), cap_h)
             y = float(marker.y) * scale
             y = max(0.0, min(y, rail_h - marker_h))
             rects.append((i, marker, QRectF(x, y, marker_w, marker_h)))
+        self._marker_rect_cache = rects
         return rects
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._marker_rect_cache = None
+        return super().resizeEvent(event)
 
     def _thumb_rect(self) -> QRectF:
         if self._viewport_height <= 0:
@@ -7577,10 +9078,17 @@ class _TimelineNavigatorRail(QFrame):
         rail_h = float(max(self.height(), 0))
         if rail_h <= 0:
             return QRectF()
+        visual_left = self._visual_left()
+        visual_width = self._visual_width()
         thumb_h = min(rail_h, float(self._viewport_height) * scale)
         thumb_y = float(self._scroll_value) * scale
         thumb_y = max(0.0, min(thumb_y, rail_h - thumb_h))
-        return QRectF(2.0, thumb_y, max(4.0, float(self.width() - 4)), thumb_h)
+        return QRectF(
+            visual_left + 2.0,
+            thumb_y,
+            max(4.0, visual_width - 4.0),
+            thumb_h,
+        )
 
     def _target_value_for_y(self, y: int) -> int:
         scale = self._scale()
@@ -7593,7 +9101,7 @@ class _TimelineNavigatorRail(QFrame):
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.Antialiasing)
-            cx = self.width() // 2
+            cx = int(round(self._visual_left() + self._visual_width() / 2.0))
 
             # Low-contrast spine keeps the rail visible without competing
             # with the active viewport thumb.
@@ -7669,6 +9177,7 @@ class _TimelineNavigatorRail(QFrame):
     def mousePressEvent(self, event):  # noqa: N802 - Qt naming
         if event.button() != Qt.LeftButton:
             return super().mousePressEvent(event)
+        self._drag_suspension_timer.stop()
         self._dragging = True
         self._drag_suspended_until_release = False
         y = event.position().toPoint().y()
@@ -7687,6 +9196,7 @@ class _TimelineNavigatorRail(QFrame):
     def mouseReleaseEvent(self, event):  # noqa: N802 - Qt naming
         if event.button() != Qt.LeftButton:
             return super().mouseReleaseEvent(event)
+        self._drag_suspension_timer.stop()
         self._dragging = False
         self._drag_suspended_until_release = False
         self._update_hover_tooltip(event.position().toPoint().y(), event)
@@ -7698,7 +9208,9 @@ class _TimelineNavigatorRail(QFrame):
         QToolTip.hideText()
         return super().leaveEvent(event)
 
-    def _update_hover_tooltip(self, y: int, event) -> None:
+    def _update_hover_tooltip(
+        self, y: int, event, *, global_pos: QPoint | None = None
+    ) -> None:
         # Tooltip-only assist for user prompts: probe with the wider
         # _USER_HIT_PAD first so hovering near (not just on) a user
         # marker still surfaces its preview. This is the only place the
@@ -7727,7 +9239,10 @@ class _TimelineNavigatorRail(QFrame):
         if marker.kind == "user":
             label = marker.label
             self.setToolTip(label)
-            QToolTip.showText(event.globalPosition().toPoint(), label, self)
+            if global_pos is None and event is not None:
+                global_pos = event.globalPosition().toPoint()
+            if global_pos is not None:
+                QToolTip.showText(global_pos, label, self)
         else:
             self.setToolTip("")
             QToolTip.hideText()
@@ -9297,6 +10812,7 @@ _MAX_IMAGE_DECODED_BYTES = 16 * 1024 * 1024
 # already capped to the timeline width; this further constrains image
 # pixmaps so a large screenshot doesn't dominate the message column.
 _IMAGE_CARD_MAX_WIDTH = 480
+_IMAGE_CARD_MAX_HEIGHT = 360
 # Markdown image syntax. We extract these into the same attachment channel
 # so MD-attached screenshots get the same card chrome as Codex-payload
 # images. ``http(s)://`` sources are left in the text so Qt can fetch and
@@ -9325,31 +10841,10 @@ def _decode_data_uri(data_uri: str) -> QImage | None:
     decode, the decoded byte count exceeds the safety cap, or Qt declines
     to load the bytes (unsupported MIME / corrupt header).
     """
-    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+    decoded = _decode_data_uri_to_bytes(data_uri)
+    if decoded is None:
         return None
-    comma = data_uri.find(",")
-    if comma < 0:
-        return None
-    payload = data_uri[comma + 1 :]
-    # ``base64.b64decode`` is forgiving with whitespace but will raise on
-    # invalid padding/characters; treat any failure as a decode miss so the
-    # caller can swap in the failure placeholder.
-    try:
-        encoded = payload.encode("ascii", errors="ignore")
-        # Cheap pre-check: a base64 string of length L decodes to ~3*L/4
-        # bytes. Bail before the expensive decode if the upper bound
-        # already breaches the cap.
-        if len(encoded) // 4 * 3 > _MAX_IMAGE_DECODED_BYTES:
-            return None
-        decoded = base64.b64decode(encoded, validate=False)
-    except (binascii.Error, ValueError):
-        return None
-    if len(decoded) > _MAX_IMAGE_DECODED_BYTES:
-        return None
-    image = QImage()
-    if not image.loadFromData(decoded):
-        return None
-    return image
+    return _load_image_bytes(decoded)
 
 
 def _extract_markdown_attachments(
@@ -9450,6 +10945,72 @@ def _load_attachment_image(attachment: Attachment) -> QImage | None:
         except (OSError, ValueError):
             return None
     return None
+
+
+def _load_attachment_image_scaled(
+    attachment: Attachment,
+    target_size: QSize,
+) -> QImage | None:
+    """Resolve an attachment to a display-sized ``QImage``.
+
+    ``_load_attachment_image`` intentionally preserves full resolution for
+    download/conversion actions. The timeline only needs a bounded preview, so
+    this path asks Qt's image reader to decode directly into the target size
+    whenever the backend supports it. That keeps both peak and retained memory
+    proportional to the visible preview, not the screenshot's source pixels.
+    """
+    if attachment.data_uri:
+        decoded = _decode_data_uri_to_bytes(attachment.data_uri)
+        if decoded is not None:
+            image = _load_image_bytes(decoded, target_size=target_size)
+            if image is not None:
+                return image
+    if attachment.path:
+        try:
+            resolved = Path(attachment.path)
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+            if resolved.exists():
+                reader = QImageReader(str(resolved))
+                image = _read_image(reader, target_size=target_size)
+                if image is not None:
+                    return image
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _attachment_image_size(attachment: Attachment) -> QSize | None:
+    """Read image dimensions without decoding full pixel data."""
+    reader: QImageReader | None = None
+    buffer: QBuffer | None = None
+    if attachment.data_uri:
+        decoded = _decode_data_uri_to_bytes(attachment.data_uri)
+        if decoded is None:
+            return None
+        data = QByteArray(decoded)
+        buffer = QBuffer()
+        buffer.setData(data)
+        if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+            return None
+        reader = QImageReader(buffer)
+    elif attachment.path:
+        try:
+            resolved = Path(attachment.path)
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+            if not resolved.exists():
+                return None
+            reader = QImageReader(str(resolved))
+        except (OSError, ValueError):
+            return None
+    if reader is None:
+        return None
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.width() <= 0 or size.height() <= 0:
+        return None
+    return QSize(size)
 
 
 _ATTACHMENT_CARD_QSS = (
@@ -9859,8 +11420,10 @@ class _ImageCard(_AttachmentCard):
     """
 
     def __init__(self, attachment: Attachment, parent: QWidget) -> None:
-        self._image: QImage | None = None
-        self._pixmap: QPixmap | None = None
+        self._display_pixmap: QPixmap | None = None
+        self._display_target_size: QSize | None = None
+        self._image_load_failed = False
+        self._source_size: QSize | None = None
         self._body_label: QLabel | None = None
         self._image_index: int = 0
         # Cache of the temp-file path written by
@@ -9970,17 +11533,14 @@ class _ImageCard(_AttachmentCard):
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
-        if self._image is None:
-            self._image = _load_attachment_image(self._attachment)
-            if self._image is None:
-                self._show_failure_placeholder()
-            else:
-                self._pixmap = QPixmap.fromImage(self._image)
-        self._update_pixmap_for_width()
+        self._reserve_body_height_for_width()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         super().resizeEvent(event)
-        self._update_pixmap_for_width()
+        if self._display_pixmap is None or self._display_pixmap.isNull():
+            self._reserve_body_height_for_width()
+        else:
+            self._update_pixmap_for_width()
         if self._open_overlay is not None:
             self._open_overlay.setGeometry(self.rect())
 
@@ -9995,27 +11555,79 @@ class _ImageCard(_AttachmentCard):
         body.setMinimumSize(200, 120)
         body.setMaximumHeight(160)
 
+    def set_preview_active(self, active: bool) -> None:
+        if active:
+            self._update_pixmap_for_width()
+        else:
+            self._release_display_pixmap()
+
+    def _release_display_pixmap(self) -> None:
+        if self._display_pixmap is None:
+            return
+        self._display_pixmap = None
+        self._display_target_size = None
+        body = self._body_label
+        if body is not None:
+            body.clear()
+        self._reserve_body_height_for_width()
+
+    def _target_width(self) -> int:
+        card_width = max(self.width() - 20, 0)
+        return min(card_width, _IMAGE_CARD_MAX_WIDTH)
+
+    def _reserve_body_height_for_width(self) -> None:
+        body = self._body_label
+        if body is None or self._image_load_failed:
+            return
+        target_width = self._target_width()
+        if target_width <= 0:
+            return
+        if self._source_size is None:
+            self._source_size = _attachment_image_size(self._attachment)
+        height = 120
+        if self._source_size is not None:
+            target_size = QSize(target_width, _IMAGE_CARD_MAX_HEIGHT)
+            scaled_size = self._source_size.scaled(target_size, Qt.KeepAspectRatio)
+            if scaled_size.width() > 0 and scaled_size.height() > 0:
+                height = min(scaled_size.height(), _IMAGE_CARD_MAX_HEIGHT)
+        body.setMinimumHeight(height)
+        body.setMaximumHeight(height)
+
     def _update_pixmap_for_width(self) -> None:
         body = self._body_label
-        if body is None or self._pixmap is None or self._pixmap.isNull():
+        if body is None or self._image_load_failed:
             return
         # Available width = card width minus card padding (10 + 10) so the
         # pixmap fits the body precisely.
-        card_width = max(self.width() - 20, 0)
-        target_width = min(card_width, _IMAGE_CARD_MAX_WIDTH)
+        target_width = self._target_width()
         if target_width <= 0:
             return
-        pixmap_width = self._pixmap.width()
-        pixmap_height = self._pixmap.height()
-        if pixmap_width <= 0 or pixmap_height <= 0:
-            return
-        if pixmap_width <= target_width:
-            scaled = self._pixmap
-        else:
-            scaled = self._pixmap.scaledToWidth(target_width, Qt.SmoothTransformation)
-        body.setPixmap(scaled)
-        body.setMinimumHeight(min(scaled.height(), 360))
-        body.setMaximumHeight(scaled.height())
+        target_size = QSize(target_width, _IMAGE_CARD_MAX_HEIGHT)
+        if (
+            self._display_pixmap is None
+            or self._display_pixmap.isNull()
+            or self._display_target_size != target_size
+        ):
+            image = _load_attachment_image_scaled(self._attachment, target_size)
+            if image is None:
+                self._image_load_failed = True
+                self._show_failure_placeholder()
+                return
+            scaled = (
+                image
+                if image.size().boundedTo(target_size) == image.size()
+                else image.scaled(
+                    target_size,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+            self._display_pixmap = QPixmap.fromImage(scaled)
+            self._display_target_size = target_size
+        body.setPixmap(self._display_pixmap)
+        display_height = min(self._display_pixmap.height(), _IMAGE_CARD_MAX_HEIGHT)
+        body.setMinimumHeight(display_height)
+        body.setMaximumHeight(display_height)
 
     # ----- Actions ---------------------------------------------------------
 
@@ -10041,7 +11653,7 @@ class _ImageCard(_AttachmentCard):
             path: Path | None = cached
         else:
             path = _materialize_attachment_for_external_open(
-                self._attachment, self._image
+                self._attachment, None
             )
             if path is not None:
                 self._materialized_path = path
@@ -10067,7 +11679,8 @@ class _ImageCard(_AttachmentCard):
             )
 
     def _save_image(self) -> None:
-        if self._image is None:
+        image = _load_attachment_image(self._attachment)
+        if image is None:
             return
         suffix = _suffix_for_mime(self._attachment.mime)
         default_name = f"cqv-image-{self._image_index + 1:03d}{suffix}"
@@ -10083,7 +11696,7 @@ class _ImageCard(_AttachmentCard):
         )
         if not save_path:
             return
-        if not self._image.save(save_path):
+        if not image.save(save_path):
             QMessageBox.warning(
                 self,
                 _t("Save image"),
@@ -10244,6 +11857,59 @@ class _FileCard(_AttachmentCard):
             )
 
 
+def _load_image_bytes(
+    decoded: bytes,
+    *,
+    target_size: QSize | None = None,
+) -> QImage | None:
+    if not decoded:
+        return None
+    data = QByteArray(decoded)
+    buffer = QBuffer()
+    buffer.setData(data)
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        return None
+    reader = QImageReader(buffer)
+    return _read_image(reader, target_size=target_size)
+
+
+def _read_image(
+    reader: QImageReader,
+    *,
+    target_size: QSize | None = None,
+) -> QImage | None:
+    reader.setAutoTransform(True)
+    if (
+        target_size is not None
+        and target_size.width() > 0
+        and target_size.height() > 0
+    ):
+        source_size = reader.size()
+        if source_size.width() > 0 and source_size.height() > 0:
+            scaled_size = source_size.scaled(target_size, Qt.KeepAspectRatio)
+            if (
+                scaled_size.width() > 0
+                and scaled_size.height() > 0
+                and scaled_size != source_size
+            ):
+                reader.setScaledSize(scaled_size)
+    image = reader.read()
+    if image.isNull():
+        return None
+    if (
+        target_size is not None
+        and target_size.width() > 0
+        and target_size.height() > 0
+    ):
+        if image.width() > target_size.width() or image.height() > target_size.height():
+            image = image.scaled(
+                target_size,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+    return image
+
+
 def _decode_data_uri_to_bytes(data_uri: str) -> bytes | None:
     if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
         return None
@@ -10252,9 +11918,15 @@ def _decode_data_uri_to_bytes(data_uri: str) -> bytes | None:
         return None
     payload = data_uri[comma + 1 :]
     try:
-        return base64.b64decode(payload.encode("ascii", errors="ignore"), validate=False)
+        encoded = payload.encode("ascii", errors="ignore")
+        if len(encoded) // 4 * 3 > _MAX_IMAGE_DECODED_BYTES:
+            return None
+        decoded = base64.b64decode(encoded, validate=False)
     except (binascii.Error, ValueError):
         return None
+    if len(decoded) > _MAX_IMAGE_DECODED_BYTES:
+        return None
+    return decoded
 
 
 def _reveal_in_file_manager(path: Path) -> bool:
@@ -10892,6 +12564,34 @@ QPushButton#SessionsDetailFilterChip:checked:hover {{
     border-color: {PRIMARY_BAND};
 }}
 
+/* Time Travel mode tabs — segmented "Messages | Attachments (N)" at the
+   top of the popup. Same checkable + PRIMARY-tinted treatment as the
+   filter chips above, but a distinct selector so future visual divergence
+   stays trivial. Slightly taller (~26px) and wider padding because these
+   are mode tabs (a top-level navigation choice), not category chips. */
+QPushButton#TimeTravelModeTab {{
+    background: rgba(255, 255, 255, 12);
+    border: 1px solid rgba(255, 255, 255, 28);
+    border-radius: 13px;
+    color: rgba(220, 226, 236, 200);
+    padding: 4px 14px;
+    font-size: 12px;
+    min-height: 24px;
+}}
+QPushButton#TimeTravelModeTab:hover {{
+    background: rgba(255, 255, 255, 22);
+    border-color: rgba(255, 255, 255, 50);
+}}
+QPushButton#TimeTravelModeTab:checked {{
+    background: {PRIMARY_TINT};
+    border-color: {PRIMARY_BAND};
+    color: #ffffff;
+}}
+QPushButton#TimeTravelModeTab:checked:hover {{
+    background: {PRIMARY_TINT};
+    border-color: {PRIMARY_BAND};
+}}
+
 /* Quick filters (Only User / Only Assistant). They are commands, not
    category toggles, so they sit in the count row as compact chips and
    mirror the selected-state treatment when their one-role filter is active. */
@@ -11019,6 +12719,36 @@ QListView#TimeTravelVerticalList::item {{
 }}
 QListView#TimeTravelVerticalList::item:selected,
 QListView#TimeTravelVerticalList::item:hover {{
+    background: transparent;
+    color: #ffffff;
+}}
+/* Time Travel attachments grid — same transparent treatment as the
+   vertical messages list above so the popup's frosted backdrop shows
+   through the cell gaps, not a solid widget background. The delegate
+   already paints its own hover/selected tint via PRIMARY_GHOST/SOFT,
+   so QListView's built-in selection bg is suppressed too. */
+QWidget#TimeTravelAttachmentsView {{
+    background: transparent;
+    color: #ffffff;
+}}
+QListView#TimeTravelAttachmentsList {{
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 28);
+    border-radius: 8px;
+    color: #ffffff;
+    selection-background-color: transparent;
+    selection-color: #ffffff;
+    alternate-background-color: transparent;
+    outline: 0;
+}}
+QListView#TimeTravelAttachmentsList::item {{
+    background: transparent;
+    color: #ffffff;
+    border: 0;
+    padding: 0;
+}}
+QListView#TimeTravelAttachmentsList::item:selected,
+QListView#TimeTravelAttachmentsList::item:hover {{
     background: transparent;
     color: #ffffff;
 }}

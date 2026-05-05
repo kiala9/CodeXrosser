@@ -92,7 +92,20 @@ def sync_preview(services: AppServices, sync_sessions: bool, sync_assets: bool) 
 def sessions_rescan(services: AppServices, target: CodexHomeTarget) -> dict[str, Any]:
     progress(f"Sessions progress: rescanning {target.value} session files...")
     manager = services.sessions_manager(target)
-    records = manager.rescan()
+
+    def on_batch(done: int, total: int) -> None:
+        # Per-batch tick the Qt host turns into a partial list refresh +
+        # status-bar progress text. Tagged so the host can route it past
+        # the generic textual ``progress`` channel.
+        emit(
+            "progress",
+            kind="sessions-rescan-batch",
+            target=target.value,
+            done=done,
+            total=total,
+        )
+
+    records = manager.rescan(progress_cb=on_batch)
     payload = [record.to_json() for record in records]
     return {
         "result": {"records": payload, "count": len(payload)},

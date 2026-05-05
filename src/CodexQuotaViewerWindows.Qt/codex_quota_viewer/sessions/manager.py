@@ -21,6 +21,7 @@ from .helpers import (
 )
 from .jsonl_parser import (
     DEFAULT_TIMELINE_PAGE_SIZE,
+    PARSER_VERSION,
     clamp_timeline_page_size,
     parse_session_catalog,
 )
@@ -32,6 +33,7 @@ from .models import (
     ParsedSessionCatalog,
     RestoreMode,
     RestoreResult,
+    SessionAttachmentRow,
     SessionDetail,
     SessionFilters,
     SessionRecord,
@@ -49,6 +51,13 @@ from .repository import SessionRepository
 
 
 ResumeLauncher = Callable[[str, str | None], bool]
+
+
+# Per-batch commit size for the streaming rescan path (P1.8). Smaller →
+# more transactions (fsync overhead) and more frequent UI updates;
+# larger → fewer commits but longer "no progress" gaps. 50 picked to
+# keep batch fsync ~10ms on NTFS WAL while still feeling live to the UI.
+_RESCAN_BATCH_SIZE = 50
 
 
 @dataclass(frozen=True)
@@ -78,9 +87,13 @@ class SessionsManager:
     def close(self) -> None:
         self.repository.close()
 
-    def rescan(self) -> list[SessionRecord]:
+    def rescan(
+        self,
+        *,
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> list[SessionRecord]:
         with self._mutation_lock:
-            self._scan_and_index_sessions()
+            self._scan_and_index_sessions(progress_cb=progress_cb)
             return self.repository.list_sessions()
 
     def list_sessions(self, filters: SessionFilters | None = None) -> list[SessionRecord]:
@@ -88,6 +101,40 @@ class SessionsManager:
 
     def get_session_detail(self, session_id: str) -> SessionDetail:
         record = self._require_session(session_id)
+        # Lazy freshness check before serving detail. Two trigger conditions
+        # share one reparse path:
+        #   1) parser_version mismatch → indexed by an older parser, the
+        #      DB timeline is structurally stale.
+        #   2) on-disk mtime ≠ stored mtime → the jsonl was modified
+        #      externally (most common: Codex CLI appending; also manual
+        #      edits). The DB timeline is content-stale.
+        # Both reuse `_reparse_one`, which is trigger-agnostic (it parses
+        # + rewrites timeline_items + persists fresh mtime + parser_version).
+        # Cost is one file parse (~50-200ms) hidden behind the existing
+        # detail loading overlay — much better than forcing a full rescan
+        # on every parser upgrade or external edit.
+        db_parser_version, db_mtime_ns = self.repository.get_session_freshness(
+            session_id
+        )
+        needs_reparse = db_parser_version != PARSER_VERSION
+        if not needs_reparse:
+            primary_str = (
+                record.active_path
+                or record.archive_path
+                or record.snapshot_path
+            )
+            if primary_str:
+                try:
+                    disk_mtime_ns = Path(primary_str).stat().st_mtime_ns
+                    if disk_mtime_ns != db_mtime_ns:
+                        needs_reparse = True
+                except OSError:
+                    # File missing → fall through to DB load. Orphan row
+                    # will be cleaned up by the next manual Rescan.
+                    pass
+        if needs_reparse:
+            self._reparse_one(record)
+            record = self._require_session(session_id)
         with _perf_timer("manager.get_session_detail", session_id=session_id):
             # Tail-load only the most recent page. Chat sessions are read
             # most-recent-first, and full-history loads at million-row scale
@@ -115,6 +162,42 @@ class SessionsManager:
                 timeline_loaded_offset=loaded_offset,
             )
 
+    def _reparse_one(self, record: SessionRecord) -> None:
+        """Reparse a single session in place and persist the new
+        timeline_items + cache fingerprints. Best-effort: file gone or
+        parse failure leaves the DB row alone — the next access will
+        retry, and a manual Rescan still cleans up orphans."""
+        primary_str = (
+            record.active_path or record.archive_path or record.snapshot_path
+        )
+        if not primary_str:
+            return
+        primary = Path(primary_str)
+        try:
+            parsed = parse_session_catalog(primary)
+            if parsed is None:
+                return
+            mtime_ns = primary.stat().st_mtime_ns
+        except OSError:
+            return
+        entry = make_catalog_entry(
+            parsed,
+            active_path=Path(record.active_path) if record.active_path else None,
+            archive_path=(
+                Path(record.archive_path) if record.archive_path else None
+            ),
+            snapshot_path=(
+                Path(record.snapshot_path) if record.snapshot_path else None
+            ),
+            original_relative_path=record.original_relative_path,
+            status=record.status,
+        )
+        self.repository.save_catalog_entry(
+            entry,
+            primary_mtime_ns=mtime_ns,
+            parser_version=PARSER_VERSION,
+        )
+
     def get_session_timeline_page(
         self,
         session_id: str,
@@ -140,6 +223,9 @@ class SessionsManager:
     def get_session_timeline_index(self, session_id: str) -> list[SessionTimelineIndexItem]:
         self._require_session(session_id)
         return self.repository.list_timeline_index(session_id)
+
+    def list_session_attachments(self, session_id: str) -> list[SessionAttachmentRow]:
+        return self.repository.list_session_attachments(session_id)
 
     def archive_session(self, session_id: str) -> SessionRecord:
         with self._mutation_lock:
@@ -389,32 +475,62 @@ class SessionsManager:
         self.repository.delete_session(session_id)
         return {"purgedId": session_id}
 
-    def _scan_and_index_sessions(self) -> list[CatalogSessionEntry]:
+    def _scan_and_index_sessions(
+        self,
+        *,
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> list[CatalogSessionEntry]:
         self._ensure_roots()
-        active_entries = collect_sessions(self.roots.sessions_root)
-        archived_entries = collect_sessions(self.roots.archive_root)
-        snapshot_entries = collect_sessions(self.roots.snapshot_root)
+
+        # Incremental rescan cache check: pull DB metadata once, then for
+        # each single-root session whose primary file's mtime + parser
+        # fingerprint match what's recorded, skip re-parse. Multi-root
+        # sessions (active + archive simultaneously, mid-transition) fall
+        # through to fresh parse so the path/state combo stays accurate.
+        skip_paths: set[Path] = set()
+        kept_session_ids: set[str] = set()
+        for meta in self.repository.list_session_scan_metadata():
+            if meta.parser_version != PARSER_VERSION:
+                continue
+            present_paths = [
+                p for p in (meta.active_path, meta.archive_path, meta.snapshot_path) if p
+            ]
+            if len(present_paths) != 1:
+                continue
+            primary = present_paths[0]
+            try:
+                st = os.stat(primary)
+            except OSError:
+                continue
+            if st.st_mtime_ns == meta.primary_mtime_ns:
+                skip_paths.add(Path(primary))
+                kept_session_ids.add(meta.session_id)
+
+        active_entries = collect_sessions(self.roots.sessions_root, skip_paths=skip_paths)
+        archived_entries = collect_sessions(self.roots.archive_root, skip_paths=skip_paths)
+        snapshot_entries = collect_sessions(self.roots.snapshot_root, skip_paths=skip_paths)
 
         latest_audit_by_id = {entry.session_id: entry for entry in self.repository.list_latest_audit_entries()}
 
-        active_by_id: dict[str, tuple[Path, ParsedSessionCatalog]] = {}
-        for path, parsed in active_entries:
-            active_by_id[parsed.summary.id] = (path, parsed)
+        active_by_id: dict[str, tuple[Path, ParsedSessionCatalog, int]] = {}
+        for path, parsed, mtime_ns in active_entries:
+            active_by_id[parsed.summary.id] = (path, parsed, mtime_ns)
 
-        archived_by_id: dict[str, tuple[Path, ParsedSessionCatalog]] = {}
+        archived_by_id: dict[str, tuple[Path, ParsedSessionCatalog, int]] = {}
         archived_relative_paths: dict[str, str] = {}
-        for path, parsed in archived_entries:
+        for path, parsed, mtime_ns in archived_entries:
             normalized_path, original_relative = self._canonicalize_archived_entry(
                 path, parsed, build_fallback_relative_path(parsed.summary.started_at, parsed.summary.id)
             )
-            archived_by_id[parsed.summary.id] = (normalized_path, parsed)
+            archived_by_id[parsed.summary.id] = (normalized_path, parsed, mtime_ns)
             archived_relative_paths[parsed.summary.id] = original_relative
 
-        snapshot_by_id: dict[str, tuple[Path, ParsedSessionCatalog]] = {}
-        for path, parsed in snapshot_entries:
-            snapshot_by_id[parsed.summary.id] = (path, parsed)
+        snapshot_by_id: dict[str, tuple[Path, ParsedSessionCatalog, int]] = {}
+        for path, parsed, mtime_ns in snapshot_entries:
+            snapshot_by_id[parsed.summary.id] = (path, parsed, mtime_ns)
 
         catalog_entries: list[CatalogSessionEntry] = []
+        fresh_metadata: dict[str, tuple[int, int]] = {}
         all_ids = set(active_by_id) | set(archived_by_id) | set(snapshot_by_id)
         for session_id in all_ids:
             active = active_by_id.get(session_id)
@@ -423,7 +539,7 @@ class SessionsManager:
             primary = active or archived or snapshot
             if primary is None:
                 continue
-            primary_path, primary_parsed = primary
+            primary_path, primary_parsed, primary_mtime_ns = primary
             latest_audit = latest_audit_by_id.get(session_id)
             active_path = active[0] if active else None
             archive_path = archived[0] if archived else None
@@ -451,7 +567,35 @@ class SessionsManager:
                     status=_resolve_catalog_status(active_path, archive_path, latest_audit.action if latest_audit else None),
                 )
             )
-        self.repository.replace_catalog(catalog_entries)
+            fresh_metadata[session_id] = (primary_mtime_ns, PARSER_VERSION)
+            # If a session was provisionally cached but reappeared as fresh
+            # (e.g. file was modified between the cache check and walk, or
+            # multi-root cross-fertilization), the fresh path wins.
+            kept_session_ids.discard(session_id)
+
+        # Streaming commit: orphan delete + kept refresh in one transaction,
+        # then fresh entries committed in batches of _RESCAN_BATCH_SIZE so
+        # the UI can re-query ``list_sessions`` between batches and show
+        # progress. Without this split, first-install rescans block until
+        # the entire parse pass finishes.
+        fresh_ids = {entry.summary.id for entry in catalog_entries}
+        self.repository.upsert_catalog_batch_start(
+            kept_session_ids=kept_session_ids,
+            expected_fresh_session_ids=fresh_ids,
+        )
+        total = len(catalog_entries) + len(kept_session_ids)
+        done = len(kept_session_ids)
+        if progress_cb:
+            progress_cb(done, total)
+        for batch_start in range(0, len(catalog_entries), _RESCAN_BATCH_SIZE):
+            batch = catalog_entries[batch_start : batch_start + _RESCAN_BATCH_SIZE]
+            self.repository.upsert_catalog_batch_apply(
+                entries=batch,
+                fresh_metadata=fresh_metadata,
+            )
+            done += len(batch)
+            if progress_cb:
+                progress_cb(done, total)
         return catalog_entries
 
     def _canonicalize_archived_entry(

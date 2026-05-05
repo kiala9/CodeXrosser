@@ -39,6 +39,8 @@ function Stop-ExistingViewer {
     try {
         $processes = Get-CimInstance Win32_Process | Where-Object {
             $_.ProcessId -ne $currentPid -and (
+                $_.Name -ieq "CodeXrosser.exe" -or
+                $_.Name -ieq "CodeXross.exe" -or
                 $_.Name -ieq "CodexQuotaViewerWindowsQt.exe" -or
                 ($_.CommandLine -and $_.CommandLine -like "*codex_quota_viewer*")
             )

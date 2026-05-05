@@ -23,7 +23,9 @@ create table if not exists sessions (
   status text not null,
   created_at text not null,
   updated_at text not null,
-  indexed_at text not null
+  indexed_at text not null,
+  primary_mtime_ns integer not null default 0,
+  parser_version integer not null default 0
 );
 
 create table if not exists timeline_items (
@@ -68,3 +70,6 @@ create index if not exists idx_sessions_started_at
   on sessions(started_at desc);
 create index if not exists idx_timeline_items_session_ordinal
   on timeline_items(session_id, ordinal asc);
+create index if not exists idx_timeline_items_session_attachments
+  on timeline_items(session_id, ordinal)
+  where attachments_json is not null;

@@ -234,6 +234,18 @@ class SessionTimelineIndexItem:
 
 
 @dataclass(frozen=True)
+class SessionAttachmentRow:
+    """One attachment fetched directly from SQLite for Time Travel."""
+
+    ordinal: int
+    item_id: str
+    type: TimelineKind
+    timestamp: str
+    attachment_index: int
+    attachment: Attachment
+
+
+@dataclass(frozen=True)
 class SessionDetail:
     record: SessionRecord
     audit_entries: list[AuditEntry]

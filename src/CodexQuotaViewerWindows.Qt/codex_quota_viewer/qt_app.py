@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import os
 import re
 import sys
@@ -40,6 +41,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
 )
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -93,6 +95,7 @@ from .services import AppServices
 from .sessions_page import SessionsPage
 
 
+APP_DISPLAY_NAME = "CodeXrosser"
 APP_ICON_ASSET = "cqv-app-icon.png"
 
 
@@ -937,7 +940,7 @@ class MainWindow(QMainWindow):
         self._status_auto_hide_timer.setSingleShot(True)
         self._status_auto_hide_timer.timeout.connect(self.clear_status)
 
-        self.setWindowTitle("Codex Quota Viewer Windows")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.setWindowIcon(_asset_icon(APP_ICON_ASSET))
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -1882,7 +1885,7 @@ class MainWindow(QMainWindow):
             self.status_footer.setVisible(True)
             self._position_status_popup()
         if self.tray_icon:
-            self.tray_icon.setToolTip(_trim_tray_text("Codex Quota Viewer: " + summary))
+            self.tray_icon.setToolTip(_trim_tray_text(APP_DISPLAY_NAME + ": " + summary))
         self._schedule_status_auto_hide(kind)
 
     def clear_status(self) -> None:
@@ -1906,7 +1909,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "status_footer"):
             self.status_footer.hide()
         if getattr(self, "tray_icon", None):
-            self.tray_icon.setToolTip("Codex Quota Viewer")
+            self.tray_icon.setToolTip(APP_DISPLAY_NAME)
 
     def _schedule_status_auto_hide(self, severity: str) -> None:
         if not hasattr(self, "_status_auto_hide_timer"):
@@ -2069,11 +2072,35 @@ class MainWindow(QMainWindow):
             return
         message_type = payload.get("type")
         if message_type == "progress":
-            self.set_status(str(payload.get("message") or ""), "info")
+            kind = payload.get("kind")
+            if kind == "sessions-rescan-batch":
+                self._handle_sessions_rescan_progress(payload)
+            else:
+                self.set_status(str(payload.get("message") or ""), "info")
         elif message_type == "result":
             task["result"] = payload
         elif message_type == "error":
             task["error"] = payload
+
+    def _handle_sessions_rescan_progress(self, payload: dict[str, Any]) -> None:
+        # Per-batch progress signal from task_worker.sessions_rescan. Routes
+        # to SessionsPage so the user sees the list filling in live instead
+        # of waiting for the whole rescan to finish. Drop progress for a
+        # target the user has since switched away from — otherwise the
+        # Sandbox rescan's batch counts would briefly clobber the Real
+        # tab's count label and trigger spurious refreshes.
+        page = getattr(self, "_sessions_page_widget", None)
+        if page is None:
+            return
+        target_value = payload.get("target")
+        if isinstance(target_value, str) and target_value != page.target.value:
+            return
+        try:
+            done = int(payload.get("done") or 0)
+            total = int(payload.get("total") or 0)
+        except (TypeError, ValueError):
+            return
+        page.apply_rescan_progress(done, total)
 
     def _process_start_failed(self, process: QProcess, error: QProcess.ProcessError) -> None:
         task = self._process_tasks.get(process)
@@ -2138,7 +2165,7 @@ class MainWindow(QMainWindow):
             on_error(ex)
             return
         self.set_status(str(ex))
-        QMessageBox.warning(self, "Codex Quota Viewer", str(ex))
+        QMessageBox.warning(self, APP_DISPLAY_NAME, str(ex))
 
     def show_accounts(self, refresh_quota: bool = True) -> None:
         self.current_view = "Accounts"
@@ -3477,8 +3504,92 @@ def _install_acrylic_blur(window: QWidget, enabled: bool = True, tint_alpha: int
         return False
 
 
+_SINGLETON_TIMEOUT_MS = 200
+
+
+def _single_instance_socket_name() -> str:
+    """Per-user named-pipe address. Including the username keeps multiple
+    Windows users on the same machine from colliding on the global pipe
+    namespace."""
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "default"
+    safe_user = re.sub(r"[^A-Za-z0-9_-]", "_", user) or "default"
+    return f"CodeXrosser-singleton-{safe_user}"
+
+
+def _signal_existing_instance() -> bool:
+    """Try to hand off to an already-running instance. Returns True when
+    a peer answered (caller should exit), False when no peer is reachable
+    (caller continues startup as the primary)."""
+    socket_name = _single_instance_socket_name()
+    socket = QLocalSocket()
+    socket.connectToServer(socket_name)
+    if not socket.waitForConnected(_SINGLETON_TIMEOUT_MS):
+        return False
+
+    # Without this, raise_() across processes is silently dropped on
+    # Windows 7+ — the existing instance has to have been granted
+    # foreground rights by the launching process. ASFW_ANY = -1.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        except Exception:
+            pass
+
+    socket.write(b"raise\n")
+    socket.flush()
+    socket.waitForBytesWritten(_SINGLETON_TIMEOUT_MS)
+    socket.disconnectFromServer()
+    return True
+
+
+def _start_singleton_server() -> "QLocalServer | None":
+    """Bind the local server so future launches can find us. ``None`` if
+    we can't take ownership (rare — would degrade to allow-multiple)."""
+    socket_name = _single_instance_socket_name()
+    server = QLocalServer()
+    if server.listen(socket_name):
+        return server
+    # Stale pipe from a crashed previous run — clean and retry once.
+    QLocalServer.removeServer(socket_name)
+    if server.listen(socket_name):
+        return server
+    return None
+
+
+def _bring_window_forward(window: QMainWindow) -> None:
+    """Show + raise + activate the main window. The state-clear handles
+    the case where the user closed-to-tray and the window is sitting
+    minimized; show() handles the case where it was hidden entirely."""
+    if window.isMinimized():
+        window.setWindowState(window.windowState() & ~Qt.WindowMinimized)
+    window.show()
+    window.raise_()
+    window.activateWindow()
+
+
+def _handle_singleton_raise(server: QLocalServer, window: QMainWindow) -> None:
+    socket = server.nextPendingConnection()
+    if socket is not None:
+        try:
+            socket.readAll()
+        finally:
+            socket.disconnectFromServer()
+            socket.deleteLater()
+    _bring_window_forward(window)
+
+
 def run_app() -> int:
     app = QApplication(sys.argv)
+    if _signal_existing_instance():
+        # Another instance picked up the activation — exit quietly so
+        # double-clicking the desktop icon while the app is in the tray
+        # just brings the existing window forward instead of spinning
+        # up a second process.
+        return 0
     _apply_dark_palette(app)
     app.setQuitOnLastWindowClosed(False)
     app_icon = _asset_icon(APP_ICON_ASSET)
@@ -3488,7 +3599,7 @@ def run_app() -> int:
     window = MainWindow(services)
     icon = app_icon if not app_icon.isNull() else app.style().standardIcon(QStyle.SP_ComputerIcon)
     tray = QSystemTrayIcon(icon, app)
-    tray.setToolTip("Codex Quota Viewer Windows")
+    tray.setToolTip(APP_DISPLAY_NAME)
     menu = QMenu()
     open_action = QAction("Open", menu)
     open_action.triggered.connect(lambda: (window.show(), window.raise_(), window.activateWindow()))
@@ -3510,6 +3621,12 @@ def run_app() -> int:
     window.show()
     _install_native_window_chrome(window)
     _install_acrylic_blur(window)
+    singleton_server = _start_singleton_server()
+    if singleton_server is not None:
+        singleton_server.newConnection.connect(
+            lambda: _handle_singleton_raise(singleton_server, window)
+        )
+        app.aboutToQuit.connect(singleton_server.close)
     app.aboutToQuit.connect(lambda: (tray.hide(), services.dispose()))
     return app.exec()
 

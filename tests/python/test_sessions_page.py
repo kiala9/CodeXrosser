@@ -23,8 +23,9 @@ from PySide6.QtCore import (  # noqa: E402
     QPointF,
     Qt,
 )
-from PySide6.QtGui import QMouseEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtGui import QCursor, QGuiApplication, QImage, QMouseEvent  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from codex_quota_viewer.localization import translate  # noqa: E402
 from codex_quota_viewer.models import CodexHomeTarget, UiLanguage  # noqa: E402
@@ -40,6 +41,8 @@ from codex_quota_viewer.sessions_page import (  # noqa: E402
     _AttachmentCard,
     _FileCard,
     _ImageCard,
+    _IMAGE_CARD_MAX_HEIGHT,
+    _IMAGE_CARD_MAX_WIDTH,
     _MessageBubble,
     _RECORD_SUBTITLE_ROLE,
     _SessionsTreeModel,
@@ -617,6 +620,41 @@ def test_image_card_omits_reveal_button_for_data_uri_only_attachment() -> None:
     assert "Show in folder" not in tooltips
 
 
+def test_image_card_keeps_only_scaled_display_pixmap(tmp_path) -> None:
+    """Large timeline images should not leave a full-resolution QImage and
+    QPixmap resident on the card. The card keeps only the bounded display
+    pixmap; save/open paths re-load on demand."""
+    QApplication.instance() or QApplication([])
+    image_path = tmp_path / "large.png"
+    source = QImage(2000, 1200, QImage.Format_RGB32)
+    source.fill(Qt.red)
+    assert source.save(str(image_path))
+
+    parent = QWidget()
+    card = _ImageCard(
+        Attachment(
+            kind="image",
+            mime="image/png",
+            path=str(image_path),
+            name="large.png",
+        ),
+        parent,
+    )
+    card.resize(900, 500)
+    card._update_pixmap_for_width()
+    card.show()
+    QTest.qWait(20)
+    QApplication.processEvents()
+
+    assert not hasattr(card, "_image")
+    assert not hasattr(card, "_pixmap")
+    assert card._display_pixmap is not None
+    assert card._display_pixmap.width() <= _IMAGE_CARD_MAX_WIDTH
+    assert card._display_pixmap.height() <= _IMAGE_CARD_MAX_HEIGHT
+    card.close()
+    parent.close()
+
+
 def test_image_card_reveal_invokes_helper_for_path_attachment(tmp_path, monkeypatch) -> None:
     """When the attachment carries a local file path the reveal action
     is wired up and clicking it invokes the reveal helper."""
@@ -1070,8 +1108,385 @@ def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
 
     QApplication.instance() or QApplication([])
     rec = _record("paginated")
-    # Pretend the session has 1000 events but only the last 200 are
-    # currently loaded — exactly what the new tail-load path produces.
+    # Pretend the session has 1000 events but only the tail page is
+    # currently loaded — exactly what the bounded tail-load path produces.
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    page_size = panel._OLDER_PAGE_SIZE
+    expected_offset = 800 - page_size
+    captured: list[tuple[str, int, int]] = []
+    panel.older_history_requested.connect(
+        lambda sid, off, lim: captured.append((sid, off, lim))
+    )
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    assert panel._loaded_offset == 800
+    assert panel._timeline_total == 1000
+
+    # Slide-up at the loaded edge → fetch request goes out, single-flight
+    # guard prevents duplicates until prepend_older_items lands.
+    panel._slide_window_up()
+    assert captured == [(rec.id, expected_offset, page_size)]
+    assert panel._loading_older is True
+    panel._slide_window_up()
+    assert captured == [(rec.id, expected_offset, page_size)]  # still single-flight
+
+    # Older page comes back: items prepend, anchor preserved by id.
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(expected_offset, 800)
+    ]
+    panel.prepend_older_items(older, expected_offset)
+    assert panel._loading_older is False
+    assert panel._loaded_offset == expected_offset
+    assert len(panel._all_timeline_items) == 200 + page_size
+    assert panel._current_user_block is not None
+    kind, payload = panel._all_blocks[panel._current_user_block]
+    assert kind == "single"
+    # Anchor must still be e-800 (first user prompt that was visible
+    # before the prepend), regardless of where it now sits in _all_blocks.
+    assert payload.id == "e-800"
+    panel.close()
+
+
+def test_older_loading_consumes_upward_wheel_at_loaded_edge() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("older-wheel")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._loading_older = True
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+
+    assert panel._should_consume_timeline_wheel(object())
+    panel._loading_older = False
+    assert not panel._should_consume_timeline_wheel(object())
+    panel.close()
+
+
+class _WheelEvent:
+    def __init__(self, y: int) -> None:
+        self._y = y
+
+    def type(self) -> QEvent.Type:
+        return QEvent.Wheel
+
+    def angleDelta(self) -> QPoint:  # noqa: N802 - Qt naming
+        return QPoint(0, self._y)
+
+    def pixelDelta(self) -> QPoint:  # noqa: N802 - Qt naming
+        return QPoint(0, 0)
+
+
+def _wait_detail_panel_ready(panel, *, timeout: float = 5.0) -> None:
+    app = QApplication.instance() or QApplication([])
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        overlay_hidden = (
+            panel._timeline_overlay is None or panel._timeline_overlay.isHidden()
+        )
+        if not panel._suppress_edge_slide and overlay_hidden:
+            return
+        time.sleep(0.001)
+    raise AssertionError("detail panel did not settle")
+
+
+def test_paging_completion_quarantines_continuous_wheel_until_settle() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("paging-wheel-quarantine")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+
+    panel._maybe_request_older()
+    assert panel._should_consume_timeline_wheel(_WheelEvent(120))
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"older item {i}",
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+    app.processEvents()
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    before = scrollbar.value()
+
+    assert panel._paging_input_quarantine is True
+    assert panel._should_consume_timeline_wheel(_WheelEvent(120))
+    assert panel.eventFilter(panel._timeline_scroll.viewport(), _WheelEvent(120))
+    assert scrollbar.value() == before
+
+    _wait_detail_panel_ready(panel)
+    assert panel._paging_input_quarantine is True
+    panel._end_paging_input_quarantine()
+    assert not panel._should_consume_timeline_wheel(_WheelEvent(120))
+    panel.close()
+
+
+def test_paging_start_flushes_posted_timeline_wheel_events() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("paging-flush-wheel")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    viewport = panel._timeline_scroll.viewport()
+    seen: list[QEvent.Type] = []
+
+    class WheelProbe(QObject):
+        def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+            if event.type() == QEvent.Wheel:
+                seen.append(event.type())
+            return False
+
+    probe = WheelProbe(panel)
+    viewport.installEventFilter(probe)
+    QCoreApplication.postEvent(viewport, QEvent(QEvent.Wheel))
+
+    panel._maybe_request_older()
+    app.processEvents()
+
+    assert seen == []
+    assert panel._paging_input_quarantine is True
+    panel.close()
+
+
+def test_first_upward_wheel_at_static_top_requests_older_history() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("first-wheel-fetch")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"visible loaded item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    captured: list[tuple[str, int, int]] = []
+    panel.older_history_requested.connect(
+        lambda sid, off, lim: captured.append((sid, off, lim))
+    )
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+
+    handled = panel.eventFilter(panel._timeline_scroll.viewport(), _WheelEvent(120))
+
+    assert handled
+    assert captured == [(rec.id, 800 - panel._OLDER_PAGE_SIZE, panel._OLDER_PAGE_SIZE)]
+    assert panel._loading_older is True
+    panel.close()
+
+
+def test_scroll_settled_noops_during_scroll_transaction() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("settled-locked")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._timeline_scroll.viewport().resize(800, 600)
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+    panel._slide_window_up = Mock()  # type: ignore[method-assign]
+
+    panel._suppress_edge_slide = True
+    panel._on_scroll_settled()
+    panel._slide_window_up.assert_not_called()
+
+    panel._suppress_edge_slide = False
+    panel._loading_older = True
+    panel._on_scroll_settled()
+    panel._slide_window_up.assert_not_called()
+    panel.close()
+
+
+def test_timeline_wheel_filter_covers_bubble_children() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+    from PySide6.QtWidgets import QTextEdit
+
+    QApplication.instance() or QApplication([])
+    rec = _record("child-wheel-filter")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=[
+            SessionTimelineItem(
+                id="e-1",
+                type="message:user",
+                timestamp="2026-01-01T00:00:00Z",
+                text="hello",
+            )
+        ],
+        timeline_total=1,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    body = panel._timeline_container.findChild(QTextEdit)
+
+    assert body is not None
+    assert body.property("_cqvTimelineWheelFilterInstalled") is True
+    assert panel._is_timeline_event_source(body)
+
+    panel._suppress_edge_slide = True
+    assert panel.eventFilter(body, _WheelEvent(120))
+    panel.close()
+
+
+def test_timeline_wheel_filter_covers_navigator_rail() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("navigator-wheel")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=[
+            SessionTimelineItem(
+                id=f"e-{i}",
+                type="message:user" if i % 5 == 0 else "message:assistant",
+                timestamp="2026-01-01T00:00:00Z",
+                text=f"item {i}",
+            )
+            for i in range(40)
+        ],
+        timeline_total=40,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._hide_timeline_overlay()
+    assert panel._is_timeline_event_source(panel._navigator)
+    assert panel._navigator.width() == panel._navigator._RAIL_WIDTH
+
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 1000)
+    scrollbar.setValue(500)
+
+    assert panel.eventFilter(panel._navigator, _WheelEvent(120))
+    assert scrollbar.value() < 500
+    panel.close()
+
+
+def test_navigator_rail_wheel_at_loaded_edge_requests_older_history() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("navigator-wheel-edge")
     tail = [
         SessionTimelineItem(
             id=f"e-{i}",
@@ -1095,18 +1510,79 @@ def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
         lambda sid, off, lim: captured.append((sid, off, lim))
     )
     panel.set_detail(detail, CodexHomeTarget.SANDBOX)
-    assert panel._loaded_offset == 800
-    assert panel._timeline_total == 1000
+    panel._hide_timeline_overlay()
+    panel._timeline_scroll.viewport().resize(800, 600)
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
 
-    # Slide-up at the loaded edge → fetch request goes out, single-flight
-    # guard prevents duplicates until prepend_older_items lands.
-    panel._slide_window_up()
-    assert captured == [(rec.id, 600, 200)]
+    assert panel.eventFilter(panel._navigator, _WheelEvent(120))
+    assert captured == [(rec.id, 800 - panel._OLDER_PAGE_SIZE, panel._OLDER_PAGE_SIZE)]
     assert panel._loading_older is True
-    panel._slide_window_up()
-    assert captured == [(rec.id, 600, 200)]  # still single-flight
+    panel.close()
 
-    # Older page comes back: items prepend, anchor preserved by id.
+
+def test_older_result_uses_request_time_anchor() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+    from PySide6.QtWidgets import QWidget
+
+    QApplication.instance() or QApplication([])
+    rec = _record("request-anchor")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    requested: list[tuple[str, int, int]] = []
+    panel.older_history_requested.connect(
+        lambda sid, off, lim: requested.append((sid, off, lim))
+    )
+
+    def block_for(item_id: str) -> int:
+        return next(
+            i
+            for i, (kind, payload) in enumerate(panel._all_blocks)
+            if kind == "single" and getattr(payload, "id", None) == item_id
+        )
+
+    request_top = QWidget()
+    request_top.setProperty("blockIndex", block_for("e-803"))
+    panel._topmost_visible_widget = lambda: request_top  # type: ignore[method-assign]
+
+    panel._maybe_request_older()
+
+    expected_offset = 800 - panel._OLDER_PAGE_SIZE
+    assert requested == [(rec.id, expected_offset, panel._OLDER_PAGE_SIZE)]
+    assert panel._suppress_edge_slide is True
+
+    later_top = QWidget()
+    later_top.setProperty("blockIndex", block_for("e-820"))
+    panel._topmost_visible_widget = lambda: later_top  # type: ignore[method-assign]
+
+    captured: dict[str, object] = {}
+
+    def stub_set(block_index: int, offset: int, raw_scroll: int) -> int:
+        captured["calls"] = int(captured.get("calls", 0)) + 1
+        captured["block_index"] = block_index
+        captured["offset"] = offset
+        captured["raw_scroll"] = raw_scroll
+        return 0
+
+    panel._set_prepend_anchor_scroll = stub_set  # type: ignore[method-assign]
+
     older = [
         SessionTimelineItem(
             id=f"e-{i}",
@@ -1114,18 +1590,659 @@ def test_detail_panel_requests_older_history_at_loaded_edge() -> None:
             timestamp="2026-01-01T00:00:00Z",
             text=f"item {i}",
         )
+        for i in range(expected_offset, 800)
+    ]
+    panel.prepend_older_items(older, expected_offset)
+    _wait_detail_panel_ready(panel)
+
+    assert captured["block_index"] == panel._block_for_anchor_id("e-803")
+    assert captured["block_index"] != panel._block_for_anchor_id("e-820")
+    assert captured["calls"] >= 1
+    request_anchor = panel._block_for_anchor_id("e-803")
+    assert request_anchor is not None
+    assert panel._window_start < request_anchor < panel._window_end
+    assert panel._suppress_edge_slide is False
+    panel.close()
+
+
+def test_older_prepend_keeps_loaded_edge_at_viewport_top() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("loaded-edge-stability")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"visible loaded item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    panel.show()
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    app.processEvents()
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+    app.processEvents()
+
+    before_id = panel._anchor_id_for_widget(panel._topmost_visible_widget())
+    assert before_id == "e-800"
+
+    panel._maybe_request_older()
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"older item {i}",
+        )
         for i in range(600, 800)
     ]
     panel.prepend_older_items(older, 600)
+    _wait_detail_panel_ready(panel)
+
+    after_id = panel._anchor_id_for_widget(panel._topmost_visible_widget())
+    assert after_id == before_id
+    anchor_block = panel._block_for_anchor_id("e-800")
+    assert anchor_block is not None
+    assert panel._window_start < anchor_block < panel._window_end
+    assert panel._window_end == panel._window_start + _WINDOW_SIZE
+    assert panel._timeline_scroll.verticalScrollBar().value() > 0
+    panel.close()
+
+
+def test_older_prepend_reuses_visible_anchor_widget_without_overlay_rebuild() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel, _WINDOW_SIZE
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("prepend-reuse-anchor-widget")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"visible loaded item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    panel.show()
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    app.processEvents()
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+    app.processEvents()
+
+    before_top = panel._topmost_visible_widget()
+    assert before_top is not None
+    assert panel._anchor_id_for_widget(before_top) == "e-800"
+
+    panel._maybe_request_older()
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"older item {i}",
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+
+    rendered_widgets = [
+        panel._timeline_layout.itemAt(i).widget()
+        for i in range(panel._timeline_layout.count() - 1)
+    ]
+    assert len(rendered_widgets) == _WINDOW_SIZE
+    assert before_top in rendered_widgets
+    assert panel._topmost_visible_widget() is before_top
+    assert panel._timeline_overlay is not None
+    assert panel._timeline_overlay.isHidden()
+    panel.close()
+
+
+def test_older_prepend_does_not_expose_intermediate_headroom_before_anchor_restore() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("prepend-hidden-intermediate")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=(f"visible loaded item {i} ") * 8,
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    panel.show()
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    for _ in range(10):
+        app.processEvents()
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+    for _ in range(3):
+        app.processEvents()
+
+    before_id = panel._anchor_id_for_widget(panel._topmost_visible_widget())
+    assert before_id == "e-800"
+
+    panel._maybe_request_older()
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=(f"older item {i} ") * 8,
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+
+    assert panel._timeline_layout.count() - 1 > 0
+    assert panel._timeline_overlay is not None
+    assert panel._timeline_overlay.isHidden()
+    assert panel._anchor_id_for_widget(panel._topmost_visible_widget()) == before_id
+    _wait_detail_panel_ready(panel)
+    assert panel._anchor_id_for_widget(panel._topmost_visible_widget()) == before_id
+    assert panel._timeline_scroll.verticalScrollBar().value() > 0
+    panel.close()
+
+
+def test_consecutive_older_prepends_keep_visible_anchor_and_headroom() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    def make_items(start: int, end: int, label: str) -> list[SessionTimelineItem]:
+        return [
+            SessionTimelineItem(
+                id=f"e-{i}",
+                type="message:user" if i % 5 == 0 else "message:assistant",
+                timestamp="2026-01-01T00:00:00Z",
+                text=f"{label} item {i}",
+            )
+            for i in range(start, end)
+        ]
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("prepend-two-pages")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=make_items(800, 1000, "tail"),
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    panel.show()
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    for _ in range(8):
+        app.processEvents()
+
+    for offset in (600, 400):
+        panel._timeline_scroll.verticalScrollBar().setValue(0)
+        for _ in range(3):
+            app.processEvents()
+        before_id = panel._anchor_id_for_widget(panel._topmost_visible_widget())
+        assert before_id is not None
+
+        panel._maybe_request_older()
+        panel.prepend_older_items(make_items(offset, offset + 200, "older"), offset)
+        _wait_detail_panel_ready(panel)
+
+        assert panel._loaded_offset == offset
+        assert panel._anchor_id_for_widget(panel._topmost_visible_widget()) == before_id
+        anchor_block = panel._block_for_anchor_id(before_id)
+        assert anchor_block is not None
+        assert panel._window_start < anchor_block < panel._window_end
+        assert panel._timeline_scroll.verticalScrollBar().value() > 0
+
+    panel.close()
+
+
+def test_older_prepend_refreshes_minimap_window_before_full_geometry_scan() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel, _WINDOW_SIZE
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("prepend-fast-minimap")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"visible loaded item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    app.processEvents()
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+    before_widget = panel._topmost_visible_widget()
+    assert before_widget is not None
+    panel._maybe_request_older()
+    panel._refresh_minimap = Mock()  # type: ignore[method-assign]
+
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"older item {i}",
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+    assert panel._timeline_overlay is not None
+    assert panel._timeline_overlay.isHidden()
+    rendered_widgets = [
+        panel._timeline_layout.itemAt(i).widget()
+        for i in range(panel._timeline_layout.count() - 1)
+    ]
+    assert before_widget in rendered_widgets
+    assert panel._timeline_layout.count() - 1 == _WINDOW_SIZE
+    _wait_detail_panel_ready(panel)
+
+    assert panel._suppress_edge_slide is False
+    assert panel._timeline_overlay is not None
+    assert panel._timeline_overlay.isHidden()
+    assert not panel._should_consume_timeline_wheel(object())
+    assert panel._navigator._markers
+    assert panel._navigator._markers[0].block_index == panel._window_start
+    assert panel._navigator._markers[-1].block_index == panel._window_end - 1
+    assert panel._navigator._scroll_maximum == panel._timeline_scroll.verticalScrollBar().maximum()
+    panel._refresh_minimap.assert_not_called()
+    panel.close()
+
+
+def test_upward_wheel_after_prepend_slides_into_loaded_headroom() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("prepend-wheel-headroom")
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"visible loaded item {i}",
+        )
+        for i in range(800, 1000)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    panel.show()
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    app.processEvents()
+    panel._timeline_scroll.verticalScrollBar().setValue(0)
+    panel._maybe_request_older()
+    older = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"older item {i}",
+        )
+        for i in range(600, 800)
+    ]
+    panel.prepend_older_items(older, 600)
+    _wait_detail_panel_ready(panel)
+
+    old_start = panel._window_start
+    bar = panel._timeline_scroll.verticalScrollBar()
+    assert old_start > 0
+    assert bar.value() > 0
+    bar.setValue(0)
+
+    handled = panel.eventFilter(panel._timeline_scroll.viewport(), _WheelEvent(120))
+
+    assert handled
+    assert panel._window_start < old_start
     assert panel._loading_older is False
-    assert panel._loaded_offset == 600
-    assert len(panel._all_timeline_items) == 400
-    assert panel._current_user_block is not None
-    kind, payload = panel._all_blocks[panel._current_user_block]
-    assert kind == "single"
-    # Anchor must still be e-800 (first user prompt that was visible
-    # before the prepend), regardless of where it now sits in _all_blocks.
-    assert payload.id == "e-800"
+    panel.close()
+
+
+def test_downward_wheel_at_static_bottom_requests_newer_history() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("bottom-wheel-fetch")
+    page = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"middle item {i}",
+        )
+        for i in range(200, 400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=page,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=200,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    captured: list[tuple[str, int, int]] = []
+    panel.newer_history_requested.connect(
+        lambda sid, off, lim: captured.append((sid, off, lim))
+    )
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._recenter_window(len(panel._all_blocks) - 1)
+    bar = panel._timeline_scroll.verticalScrollBar()
+    bar.setRange(0, 500)
+    bar.setValue(bar.maximum())
+
+    handled = panel.eventFilter(panel._timeline_scroll.viewport(), _WheelEvent(-120))
+
+    assert handled
+    assert captured == [(rec.id, 400, panel._OLDER_PAGE_SIZE)]
+    assert panel._loading_newer is True
+    panel.close()
+
+
+def test_downward_window_slide_flushes_posted_timeline_wheel_events() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    rec = _record("down-flush-wheel")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    viewport = panel._timeline_scroll.viewport()
+    seen: list[QEvent.Type] = []
+
+    class WheelProbe(QObject):
+        def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+            if event.type() == QEvent.Wheel:
+                seen.append(event.type())
+            return False
+
+    probe = WheelProbe(panel)
+    viewport.installEventFilter(probe)
+    QCoreApplication.postEvent(viewport, QEvent(QEvent.Wheel))
+
+    old_window = (panel._window_start, panel._window_end)
+    panel._slide_window_down()
+    app.processEvents()
+
+    assert seen == []
+    assert (panel._window_start, panel._window_end) != old_window
+    assert panel._window_start > old_window[0]
+    panel.close()
+
+
+def test_downward_window_slide_quarantines_wheel_seen_during_transaction() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("down-quarantine-wheel")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    original_build = panel._build_window_widgets
+
+    def build_with_wheel(*args, **kwargs):
+        assert panel._should_consume_timeline_wheel(_WheelEvent(-120))
+        return original_build(*args, **kwargs)
+
+    panel._build_window_widgets = build_with_wheel  # type: ignore[method-assign]
+
+    panel._slide_window_down()
+
+    assert panel._paging_input_quarantine is True
+    assert panel._suppress_edge_slide is True
+    _wait_detail_panel_ready(panel)
+    assert panel._paging_input_quarantine is True
+    panel._end_paging_input_quarantine()
+    assert not panel._should_consume_timeline_wheel(_WheelEvent(-120))
+    panel.close()
+
+
+def test_downward_window_slide_keeps_edge_suppressed_until_layout_settles() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("down-settle-lock")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._scroll_throttle.stop()
+
+    panel._slide_window_down()
+    panel._on_scroll_changed(panel._timeline_scroll.verticalScrollBar().maximum())
+
+    assert panel._suppress_edge_slide is True
+    assert not panel._scroll_throttle.isActive()
+    _wait_detail_panel_ready(panel)
+    assert panel._suppress_edge_slide is False
+    panel.close()
+
+
+def test_downward_window_slide_restores_retained_visible_anchor_after_layout() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+    from PySide6.QtWidgets import QWidget
+
+    QApplication.instance() or QApplication([])
+    rec = _record("down-anchor-restore")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 5000)
+    scrollbar.setValue(1400)
+    fake_top = QWidget()
+    fake_top.move(0, 320)
+    fake_top.setProperty("blockIndex", 80)
+    panel._topmost_visible_widget_at_or_after_view_pos = (  # type: ignore[method-assign]
+        lambda _min_view_pos: fake_top
+    )
+    captured: list[tuple[int, int, int]] = []
+
+    def stub_set(block_index: int, offset: int, raw_scroll: int) -> int:
+        captured.append((block_index, offset, raw_scroll))
+        target = min(777, scrollbar.maximum())
+        scrollbar.setValue(target)
+        return target
+
+    panel._set_prepend_anchor_scroll = stub_set  # type: ignore[method-assign]
+
+    panel._slide_window_down()
+    _wait_detail_panel_ready(panel)
+
+    assert captured
+    assert captured[0][:2] == (80, 1080)
+    assert panel._suppress_edge_slide is False
+    panel.close()
+
+
+def test_scrollbar_changes_during_input_quarantine_do_not_arm_edge_slide() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("quarantine-scrollbar")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._scroll_throttle.stop()
+    panel._begin_paging_input_quarantine()
+    panel._suppress_edge_slide = False
+    panel._slide_window_down = Mock()  # type: ignore[method-assign]
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 2000)
+
+    panel._on_scroll_changed(scrollbar.maximum())
+
+    assert not panel._scroll_throttle.isActive()
+    panel._end_paging_input_quarantine()
+    panel._on_scroll_settled()
+    panel._slide_window_down.assert_not_called()
+    panel.close()
+
+
+def test_downward_window_slide_suspends_active_minimap_drag() -> None:
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("down-minimap-drag")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(400)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._navigator._dragging = True
+    panel._navigator._drag_suspended_until_release = False
+
+    panel._slide_window_down()
+
+    assert panel._navigator._drag_suspended_until_release is True
     panel.close()
 
 
@@ -2319,7 +3436,7 @@ def test_scroll_settled_at_top_edge_triggers_older_fetch() -> None:
     panel._scroll_throttle.stop()
     panel._on_scroll_settled()
 
-    assert captured == [(rec.id, 600, 200)]
+    assert captured == [(rec.id, 800 - panel._OLDER_PAGE_SIZE, panel._OLDER_PAGE_SIZE)]
     panel.close()
 
 
@@ -2543,7 +3660,7 @@ def test_large_timeline_window_renders_in_event_loop_chunks() -> None:
             id=f"e-{i}",
             type="message:user" if i % 2 == 0 else "message:assistant",
             timestamp=f"2026-01-01T00:00:{i % 60:02d}Z",
-            text="x" * 512,
+            text="x" * 1024,
         )
         for i in range(_WINDOW_SIZE + 40)
     ]
@@ -2625,6 +3742,46 @@ def test_minimap_click_scrolls_current_window_without_recentering() -> None:
     panel.close()
 
 
+def test_minimap_drag_updates_thumb_without_full_geometry_refresh() -> None:
+    """Dragging the minimap must stay on the input frame: update the rail
+    thumb immediately, but leave exact marker geometry to the coalesced timer."""
+    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    rec = _record("minimap-fast-drag")
+    timeline = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 5 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"item {i}",
+        )
+        for i in range(120)
+    ]
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=timeline,
+        timeline_total=len(timeline),
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 700)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, 2400)
+    panel._refresh_minimap = Mock()  # type: ignore[method-assign]
+
+    panel._set_scrollbar_value_from_minimap(1600)
+
+    panel._refresh_minimap.assert_not_called()
+    assert scrollbar.value() == 1600
+    assert panel._navigator._scroll_value == 1600
+    assert panel._minimap_refresh_timer.isActive()
+    panel.close()
+
+
 def test_minimap_ignores_drag_requests_while_scroll_locked() -> None:
     from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
     from codex_quota_viewer.sessions_page import _SessionDetailPanel
@@ -2663,12 +3820,32 @@ def test_minimap_ignores_drag_requests_while_scroll_locked() -> None:
     panel.close()
 
 
-def test_minimap_drag_suspended_after_paging_refresh_until_release() -> None:
+def _rail_mouse_event(
+    event_type: QEvent.Type,
+    y: int,
+    *,
+    x: int = 11,
+    button: Qt.MouseButton = Qt.LeftButton,
+    buttons: Qt.MouseButton = Qt.LeftButton,
+) -> QMouseEvent:
+    pos = QPointF(x, y)
+    return QMouseEvent(
+        event_type,
+        pos,
+        pos,
+        pos,
+        button,
+        buttons,
+        Qt.NoModifier,
+    )
+
+
+def _configured_timeline_rail():
     from codex_quota_viewer.sessions_page import _TimelineNavigatorRail
 
     QApplication.instance() or QApplication([])
     rail = _TimelineNavigatorRail()
-    rail.resize(22, 300)
+    rail.resize(rail._RAIL_WIDTH, 300)
     rail.set_viewport(
         [],
         content_height=1200,
@@ -2676,44 +3853,166 @@ def test_minimap_drag_suspended_after_paging_refresh_until_release() -> None:
         viewport_height=200,
         scroll_maximum=1000,
     )
+    return rail
+
+
+def test_minimap_drag_suspended_after_paging_refresh_until_release() -> None:
+    rail = _configured_timeline_rail()
     emitted: list[int] = []
     rail.scroll_value_requested.connect(emitted.append)
 
-    def event(
-        event_type: QEvent.Type,
-        y: int,
-        *,
-        button: Qt.MouseButton = Qt.LeftButton,
-        buttons: Qt.MouseButton = Qt.LeftButton,
-    ) -> QMouseEvent:
-        pos = QPointF(11, y)
-        return QMouseEvent(
-            event_type,
-            pos,
-            pos,
-            pos,
-            button,
-            buttons,
-            Qt.NoModifier,
-        )
-
-    rail.mousePressEvent(event(QEvent.MouseButtonPress, 120))
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120))
     assert len(emitted) == 1
     assert rail._dragging is True
 
     rail.suspend_drag_until_release()
-    rail.mouseMoveEvent(event(QEvent.MouseMove, 260))
+    rail.mouseMoveEvent(_rail_mouse_event(QEvent.MouseMove, 260))
     assert len(emitted) == 1
     assert rail._drag_suspended_until_release is True
 
     rail.mouseReleaseEvent(
-        event(QEvent.MouseButtonRelease, 260, buttons=Qt.NoButton)
+        _rail_mouse_event(QEvent.MouseButtonRelease, 260, buttons=Qt.NoButton)
     )
     assert rail._dragging is False
     assert rail._drag_suspended_until_release is False
 
-    rail.mousePressEvent(event(QEvent.MouseButtonPress, 180))
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 180))
     assert len(emitted) == 2
+    rail.close()
+
+
+def test_minimap_left_interaction_pad_accepts_drag_without_moving_visual_rail() -> None:
+    rail = _configured_timeline_rail()
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    assert rail._RAIL_WIDTH > rail._VISUAL_WIDTH
+    assert rail._thumb_rect().left() == pytest.approx(
+        rail._RAIL_WIDTH - rail._VISUAL_WIDTH + 2.0
+    )
+
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120, x=4))
+    rail.mouseMoveEvent(_rail_mouse_event(QEvent.MouseMove, 260, x=4))
+
+    assert rail._dragging is True
+    assert emitted == [rail._target_value_for_y(120), rail._target_value_for_y(260)]
+    rail.close()
+
+
+def test_minimap_marker_rect_cache_survives_scroll_state_updates() -> None:
+    from codex_quota_viewer.sessions_page import _MinimapMarker
+
+    rail = _configured_timeline_rail()
+    rail.set_viewport(
+        [
+            _MinimapMarker(
+                block_index=0,
+                y=10,
+                height=40,
+                kind="user",
+                label="prompt",
+            )
+        ],
+        content_height=1200,
+        scroll_value=0,
+        viewport_height=200,
+        scroll_maximum=1000,
+    )
+
+    first = rail._marker_rects()
+    second = rail._marker_rects()
+    rail.set_scroll_state(scroll_value=300, viewport_height=200, scroll_maximum=1000)
+
+    assert second is first
+    assert rail._marker_rects() is first
+    rail.close()
+
+
+def test_minimap_drag_suspension_timeout_resumes_and_emits_current_cursor_target(
+    monkeypatch,
+) -> None:
+    rail = _configured_timeline_rail()
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120))
+    rail.suspend_drag_until_release()
+    assert rail._drag_suspension_timer.isActive()
+
+    cursor_pos = rail.mapToGlobal(QPoint(11, 260))
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.LeftButton)
+    )
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: cursor_pos))
+
+    rail._drag_suspension_timer.timeout.emit()
+    rail._drag_suspension_timer.stop()
+
+    assert rail._dragging is True
+    assert rail._drag_suspended_until_release is False
+    assert len(emitted) == 2
+    assert emitted[-1] == rail._target_value_for_y(260)
+    rail.close()
+
+
+def test_minimap_drag_suspension_release_clears_timer_without_timeout_emit(
+    monkeypatch,
+) -> None:
+    rail = _configured_timeline_rail()
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120))
+    rail.suspend_drag_until_release()
+    assert rail._drag_suspension_timer.isActive()
+
+    rail.mouseReleaseEvent(
+        _rail_mouse_event(QEvent.MouseButtonRelease, 260, buttons=Qt.NoButton)
+    )
+    assert rail._drag_suspension_timer.isActive() is False
+
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.NoButton)
+    )
+    monkeypatch.setattr(
+        QCursor, "pos", staticmethod(lambda: rail.mapToGlobal(QPoint(11, 260)))
+    )
+    rail._drag_suspension_timer.timeout.emit()
+
+    assert rail._dragging is False
+    assert rail._drag_suspended_until_release is False
+    assert len(emitted) == 1
+    rail.close()
+
+
+def test_minimap_drag_suspension_repeated_freeze_restarts_timeout(
+    monkeypatch,
+) -> None:
+    rail = _configured_timeline_rail()
+    rail._DRAG_SUSPENSION_TIMEOUT_MS = 160
+    emitted: list[int] = []
+    rail.scroll_value_requested.connect(emitted.append)
+
+    cursor_pos = rail.mapToGlobal(QPoint(11, 260))
+    monkeypatch.setattr(
+        QGuiApplication, "mouseButtons", staticmethod(lambda: Qt.LeftButton)
+    )
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: cursor_pos))
+
+    rail.mousePressEvent(_rail_mouse_event(QEvent.MouseButtonPress, 120))
+    rail.suspend_drag_until_release()
+    QTest.qWait(80)
+    rail.suspend_drag_until_release()
+    QTest.qWait(90)
+
+    assert len(emitted) == 1
+    assert rail._drag_suspended_until_release is True
+
+    QTest.qWait(120)
+
+    assert rail._drag_suspended_until_release is False
+    assert len(emitted) == 2
+    assert emitted[-1] == rail._target_value_for_y(260)
     rail.close()
 
 
@@ -3120,6 +4419,31 @@ def test_scroll_jump_buttons_show_both_in_middle() -> None:
     assert panel._scroll_bottom_btn.isVisible()
 
 
+def test_scroll_jump_buttons_anchor_next_to_visible_minimap_rail() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+    from PySide6.QtWidgets import QWidget
+
+    app = QApplication.instance() or QApplication([])
+    parent = QWidget()
+    parent.resize(900, 700)
+    panel = _SessionDetailPanel(translator=lambda s: s, parent=parent)
+    panel.resize(900, 700)
+    parent.show()
+    panel.show()
+    app.processEvents()
+    panel._reposition_scroll_jump_buttons()
+
+    viewport = panel._timeline_scroll.viewport()
+    viewport_right = viewport.mapToGlobal(QPoint(viewport.width(), 0)).x()
+    visual_left = panel._navigator.mapToGlobal(
+        QPoint(int(round(panel._navigator._visual_left())), 0)
+    ).x()
+    bottom_right = panel._scroll_bottom_btn.x() + panel._scroll_bottom_btn.width()
+
+    assert bottom_right > viewport_right
+    assert bottom_right == visual_left - panel._SCROLL_JUMP_RAIL_GAP
+
+
 def test_scroll_jump_buttons_jump_to_extreme_values() -> None:
     """Clicking the jump buttons sets the scrollbar to its extremes."""
     from codex_quota_viewer.sessions_page import _SessionDetailPanel
@@ -3276,6 +4600,15 @@ def test_clearing_search_restores_unfiltered_view() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Smallest possible decodable PNG (1x1 transparent) used by Time Travel
+# attachment tests so the delegate's image decode path actually exercises
+# QImage.loadFromData without needing fixture image files on disk.
+_TT_TINY_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+)
+
+
 def _make_time_travel_detail(
     record_id: str,
     *,
@@ -3283,24 +4616,54 @@ def _make_time_travel_detail(
     asst_per_user: int = 1,
     tool_per_user: int = 0,
     tool_group_size: int = 0,
+    attachments_per_user: int = 0,
+    file_attachment_per_user: bool = False,
 ) -> Any:
     """Build a SessionDetail with a known shape for Time Travel tests.
 
     Each "turn" is: 1 user message + ``asst_per_user`` assistant messages
     + ``tool_per_user`` isolated tool calls + (if tool_group_size > 1)
-    a coalesced tool_group of that size. Returns the SessionDetail.
+    a coalesced tool_group of that size. When ``attachments_per_user``
+    is positive each user message carries that many image attachments
+    (a 1×1 PNG via ``_TT_TINY_PNG_DATA_URI``); when
+    ``file_attachment_per_user`` is true each user message also gets one
+    ``application/json`` file attachment. Returns the SessionDetail.
     """
-    from codex_quota_viewer.sessions.models import SessionDetail, SessionTimelineItem
+    from codex_quota_viewer.sessions.models import (
+        Attachment,
+        SessionDetail,
+        SessionTimelineItem,
+    )
 
     items: list[SessionTimelineItem] = []
     counter = 0
     for u in range(user_count):
+        user_attachments: list[Attachment] = []
+        for a_idx in range(attachments_per_user):
+            user_attachments.append(
+                Attachment(
+                    kind="image",
+                    mime="image/png",
+                    data_uri=_TT_TINY_PNG_DATA_URI,
+                    name=f"shot_{u}_{a_idx}.png",
+                )
+            )
+        if file_attachment_per_user:
+            user_attachments.append(
+                Attachment(
+                    kind="file",
+                    mime="application/json",
+                    data_uri="data:application/json;base64,e30=",
+                    name=f"data_{u}.json",
+                )
+            )
         items.append(
             SessionTimelineItem(
                 id=f"u-{u}",
                 type="message:user",
                 timestamp=f"2026-01-01T0{u}:00:00Z",
                 text=f"user prompt {u}",
+                attachments=tuple(user_attachments),
             )
         )
         for a in range(asst_per_user):
@@ -3427,7 +4790,7 @@ def test_time_travel_row_click_jumps_without_closing_popup() -> None:
 
     captured: list[int] = []
     panel._recenter_async = (  # type: ignore[method-assign]
-        lambda focus_block, *, on_anchor: captured.append(focus_block)
+        lambda focus_block: captured.append(focus_block)
     )
 
     target = 7
@@ -3451,12 +4814,49 @@ def test_time_travel_jump_clamps_to_block_range() -> None:
 
     captured: list[int] = []
     panel._recenter_async = (  # type: ignore[method-assign]
-        lambda focus_block, *, on_anchor: captured.append(focus_block)
+        lambda focus_block: captured.append(focus_block)
     )
 
     panel._on_time_travel_jump(-1)
     panel._on_time_travel_jump(99999)
     assert captured == []
+    panel.close()
+
+
+def test_time_travel_current_row_tracks_viewport_center_block() -> None:
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TT_BLOCK_INDEX_ROLE,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 360)
+    panel.show()
+    panel.set_detail(
+        _make_time_travel_detail("tt-current-block", user_count=1, asst_per_user=8),
+        CodexHomeTarget.SANDBOX,
+    )
+    panel._timeline_container.adjustSize()
+    panel._timeline_container.layout().activate()
+    app.processEvents()
+
+    target_block = 3
+    target_widget = panel._find_widget_for_block(target_block)
+    assert target_widget is not None
+    viewport_h = 120
+    panel._timeline_scroll.viewport().resize(800, viewport_h)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, max(0, panel._timeline_container.height() - viewport_h))
+    scrollbar.setValue(target_widget.y() + target_widget.height() // 2 - viewport_h // 2)
+
+    popup = _open_time_travel_for_test(panel)
+    current = popup._vertical._list.currentIndex()
+    source = popup._vertical._proxy.mapToSource(current)
+
+    assert panel._current_user_block == 0
+    assert source.data(_TT_BLOCK_INDEX_ROLE) == target_block
+    panel._dismiss_time_travel_popup()
     panel.close()
 
 
@@ -3503,6 +4903,67 @@ def test_time_travel_global_index_replaces_loaded_slice_rows() -> None:
     panel.close()
 
 
+def test_time_travel_global_index_current_row_uses_jump_offset_lookup() -> None:
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    app = QApplication.instance() or QApplication([])
+    tail = [
+        SessionTimelineItem(
+            id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            text=f"tail {i}",
+        )
+        for i in range(800, 840)
+    ]
+    rec = _record("tt-global-current-offset")
+    detail = SessionDetail(
+        record=rec,
+        audit_entries=[],
+        timeline=tail,
+        timeline_total=1000,
+        timeline_next_offset=None,
+        timeline_loaded_offset=800,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.resize(900, 360)
+    panel.show()
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    panel._timeline_container.adjustSize()
+    panel._timeline_container.layout().activate()
+    app.processEvents()
+
+    focus_block = panel._block_for_anchor_id("e-803")
+    assert focus_block is not None
+    focus_widget = panel._find_widget_for_block(focus_block)
+    assert focus_widget is not None
+    viewport_h = 120
+    panel._timeline_scroll.viewport().resize(800, viewport_h)
+    scrollbar = panel._timeline_scroll.verticalScrollBar()
+    scrollbar.setRange(0, max(0, panel._timeline_container.height() - viewport_h))
+    scrollbar.setValue(focus_widget.y() + focus_widget.height() // 2 - viewport_h // 2)
+
+    popup = _open_time_travel_for_test(panel)
+    index_items = [
+        SessionTimelineIndexItem(
+            ordinal=i,
+            item_id=f"e-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-01-01T00:00:00Z",
+            preview=f"global {i}",
+        )
+        for i in range(800, 840)
+    ]
+
+    panel.set_time_travel_index(rec.id, index_items)
+    current = popup._vertical._list.currentIndex()
+    source = popup._vertical._proxy.mapToSource(current)
+
+    assert source.data(_TT_JUMP_OFFSET_ROLE) == 803
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
 def test_time_travel_offset_jump_requests_page_for_unloaded_offset() -> None:
     from codex_quota_viewer.sessions_page import _SessionDetailPanel
 
@@ -3532,7 +4993,9 @@ def test_time_travel_offset_jump_requests_page_for_unloaded_offset() -> None:
 
     panel._on_time_travel_offset_jump(100, "e-100")
 
-    assert captured == [(rec.id, 0, 200, 100, "e-100")]
+    page_size = panel._OLDER_PAGE_SIZE
+    expected_offset = max(0, 100 - page_size // 2)
+    assert captured == [(rec.id, expected_offset, page_size, 100, "e-100")]
     assert not panel._timeline_overlay.isHidden()
     panel.close()
 
@@ -3588,6 +5051,51 @@ def test_time_travel_offset_page_replaces_slice_and_centers_focus() -> None:
     panel.close()
 
 
+def test_time_travel_offset_page_reanchors_after_layout_settles() -> None:
+    from codex_quota_viewer.sessions_page import (
+        _JUMP_ANCHOR_SETTLE_DELAY_MS,
+        _JUMP_ANCHOR_SETTLE_PASSES,
+        _SessionDetailPanel,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel._render_token = 42
+
+    scroll_calls: list[tuple[int, bool]] = []
+    finished: list[bool] = []
+    hidden: list[bool] = []
+
+    panel._scroll_to_block_center = (  # type: ignore[method-assign]
+        lambda block_index, *, keep_suppressed=False: scroll_calls.append(
+            (block_index, keep_suppressed)
+        )
+        or True
+    )
+    panel._finish_paging_scroll_transaction = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: finished.append(True)
+    )
+    panel._hide_timeline_overlay = lambda: hidden.append(True)  # type: ignore[method-assign]
+    panel._refresh_status_label = lambda: None  # type: ignore[method-assign]
+    panel._refresh_minimap = lambda: None  # type: ignore[method-assign]
+    panel._refresh_count_label = lambda: None  # type: ignore[method-assign]
+
+    panel._scroll_to_block_center_and_release(7, token=42)
+    deadline = time.monotonic() + 1.0
+    while (
+        len(scroll_calls) < _JUMP_ANCHOR_SETTLE_PASSES
+        and time.monotonic() < deadline
+    ):
+        QTest.qWait(max(1, _JUMP_ANCHOR_SETTLE_DELAY_MS))
+        app.processEvents()
+
+    assert scroll_calls == [(7, True)] * _JUMP_ANCHOR_SETTLE_PASSES
+    assert finished == [True]
+    assert hidden == [True]
+    assert panel._suppress_edge_slide is False
+    panel.close()
+
+
 def test_time_travel_middle_page_requests_newer_at_bottom_edge() -> None:
     from codex_quota_viewer.sessions_page import _SessionDetailPanel
 
@@ -3617,10 +5125,10 @@ def test_time_travel_middle_page_requests_newer_at_bottom_edge() -> None:
 
     panel._slide_window_down()
 
-    assert captured == [(rec.id, 400, 200)]
+    assert captured == [(rec.id, 400, panel._OLDER_PAGE_SIZE)]
     assert panel._loading_newer is True
     panel._slide_window_down()
-    assert captured == [(rec.id, 400, 200)]
+    assert captured == [(rec.id, 400, panel._OLDER_PAGE_SIZE)]
     panel.close()
 
 
@@ -4084,3 +5592,1007 @@ def test_time_travel_vertical_view_chip_and_text_filters_compose() -> None:
     # Now also disable Tool chip — combined filter must drop to zero.
     view._kind_chips["tool"].setChecked(False)
     assert view._proxy.rowCount() == 0
+
+
+def test_time_travel_mode_bar_starts_in_messages_mode() -> None:
+    """The popup defaults to the Messages page so existing behaviour
+    (open → start typing in search) is preserved when the user hasn't
+    explicitly clicked the Attachments tab."""
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TimeTravelModeBar,
+    )
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-mode-default"), CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    assert popup._stack.currentIndex() == _TimeTravelModeBar.MODE_MESSAGES
+    assert popup._mode_bar.current_mode() == _TimeTravelModeBar.MODE_MESSAGES
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_mode_bar_switches_to_attachments() -> None:
+    """Clicking the Attachments tab routes the inner QStackedWidget to
+    page index 1 — the popup keeps the same height (no resize jitter)."""
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TimeTravelModeBar,
+    )
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-mode-switch", attachments_per_user=1),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    popup._mode_bar._attachments_button.setChecked(True)
+    assert popup._stack.currentIndex() == _TimeTravelModeBar.MODE_ATTACHMENTS
+
+    popup._mode_bar._messages_button.setChecked(True)
+    assert popup._stack.currentIndex() == _TimeTravelModeBar.MODE_MESSAGES
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_count_badge_reflects_total() -> None:
+    """The Attachments tab label embeds the total count so users can see
+    "is there anything in there?" without switching tabs first."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-badge", user_count=3, attachments_per_user=2
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    label = popup._mode_bar._attachments_button.text()
+    assert "(6)" in label  # 3 users × 2 image attachments each
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_model_collects_all_attachments() -> None:
+    """Each attachment on each block contributes one row to the grid
+    model — image + file mix in one flat list."""
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TT_ATT_BLOCK_INDEX_ROLE,
+        _TT_ATT_KIND_ROLE,
+    )
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-collect",
+            user_count=4,
+            attachments_per_user=2,
+            file_attachment_per_user=True,
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    model = popup._attachments._model
+    # 4 users × (2 images + 1 file) = 12 attachments
+    assert model.rowCount() == 12
+    # Mix of image + file kinds
+    kinds = [
+        model.index(i, 0).data(_TT_ATT_KIND_ROLE)
+        for i in range(model.rowCount())
+    ]
+    assert kinds.count("image") == 8
+    assert kinds.count("file") == 4
+    # Block indices reference back into _all_blocks (user prompts, every
+    # ``asst_per_user + 1``-th block) — bare existence check is enough.
+    block_indices = {
+        model.index(i, 0).data(_TT_ATT_BLOCK_INDEX_ROLE)
+        for i in range(model.rowCount())
+    }
+    assert block_indices.issubset(set(range(len(panel._all_blocks))))
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_model_skips_blocks_without_attachments() -> None:
+    """A session with zero attachments yields an empty model — assistant /
+    tool blocks contribute nothing, even though they exist in the
+    timeline."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-empty", user_count=4, asst_per_user=2, tool_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    assert popup._attachments._model.rowCount() == 0
+    assert popup._attachments.attachment_count() == 0
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_model_marks_filtered_rows() -> None:
+    """Panel-level filter dims attachments that belong to filtered-out
+    blocks — they stay visible (Time Travel always shows the whole
+    session) but the delegate paints them at 35% opacity via
+    ``IsFilteredOutRole``."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelAttachmentsModel,
+        _TT_ATT_FILTERED_OUT_ROLE,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail(
+        "tt-att-dim", user_count=3, attachments_per_user=1
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+    # Allow only the first user prompt block — every other block is dim.
+    user_block_indices = [
+        i for i, (kind, payload) in enumerate(blocks)
+        if kind == "single" and getattr(payload, "type", "") == "message:user"
+    ]
+    assert len(user_block_indices) >= 2
+    allowed = [user_block_indices[0]]
+
+    model = _TimeTravelAttachmentsModel()
+    model.refresh(blocks, allowed)
+
+    in_count = 0
+    out_count = 0
+    for r in range(model.rowCount()):
+        if model.index(r, 0).data(_TT_ATT_FILTERED_OUT_ROLE):
+            out_count += 1
+        else:
+            in_count += 1
+    assert in_count == 1
+    assert out_count == len(user_block_indices) - 1
+
+
+def test_time_travel_attachments_click_emits_block_index() -> None:
+    """Activating an attachment row emits a jump request — preferring
+    ``offsetClicked(ordinal, item_id)`` when both are populated (covers
+    out-of-slice items in huge sessions), falling back to
+    ``attachmentJumpRequested(block_index)`` for sliced rows that lack
+    one or the other."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-click", user_count=3, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    offset_captured: list[tuple[int, str]] = []
+    block_captured: list[int] = []
+    popup._attachments.offsetClicked.connect(
+        lambda o, i: offset_captured.append((o, i))
+    )
+    popup._attachments.attachmentJumpRequested.connect(block_captured.append)
+
+    # Activate the first attachment row directly via the model index —
+    # this is the same QModelIndex the view's clicked signal would carry.
+    # The host's _push_time_travel_data populated ordinal_map, so the
+    # row carries both ordinal and item_id → offset path wins.
+    first_idx = popup._attachments._model.index(0, 0)
+    popup._attachments._on_activated(first_idx)
+
+    from codex_quota_viewer.sessions_page import (
+        _TT_ATT_ITEM_ID_ROLE,
+        _TT_ATT_ORDINAL_ROLE,
+    )
+    expected_ordinal = first_idx.data(_TT_ATT_ORDINAL_ROLE)
+    expected_item_id = first_idx.data(_TT_ATT_ITEM_ID_ROLE)
+    assert isinstance(expected_ordinal, int)
+    assert expected_item_id  # populated from owner.id
+    assert offset_captured == [(expected_ordinal, expected_item_id)]
+    assert block_captured == []  # offset path took precedence
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_jump_routes_through_popup_blockJumpRequested() -> None:
+    """The view's ``attachmentJumpRequested`` is forwarded by the popup
+    on its existing ``blockJumpRequested`` signal — host wires this to
+    ``_recenter_async`` so attachment clicks reuse the message-jump
+    path. Same rapid-browse semantics, no popup close."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-route", user_count=3, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    captured: list[int] = []
+    panel._recenter_async = (  # type: ignore[method-assign]
+        lambda focus_block, **_kwargs: captured.append(focus_block)
+    )
+
+    # Pick the first attachment's source block via the model.
+    from codex_quota_viewer.sessions_page import _TT_ATT_BLOCK_INDEX_ROLE
+    first_block = popup._attachments._model.index(0, 0).data(
+        _TT_ATT_BLOCK_INDEX_ROLE
+    )
+    popup._attachments.attachmentJumpRequested.emit(first_block)
+
+    assert captured == [first_block]
+    # Popup stays open after a jump — rapid-browse semantics.
+    assert panel._time_travel_popup is not None
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_view_empty_state_when_no_attachments() -> None:
+    """A session without attachments shows the placeholder ("No
+    attachments in this session") and the mode-bar count is 0. Tab
+    stays clickable — disabling it would feel jarring."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(_make_time_travel_detail("tt-att-empty-state"), CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    assert popup._attachments.attachment_count() == 0
+    assert "(0)" in popup._mode_bar._attachments_button.text()
+    assert popup._mode_bar._attachments_button.isEnabled()
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_delegate_caches_decoded_thumbnail() -> None:
+    """Thumbnails are decoded once per (block, attachment) and reused on
+    subsequent paints — guards the expensive base64 → QImage decode
+    path from running on every scroll tick."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-cache", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    delegate = popup._attachments._delegate
+    assert delegate._thumb_cache == {}
+
+    # Fire two paint-equivalent thumbnail lookups for the same row —
+    # the second must be served from cache (same QPixmap identity).
+    idx = popup._attachments._model.index(0, 0)
+    pix1 = delegate._thumbnail_for(idx)
+    pix2 = delegate._thumbnail_for(idx)
+    assert pix1 is not None
+    assert pix1 is pix2
+    assert len(delegate._thumb_cache) == 1
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_refresh_clears_thumbnail_cache() -> None:
+    """Each call to ``view.refresh`` is treated as a session boundary —
+    cached thumbnails are dropped so a re-open against a different
+    session never reuses pixmaps from the previous one."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-att-cache-clear", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    delegate = popup._attachments._delegate
+    idx = popup._attachments._model.index(0, 0)
+    delegate._thumbnail_for(idx)
+    assert len(delegate._thumb_cache) >= 1
+
+    popup._attachments.refresh(panel._all_blocks, None)
+    assert delegate._thumb_cache == {}
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_survive_lightweight_index_mode() -> None:
+    """Huge sessions (timeline_total >> loaded items) take the
+    lightweight index path for the messages list — that path strips
+    attachment payloads. The attachments grid must still populate from
+    ``_all_blocks`` (the materialized slice) so the user doesn't see
+    ``Attachments (0)`` on a session that clearly has attached files."""
+    from codex_quota_viewer.sessions.models import (
+        SessionDetail,
+        SessionTimelineIndexItem,
+        SessionTimelineItem,
+    )
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    # Build a small materialized slice with one user message that has
+    # both a payload-level file attachment AND a markdown image link.
+    md_text = (
+        "Two SVG icons:\n"
+        "![GPT-account](E:/Download/GPT-account.svg)\n"
+        "![API-account](E:/Download/API-account.svg)\n"
+    )
+    user_item = SessionTimelineItem(
+        id="u-bigsession",
+        type="message:user",
+        timestamp="2026-04-30T01:25:00Z",
+        text=md_text,
+    )
+    detail = SessionDetail(
+        record=_record("tt-att-bigsession"),
+        audit_entries=[],
+        timeline=[user_item],
+        # timeline_total deliberately much larger than len(timeline) so
+        # _needs_time_travel_index() returns True.
+        timeline_total=6319,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    # Stand in for the lightweight index that the manager would normally
+    # provide async — populate it directly so _push_time_travel_data
+    # takes the index path on open.
+    panel._time_travel_index_items = [
+        SessionTimelineIndexItem(
+            ordinal=i,
+            item_id=f"big-{i}",
+            type="message:user" if i % 2 == 0 else "message:assistant",
+            timestamp="2026-04-30T01:25:00Z",
+            preview=f"item {i}",
+            tool_name=None,
+        )
+        for i in range(6319)
+    ]
+
+    popup = _open_time_travel_for_test(panel)
+
+    # Index mode must still show attachments from the loaded slice.
+    assert popup._attachments._model.rowCount() == 2
+    assert "(2)" in popup._mode_bar._attachments_button.text()
+    # And the messages list took the lightweight index path (proxy
+    # rowCount reflects the global index count, not the materialized 1).
+    assert popup._vertical._proxy.rowCount() == 6319
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_use_global_ordinal_in_index_mode() -> None:
+    """In huge sessions taking the lightweight index path, the
+    attachments grid must label cells with the global timeline ordinal
+    (matching the messages tab's ``#N``), not the local block index.
+    Without the ordinal_map plumbing, an attachment at item ordinal
+    2537 in a 6319-item session would render as ``#1`` because it's
+    the first row in ``_all_blocks`` — a 2536× discrepancy from what
+    the messages tab shows."""
+    from codex_quota_viewer.sessions.models import (
+        SessionDetail,
+        SessionTimelineIndexItem,
+        SessionTimelineItem,
+    )
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TT_ATT_ORDINAL_ROLE,
+    )
+
+    QApplication.instance() or QApplication([])
+    user_item = SessionTimelineItem(
+        id="u-deep",
+        type="message:user",
+        timestamp="2026-04-30T01:25:00Z",
+        text=(
+            "Two SVG icons:\n"
+            "![GPT-account](E:/Download/GPT-account.svg)\n"
+        ),
+    )
+    detail = SessionDetail(
+        record=_record("tt-att-ordinal"),
+        audit_entries=[],
+        timeline=[user_item],
+        timeline_total=6319,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    # Pretend the lightweight index landed and places this user item
+    # at global ordinal 2537 (display would be #2538, matching the
+    # messages tab numbering).
+    panel._time_travel_index_items = [
+        SessionTimelineIndexItem(
+            ordinal=2537,
+            item_id="u-deep",
+            type="message:user",
+            timestamp="2026-04-30T01:25:00Z",
+            preview="Two SVG icons",
+            tool_name=None,
+        )
+    ]
+
+    popup = _open_time_travel_for_test(panel)
+
+    # Model surfaces the global ordinal via _TT_ATT_ORDINAL_ROLE.
+    first_idx = popup._attachments._model.index(0, 0)
+    assert first_idx.data(_TT_ATT_ORDINAL_ROLE) == 2537
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_ordinal_map_cache_reuses_index_lookup() -> None:
+    """Once the loaded slice's id -> ordinal map is built from the full
+    lightweight index, later minimap refreshes should reuse it instead
+    of scanning the full session index again."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    class CountingIndexItems(list):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    loaded_item = SessionTimelineItem(
+        id="e-900",
+        type="message:user",
+        timestamp="2026-01-01T00:00:00Z",
+        text="has attachment",
+    )
+    panel._loaded_offset = 800
+    panel._all_timeline_items = [loaded_item]
+    panel._time_travel_index_items = CountingIndexItems(
+        [
+            SessionTimelineIndexItem(
+                ordinal=i,
+                item_id=f"e-{i}",
+                type="message:user",
+                timestamp="2026-01-01T00:00:00Z",
+                preview=f"item {i}",
+            )
+            for i in range(1000)
+        ]
+    )
+
+    first = panel._build_time_travel_ordinal_map()
+    second = panel._build_time_travel_ordinal_map()
+
+    assert first == {"e-900": 900}
+    assert second is first
+    assert panel._time_travel_index_items.iterations == 1
+    panel.close()
+
+
+def test_time_travel_attachments_ordinal_falls_back_to_block_index() -> None:
+    """When no ordinal_map is provided (small session, tests, etc.),
+    the model surfaces ``ordinal=None`` so the delegate falls back to
+    ``block_index + 1``. This guards the legacy code path used by the
+    standalone-model tests."""
+    from codex_quota_viewer.sessions_page import (
+        _TimeTravelAttachmentsModel,
+        _TT_ATT_ORDINAL_ROLE,
+        _coalesce_timeline_blocks,
+    )
+
+    QApplication.instance() or QApplication([])
+    detail = _make_time_travel_detail(
+        "tt-att-no-ordinal", user_count=2, attachments_per_user=1
+    )
+    blocks = _coalesce_timeline_blocks(detail.timeline)
+
+    model = _TimeTravelAttachmentsModel()
+    model.refresh(blocks, None)  # no ordinal_map → ordinal field stays None
+
+    for r in range(model.rowCount()):
+        assert model.index(r, 0).data(_TT_ATT_ORDINAL_ROLE) is None
+
+
+def test_time_travel_attachments_picks_up_markdown_image_links() -> None:
+    """A user message body like "see ![](E:/Download/x.svg) and
+    ![](E:/Download/y.png)" produces two attachment cards in the bubble
+    (via ``_extract_markdown_attachments``). The Time Travel grid must
+    pick those up too — otherwise sessions where the user pastes
+    screenshots via markdown syntax show "Attachments (0)" even though
+    the bubble clearly renders attachment cards."""
+    from codex_quota_viewer.sessions.models import (
+        SessionDetail,
+        SessionTimelineItem,
+    )
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    md_text = (
+        "Two SVG icons replacing the bitmap ones:\n"
+        "![GPT-account](E:/Download/GPT-account.svg)\n"
+        "![API-account](E:/Download/API-account.svg)\n"
+    )
+    user_item = SessionTimelineItem(
+        id="u-md",
+        type="message:user",
+        timestamp="2026-04-30T01:25:00Z",
+        text=md_text,
+    )
+    detail = SessionDetail(
+        record=_record("tt-att-md"),
+        audit_entries=[],
+        timeline=[user_item],
+        timeline_total=1,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    # Both markdown image links must contribute rows to the model.
+    assert popup._attachments._model.rowCount() == 2
+    assert "(2)" in popup._mode_bar._attachments_button.text()
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_attachments_handles_invalid_data_uri() -> None:
+    """A corrupt or empty data_uri falls back to the broken-image
+    placeholder rather than raising — `_decode_data_uri` returns None
+    on bad payloads and the delegate caches a sentinel pixmap."""
+    from codex_quota_viewer.sessions.models import (
+        Attachment,
+        SessionDetail,
+        SessionTimelineItem,
+    )
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    bad_attachment = Attachment(
+        kind="image",
+        mime="image/png",
+        data_uri="data:image/png;base64,not_real_base64_!!!",
+        name="broken.png",
+    )
+    user_item = SessionTimelineItem(
+        id="u-bad",
+        type="message:user",
+        timestamp="2026-01-01T00:00:00Z",
+        text="hi",
+        attachments=(bad_attachment,),
+    )
+    detail = SessionDetail(
+        record=_record("tt-att-broken"),
+        audit_entries=[],
+        timeline=[user_item],
+        timeline_total=1,
+        timeline_next_offset=None,
+    )
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(detail, CodexHomeTarget.SANDBOX)
+    popup = _open_time_travel_for_test(panel)
+
+    delegate = popup._attachments._delegate
+    idx = popup._attachments._model.index(0, 0)
+    pix = delegate._thumbnail_for(idx)
+    # Broken-image placeholder is a non-null QPixmap — the test guards
+    # against the path raising or returning None for the corrupt input.
+    assert pix is not None
+    assert not pix.isNull()
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+# ---- Full-session attachments lazy-load tests -------------------------------
+
+
+def _make_session_attachment_row(
+    *, ordinal: int, item_id: str, name: str = "shot.png"
+) -> Any:
+    """Build a SessionAttachmentRow for UI tests — same shape the
+    repository produces, but constructed by hand so tests don't have
+    to spin up a real SQLite database."""
+    from codex_quota_viewer.sessions.models import (
+        Attachment,
+        SessionAttachmentRow,
+    )
+
+    return SessionAttachmentRow(
+        ordinal=ordinal,
+        item_id=item_id,
+        type="message:user",
+        timestamp="2026-04-30T01:25:00Z",
+        attachment_index=0,
+        attachment=Attachment(
+            kind="image",
+            mime="image/png",
+            data_uri=_TT_TINY_PNG_DATA_URI,
+            name=name,
+        ),
+    )
+
+
+def test_time_travel_full_attachments_replaces_sliced_view() -> None:
+    """When the host pushes a SQL-fetched full attachment list, the
+    grid replaces its sliced view — row count comes from the full list,
+    ordinals come from the row objects (matching messages tab #N), not
+    from synthetic block indices."""
+    from codex_quota_viewer.sessions_page import (
+        _SessionDetailPanel,
+        _TT_ATT_ORDINAL_ROLE,
+    )
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-full-replace", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+    assert popup._attachments._model.rowCount() == 2  # sliced
+
+    # Simulate the worker callback with 5 SQL rows at deep ordinals.
+    rows = [
+        _make_session_attachment_row(
+            ordinal=ord_, item_id=f"u-{ord_}", name=f"shot_{ord_}.png"
+        )
+        for ord_ in (12, 137, 2538, 4001, 6001)
+    ]
+    popup.set_full_attachments(rows)
+
+    assert popup._attachments._model.rowCount() == 5
+    assert "(5)" in popup._mode_bar._attachments_button.text()
+    # Each row's _TT_ATT_ORDINAL_ROLE is the SQL ordinal directly —
+    # NOT a synthetic block index. Display would render #13, #138, etc.
+    actual_ordinals = [
+        popup._attachments._model.index(r, 0).data(_TT_ATT_ORDINAL_ROLE)
+        for r in range(5)
+    ]
+    assert actual_ordinals == [12, 137, 2538, 4001, 6001]
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_caches_per_session() -> None:
+    """Repeat tab clicks within the same session reuse the cached
+    rows instead of re-firing ``full_attachments_requested``. Cross-
+    session swap drops the cache."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-cache", user_count=2),
+        CodexHomeTarget.SANDBOX,
+    )
+
+    requests: list[str] = []
+    panel.full_attachments_requested.connect(requests.append)
+
+    popup = _open_time_travel_for_test(panel)
+
+    # First time the popup signals the host: cache miss, fire signal.
+    panel._on_full_attachments_requested()
+    assert requests == [panel._loaded_session_id]
+
+    # Worker callback lands → cache populated.
+    rows = [_make_session_attachment_row(ordinal=42, item_id="u-1")]
+    panel.set_full_session_attachments(panel._loaded_session_id, rows)
+    assert panel._loaded_session_id in panel._full_attachments_cache
+
+    # Second trigger inside the same session → cache hit, no new emit.
+    panel._on_full_attachments_requested()
+    assert requests == [panel._loaded_session_id]  # length unchanged
+
+    # Different session swap → cache cleared.
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-other"), CodexHomeTarget.SANDBOX
+    )
+    assert panel._full_attachments_cache == {}
+    panel.close()
+
+
+def test_time_travel_full_attachments_drops_stale_after_session_swap() -> None:
+    """A worker callback that arrives AFTER the user navigated to
+    another session must be dropped — the rows belong to the previous
+    session and pushing them would corrupt the new view."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-stale-1"), CodexHomeTarget.SANDBOX
+    )
+    stale_id = panel._loaded_session_id
+
+    popup = _open_time_travel_for_test(panel)
+    panel._on_full_attachments_requested()
+    assert stale_id in panel._full_attachments_pending
+
+    # User navigates away before worker returns.
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-stale-2"), CodexHomeTarget.SANDBOX
+    )
+    new_id = panel._loaded_session_id
+    assert new_id != stale_id
+
+    # Stale callback lands — must NOT pollute the new session's cache.
+    rows = [_make_session_attachment_row(ordinal=99, item_id="u-stale")]
+    panel.set_full_session_attachments(stale_id, rows)
+    assert stale_id not in panel._full_attachments_cache
+    assert new_id not in panel._full_attachments_cache
+    panel.close()
+
+
+def test_time_travel_full_attachments_handles_worker_error() -> None:
+    """If the worker fails (manager.list_session_attachments raises),
+    the in-flight marker is cleared so the user can retry by re-
+    opening the tab. The sliced view stays in place."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-full-error", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+    sliced_count_before = popup._attachments._model.rowCount()
+
+    panel._on_full_attachments_requested()
+    assert panel._loaded_session_id in panel._full_attachments_pending
+
+    # Simulate the worker erroring out.
+    panel.cancel_full_session_attachments_request(panel._loaded_session_id)
+
+    assert panel._loaded_session_id not in panel._full_attachments_pending
+    # Sliced view still there — no rows replaced.
+    assert popup._attachments._model.rowCount() == sliced_count_before
+    # Popup's "already requested" flag was reset so re-opening the tab
+    # would fire a fresh request.
+    assert popup._full_attachments_requested is False
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_click_emits_offset() -> None:
+    """A click on a thumbnail in full-load mode emits ``offsetClicked``
+    (not the in-slice ``attachmentJumpRequested``) so the host's
+    ``_on_time_travel_offset_jump`` can route to items outside
+    ``_all_blocks``."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-full-click"), CodexHomeTarget.SANDBOX
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    rows = [
+        _make_session_attachment_row(
+            ordinal=2537, item_id="u-deep", name="GPT-account.svg"
+        )
+    ]
+    popup.set_full_attachments(rows)
+
+    captured: list[tuple[int, str]] = []
+    popup._attachments.offsetClicked.connect(lambda o, i: captured.append((o, i)))
+
+    first_idx = popup._attachments._model.index(0, 0)
+    popup._attachments._on_activated(first_idx)
+
+    assert captured == [(2537, "u-deep")]
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_click_routes_via_ordinal_with_empty_item_id() -> None:
+    """Regression for the P2 click-routing bug: a row with valid
+    ordinal but EMPTY item_id must still route through
+    ``offsetClicked`` (the host's offset-jump path resolves anchors
+    from ``_all_timeline_items`` when item_id is missing). The previous
+    ``and item_id`` guard incorrectly fell through to
+    ``attachmentJumpRequested(synthetic_block_index)`` and jumped to
+    an arbitrary in-slice block."""
+    from codex_quota_viewer.sessions.models import (
+        Attachment,
+        SessionAttachmentRow,
+    )
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail("tt-empty-id"), CodexHomeTarget.SANDBOX
+    )
+    popup = _open_time_travel_for_test(panel)
+
+    # Build a SQL-row whose item_id is empty — could happen if the
+    # repository row had a NULL/empty id column.
+    rows = [
+        SessionAttachmentRow(
+            ordinal=4242,
+            item_id="",
+            type="message:user",
+            timestamp="2026-04-30T01:25:00Z",
+            attachment_index=0,
+            attachment=Attachment(
+                kind="image",
+                mime="image/png",
+                data_uri=_TT_TINY_PNG_DATA_URI,
+                name="orphan.png",
+            ),
+        )
+    ]
+    popup.set_full_attachments(rows)
+
+    offset_captured: list[tuple[int, str]] = []
+    block_captured: list[int] = []
+    popup._attachments.offsetClicked.connect(
+        lambda o, i: offset_captured.append((o, i))
+    )
+    popup._attachments.attachmentJumpRequested.connect(block_captured.append)
+
+    popup._attachments._on_activated(popup._attachments._model.index(0, 0))
+
+    # Ordinal alone is enough — empty item_id is OK; host fills it in
+    # from _all_timeline_items at jump time.
+    assert offset_captured == [(4242, "")]
+    assert block_captured == []
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_survive_subsequent_data_push() -> None:
+    """Regression for the P1 bug: once the cached full list is
+    populated, a later ``_push_time_travel_data`` (e.g. a minimap
+    refresh after the user scrolls) must NOT revert the grid back to
+    the sliced view. Previously the host always called
+    ``set_attachments(blocks, ...)`` which overwrote the full grid."""
+    from codex_quota_viewer.sessions_page import _SessionDetailPanel
+
+    QApplication.instance() or QApplication([])
+    panel = _SessionDetailPanel(translator=lambda s: s)
+    panel.set_detail(
+        _make_time_travel_detail(
+            "tt-full-survive", user_count=2, attachments_per_user=1
+        ),
+        CodexHomeTarget.SANDBOX,
+    )
+    popup = _open_time_travel_for_test(panel)
+    sliced_count = popup._attachments._model.rowCount()
+    assert sliced_count == 2  # baseline sliced view
+
+    # Worker callback lands with a richer full list (5 rows from across
+    # the whole session, beyond the sliced 2).
+    full_rows = [
+        _make_session_attachment_row(
+            ordinal=ord_, item_id=f"u-{ord_}", name=f"shot_{ord_}.png"
+        )
+        for ord_ in (10, 100, 1000, 2500, 5000)
+    ]
+    panel.set_full_session_attachments(panel._loaded_session_id, full_rows)
+    assert popup._attachments._model.rowCount() == 5
+
+    refresh_calls: list[int] = []
+    real_refresh_full = popup._attachments.refresh_full
+
+    def spy_refresh_full(rows: list[Any]) -> None:
+        refresh_calls.append(len(rows))
+        real_refresh_full(rows)
+
+    popup._attachments.refresh_full = spy_refresh_full  # type: ignore[method-assign]
+
+    # Simulate a later refresh — the kind of trigger that previously
+    # blew the grid away.
+    panel._push_time_travel_data()
+
+    assert popup._attachments._model.rowCount() == 5
+    assert "(5)" in popup._mode_bar._attachments_button.text()
+    assert refresh_calls == []
+    panel._dismiss_time_travel_popup()
+    panel.close()
+
+
+def test_time_travel_full_attachments_rejects_stale_target() -> None:
+    """Regression for the P2 stale-target bug: a worker result that
+    arrives after the user switched targets (Sandbox <-> Real) must
+    NOT be applied even when the session id happens to match (Sandbox
+    and Real can hold copies with the same id).
+
+    Uses a task_runner stub that DELAYS the on_success callback so we
+    can swap ``_target`` between request submission and delivery —
+    that's the production race window the fix protects against."""
+    from codex_quota_viewer.sessions_page import SessionsPage
+
+    QApplication.instance() or QApplication([])
+    captured_calls: list[tuple[CodexHomeTarget, str]] = []
+
+    class FakeManager:
+        def __init__(self, target: CodexHomeTarget):
+            self._target = target
+
+        def list_session_attachments(self, session_id: str):
+            captured_calls.append((self._target, session_id))
+            return [("fake-row",)]
+
+        def list_sessions(self, _filters):
+            return []
+
+    deferred: list[tuple[Any, Any, Any]] = []
+
+    def fake_runner(action, on_success, on_error):
+        # Run the action immediately (captures active_target via the
+        # closure in _request_full_session_attachments) but defer the
+        # success callback so we can mutate _target in between.
+        try:
+            result = action()
+        except Exception as exc:  # pragma: no cover - sanity guard
+            deferred.append((None, on_error, exc))
+            return
+        deferred.append((result, on_success, None))
+
+    page = SessionsPage(
+        sessions_manager_factory=lambda target: FakeManager(target),
+        confirm_real_action=lambda _title, _msg: True,
+        translator=lambda s: s,
+        task_runner=fake_runner,
+    )
+
+    applied: list[tuple[str, list]] = []
+    real_setter = page._detail_panel.set_full_session_attachments
+
+    def spy(session_id: str, rows: list) -> None:
+        applied.append((session_id, list(rows)))
+        real_setter(session_id, rows)
+
+    page._detail_panel.set_full_session_attachments = spy  # type: ignore[method-assign]
+
+    # Simulate: request submitted under SANDBOX target...
+    page._active_session_id = "shared-sess"
+    page._target = CodexHomeTarget.SANDBOX
+    page._request_full_session_attachments("shared-sess")
+    # ...action ran against SANDBOX, callback queued.
+    assert captured_calls == [(CodexHomeTarget.SANDBOX, "shared-sess")]
+    assert len(deferred) == 1
+    assert applied == []
+
+    # User switches targets BEFORE the worker callback fires.
+    page._target = CodexHomeTarget.REAL
+
+    # Now drain the deferred callback. The deliver guard should reject
+    # the result because the target no longer matches the captured one.
+    result, callback, _err = deferred[0]
+    callback(result)
+
+    assert applied == []  # rejected — stale target
+    page.close()

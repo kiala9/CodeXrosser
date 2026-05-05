@@ -15,14 +15,36 @@ from .paths import ensure_inside_realpath, shell_quote
 SESSION_RELATIVE_PATTERN = re.compile(r"^rollout-.+-(?P<id>[0-9a-fA-F-]+)\.jsonl$")
 
 
-def collect_sessions(root: Path) -> list[tuple[Path, ParsedSessionCatalog]]:
+def collect_sessions(
+    root: Path,
+    *,
+    skip_paths: frozenset[Path] | set[Path] | None = None,
+) -> list[tuple[Path, ParsedSessionCatalog, int]]:
+    """Walk session JSONL files under ``root`` and parse each.
+
+    Returns ``[(file_path, parsed, mtime_ns), ...]`` for every file that
+    parsed successfully. ``mtime_ns`` is captured before parse so the
+    incremental-rescan cache can use it as the freshness key on the next
+    scan.
+
+    Files whose absolute path appears in ``skip_paths`` are skipped
+    without stat-ing or parsing — caller has already determined they are
+    cache-fresh. The cache check itself happens upstream in
+    ``SessionsManager._scan_and_index_sessions``."""
     if not root.exists():
         return []
-    entries: list[tuple[Path, ParsedSessionCatalog]] = []
+    skip = skip_paths or frozenset()
+    entries: list[tuple[Path, ParsedSessionCatalog, int]] = []
     for file_path in _walk_jsonl_files(root):
         try:
             ensure_inside_realpath(root, file_path)
         except Exception:
+            continue
+        if file_path in skip:
+            continue
+        try:
+            mtime_ns = file_path.stat().st_mtime_ns
+        except OSError:
             continue
         try:
             parsed = parse_session_catalog(file_path)
@@ -30,7 +52,7 @@ def collect_sessions(root: Path) -> list[tuple[Path, ParsedSessionCatalog]]:
             continue
         if parsed is None:
             continue
-        entries.append((file_path, parsed))
+        entries.append((file_path, parsed, mtime_ns))
     return entries
 
 

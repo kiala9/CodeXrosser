@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QSize, Qt
+from PySide6.QtGui import QImageReader
+
 from ._perf import _perf_timer
+from .jsonl_parser import _extract_markdown_image_attachments
 from .models import (
     Attachment,
     AuditEntry,
     CatalogSessionEntry,
+    SessionAttachmentRow,
     SessionFilters,
     SessionRecord,
     SessionTimelineIndexItem,
@@ -20,7 +28,23 @@ from .models import (
 )
 
 
+@dataclass(frozen=True)
+class SessionScanMetadata:
+    """Lightweight per-session row used by the incremental-rescan cache
+    check. Just enough to decide whether a file's path/mtime matches
+    what we last parsed — the full ``CatalogSessionEntry`` is only
+    rebuilt when the cache misses."""
+    session_id: str
+    active_path: str | None
+    archive_path: str | None
+    snapshot_path: str | None
+    primary_mtime_ns: int
+    parser_version: int
+
+
 SCHEMA_FILE_NAME = "schema.sql"
+_ATTACHMENT_THUMBNAIL_MAX_SOURCE_BYTES = 16 * 1024 * 1024
+_ATTACHMENT_THUMBNAIL_SIZE = QSize(100, 100)
 
 
 SESSION_SELECT_COLUMNS = """
@@ -109,13 +133,109 @@ class SessionRepository:
         return bool(self._fts_available)
 
     def replace_catalog(self, entries: list[CatalogSessionEntry]) -> list[SessionRecord]:
-        indexed_at = _now_iso()
-        with _perf_timer("repository.replace_catalog", entries=len(entries)):
+        # Thin wrapper over upsert_catalog: every entry treated as fresh,
+        # nothing kept → DB rows not present in ``entries`` get deleted.
+        # Same end-state as the old all-delete-then-insert path; kept for
+        # callers (e.g. existing tests) that don't have stat metadata.
+        return self.upsert_catalog(
+            fresh_entries=entries,
+            fresh_metadata={},
+            kept_session_ids=set(),
+        )
+
+    def upsert_catalog(
+        self,
+        *,
+        fresh_entries: list[CatalogSessionEntry],
+        fresh_metadata: dict[str, tuple[int, int]],
+        kept_session_ids: set[str],
+    ) -> list[SessionRecord]:
+        """Atomic catalog rewrite — thin wrapper around the batch APIs.
+        The outer ``_transaction()`` makes both phases share one BEGIN/
+        COMMIT (the inner transactions inside batch_start/batch_apply
+        no-op because ``_Transaction`` checks ``in_transaction``), so a
+        failure halfway through rolls back orphan deletes too — same
+        guarantee the pre-batched ``replace_catalog`` had. The streaming
+        rescan path (P1.8) calls ``upsert_catalog_batch_*`` directly,
+        skipping this outer transaction so partial state IS observable
+        between batches — that's the trade-off that lets the UI stream."""
+        with _perf_timer(
+            "repository.upsert_catalog",
+            fresh=len(fresh_entries),
+            kept=len(kept_session_ids),
+        ):
+            fresh_ids = {entry.summary.id for entry in fresh_entries}
             with self._lock, self._transaction():
-                existing = self._read_all_session_rows()
-                self._connection.execute("delete from timeline_items")
-                self._connection.execute("delete from sessions")
-                self._clear_session_search()
+                self.upsert_catalog_batch_start(
+                    kept_session_ids=kept_session_ids,
+                    expected_fresh_session_ids=fresh_ids,
+                )
+                if fresh_entries:
+                    self.upsert_catalog_batch_apply(
+                        entries=fresh_entries,
+                        fresh_metadata=fresh_metadata,
+                    )
+        return self.list_sessions()
+
+    def upsert_catalog_batch_start(
+        self,
+        *,
+        kept_session_ids: set[str],
+        expected_fresh_session_ids: set[str],
+    ) -> None:
+        """Phase 1 of the streaming catalog rewrite: delete orphan rows
+        (in DB but absent from both kept and the upcoming fresh set) and
+        refresh ``indexed_at`` on kept rows. Single transaction, runs
+        once before any ``upsert_catalog_batch_apply`` calls."""
+        indexed_at = _now_iso()
+        with self._lock, self._transaction():
+            existing = self._read_all_session_rows()
+            obsolete_ids = [
+                sid
+                for sid in existing.keys()
+                if sid not in expected_fresh_session_ids
+                and sid not in kept_session_ids
+            ]
+            for sid in obsolete_ids:
+                self._connection.execute(
+                    "delete from timeline_items where session_id = ?", (sid,)
+                )
+                self._connection.execute(
+                    "delete from session_search where session_id = ?", (sid,)
+                )
+                self._connection.execute(
+                    "delete from sessions where id = ?", (sid,)
+                )
+            for sid in kept_session_ids:
+                if sid in existing:
+                    self._connection.execute(
+                        "update sessions set indexed_at = ? where id = ?",
+                        (indexed_at, sid),
+                    )
+
+    def upsert_catalog_batch_apply(
+        self,
+        *,
+        entries: list[CatalogSessionEntry],
+        fresh_metadata: dict[str, tuple[int, int]],
+    ) -> None:
+        """Phase 2 of the streaming catalog rewrite: upsert one chunk of
+        fresh entries in a single transaction. Caller invokes this once
+        per batch so partial state becomes visible between batches —
+        the UI can re-query ``list_sessions`` and show progress mid-scan
+        without waiting for the whole rescan to commit."""
+        if not entries:
+            return
+        indexed_at = _now_iso()
+        with _perf_timer(
+            "repository.upsert_catalog_batch_apply",
+            entries=len(entries),
+        ):
+            with self._lock, self._transaction():
+                existing = {
+                    eid: self._read_session_row(eid)
+                    for eid in (entry.summary.id for entry in entries)
+                }
                 for entry in entries:
                     prior = existing.get(entry.summary.id)
                     created_at = prior["created_at"] if prior else indexed_at
@@ -124,12 +244,62 @@ class SessionRepository:
                         if prior and not _did_catalog_entry_change(prior, entry)
                         else indexed_at
                     )
-                    self._insert_session(entry, created_at=created_at, updated_at=updated_at, indexed_at=indexed_at)
+                    mtime_ns, parser_version = fresh_metadata.get(
+                        entry.summary.id, (0, 0)
+                    )
+                    self._connection.execute(
+                        "delete from timeline_items where session_id = ?",
+                        (entry.summary.id,),
+                    )
+                    self._connection.execute(
+                        "delete from session_search where session_id = ?",
+                        (entry.summary.id,),
+                    )
+                    self._upsert_session(
+                        entry,
+                        created_at=created_at,
+                        updated_at=updated_at,
+                        indexed_at=indexed_at,
+                        primary_mtime_ns=mtime_ns,
+                        parser_version=parser_version,
+                    )
                     self._insert_session_search(entry)
                     self._insert_timeline_items(entry)
-        return self.list_sessions()
 
-    def save_catalog_entry(self, entry: CatalogSessionEntry) -> SessionRecord:
+    def list_session_scan_metadata(self) -> list[SessionScanMetadata]:
+        """Lightweight per-session read used by the incremental-rescan
+        cache check. Returns just the columns needed to decide whether
+        the on-disk primary file's path/mtime match what we last parsed."""
+        rows = self._connection.execute(
+            """
+            select id, active_path, archive_path, snapshot_path,
+                   primary_mtime_ns, parser_version
+            from sessions
+            """
+        ).fetchall()
+        return [
+            SessionScanMetadata(
+                session_id=str(row["id"]),
+                active_path=row["active_path"],
+                archive_path=row["archive_path"],
+                snapshot_path=row["snapshot_path"],
+                primary_mtime_ns=int(row["primary_mtime_ns"] or 0),
+                parser_version=int(row["parser_version"] or 0),
+            )
+            for row in rows
+        ]
+
+    def save_catalog_entry(
+        self,
+        entry: CatalogSessionEntry,
+        *,
+        primary_mtime_ns: int = 0,
+        parser_version: int = 0,
+    ) -> SessionRecord:
+        """Single-session upsert. Used by the lazy reparse path (P1.5.1)
+        when ``get_session_detail`` discovers the persisted timeline was
+        produced by an older parser. Does NOT touch other sessions —
+        that's the whole point compared to ``upsert_catalog``."""
         now = _now_iso()
         with self._lock, self._transaction():
             existing = self._read_session_row(entry.summary.id)
@@ -139,7 +309,14 @@ class SessionRepository:
                 if existing and not _did_catalog_entry_change(existing, entry)
                 else now
             )
-            self._upsert_session(entry, created_at=created_at, updated_at=updated_at, indexed_at=now)
+            self._upsert_session(
+                entry,
+                created_at=created_at,
+                updated_at=updated_at,
+                indexed_at=now,
+                primary_mtime_ns=primary_mtime_ns,
+                parser_version=parser_version,
+            )
             self._connection.execute(
                 "delete from timeline_items where session_id = ?",
                 (entry.summary.id,),
@@ -154,6 +331,33 @@ class SessionRepository:
         if record is None:
             raise RuntimeError(f"Session disappeared after upsert: {entry.summary.id}")
         return record
+
+    def get_session_parser_version(self, session_id: str) -> int:
+        """One-row lookup used by the lazy-reparse cache check before
+        ``get_session_detail`` does its tail load. Returns 0 if the
+        session row is missing — caller treats that as a cache miss."""
+        row = self._connection.execute(
+            "select parser_version from sessions where id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row["parser_version"] or 0) if row else 0
+
+    def get_session_freshness(self, session_id: str) -> tuple[int, int]:
+        """One-row freshness lookup: (parser_version, primary_mtime_ns).
+        Used by ``get_session_detail`` to decide whether the cached
+        timeline is still valid before serving a tail load. Returns
+        (0, 0) if the session row is missing — caller treats that as
+        a cache miss and falls through to reparse."""
+        row = self._connection.execute(
+            "select parser_version, primary_mtime_ns from sessions where id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return (0, 0)
+        return (
+            int(row["parser_version"] or 0),
+            int(row["primary_mtime_ns"] or 0),
+        )
 
     def update_session(self, session_id: str, mutation: dict[str, Any]) -> SessionRecord:
         with self._lock, self._transaction():
@@ -366,6 +570,55 @@ class SessionRepository:
         ).fetchall()
         return [_map_timeline_index_row(row) for row in rows]
 
+    def list_session_attachments(self, session_id: str) -> list[SessionAttachmentRow]:
+        """Return every attachment in a session in ordinal order."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                select ordinal, item_id, type, timestamp, attachments_json, NULL as text
+                from timeline_items
+                where session_id = ? and attachments_json is not null
+                union all
+                select ordinal, item_id, type, timestamp, NULL as attachments_json, text
+                from timeline_items
+                where session_id = ?
+                  and attachments_json is null
+                  and text is not null
+                  and instr(text, '![') > 0
+                order by ordinal asc
+                """,
+                (session_id, session_id),
+            ).fetchall()
+            attachment_rows: list[SessionAttachmentRow] = []
+            for row in rows:
+                attachments = _decode_attachments_json(row)
+                if not attachments:
+                    _text, attachments = _extract_markdown_image_attachments(
+                        str(row["text"] or "")
+                    )
+                if not attachments:
+                    continue
+                item_type = str(row["type"])
+                normalized_type = (
+                    "tool_call"
+                    if item_type == "tool_call"
+                    else "message:assistant"
+                    if item_type == "message:assistant"
+                    else "message:user"
+                )
+                for attachment_index, attachment in enumerate(attachments):
+                    attachment_rows.append(
+                        SessionAttachmentRow(
+                            ordinal=int(row["ordinal"] or 0),
+                            item_id=str(row["item_id"]),
+                            type=normalized_type,  # type: ignore[arg-type]
+                            timestamp=str(row["timestamp"]),
+                            attachment_index=attachment_index,
+                            attachment=_attachment_with_lightweight_preview(attachment),
+                        )
+                    )
+            return attachment_rows
+
     def list_audit_entries(self, session_id: str) -> list[AuditEntry]:
         rows = self._connection.execute(
             """
@@ -500,8 +753,17 @@ class SessionRepository:
         created_at: str,
         updated_at: str,
         indexed_at: str,
+        primary_mtime_ns: int = 0,
+        parser_version: int = 0,
     ) -> None:
-        self._connection.execute(_INSERT_SESSION_SQL, _entry_to_params(entry, created_at, updated_at, indexed_at))
+        self._connection.execute(
+            _INSERT_SESSION_SQL,
+            _entry_to_params(
+                entry, created_at, updated_at, indexed_at,
+                primary_mtime_ns=primary_mtime_ns,
+                parser_version=parser_version,
+            ),
+        )
 
     def _upsert_session(
         self,
@@ -510,8 +772,17 @@ class SessionRepository:
         created_at: str,
         updated_at: str,
         indexed_at: str,
+        primary_mtime_ns: int = 0,
+        parser_version: int = 0,
     ) -> None:
-        self._connection.execute(_UPSERT_SESSION_SQL, _entry_to_params(entry, created_at, updated_at, indexed_at))
+        self._connection.execute(
+            _UPSERT_SESSION_SQL,
+            _entry_to_params(
+                entry, created_at, updated_at, indexed_at,
+                primary_mtime_ns=primary_mtime_ns,
+                parser_version=parser_version,
+            ),
+        )
 
     def _insert_session_search(self, entry: CatalogSessionEntry) -> None:
         if not self.fts_available:
@@ -552,8 +823,25 @@ class SessionRepository:
         schema_path = Path(__file__).parent / SCHEMA_FILE_NAME
         sql = schema_path.read_text(encoding="utf-8")
         with self._lock, self._transaction():
+            self._ensure_legacy_timeline_attachment_column()
             self._connection.executescript(sql)
             self._ensure_legacy_columns()
+
+    def _ensure_legacy_timeline_attachment_column(self) -> None:
+        table = self._connection.execute(
+            """
+            select name from sqlite_master
+            where type = 'table' and name = 'timeline_items'
+            """
+        ).fetchone()
+        if table is None:
+            return
+        timeline_rows = self._connection.execute("pragma table_info(timeline_items)").fetchall()
+        timeline_columns = {str(row["name"]) for row in timeline_rows if row and row["name"]}
+        if "attachments_json" not in timeline_columns:
+            self._connection.execute(
+                "alter table timeline_items add column attachments_json text"
+            )
 
     def _ensure_legacy_columns(self) -> None:
         rows = self._connection.execute("pragma table_info(sessions)").fetchall()
@@ -562,6 +850,18 @@ class SessionRepository:
             self._connection.execute("alter table sessions add column indexed_at text")
             self._connection.execute(
                 "update sessions set indexed_at = coalesce(indexed_at, updated_at, created_at, CURRENT_TIMESTAMP)"
+            )
+        # P1.5 incremental-rescan freshness columns. Existing rows default
+        # to 0 → mismatches the current PARSER_VERSION → first post-upgrade
+        # rescan reparses everything (same cost as today's behavior), then
+        # writes real values and subsequent rescans are incremental.
+        if "primary_mtime_ns" not in column_names:
+            self._connection.execute(
+                "alter table sessions add column primary_mtime_ns integer not null default 0"
+            )
+        if "parser_version" not in column_names:
+            self._connection.execute(
+                "alter table sessions add column parser_version integer not null default 0"
             )
         timeline_rows = self._connection.execute("pragma table_info(timeline_items)").fetchall()
         timeline_columns = {str(row["name"]) for row in timeline_rows if row and row["name"]}
@@ -604,13 +904,15 @@ insert into sessions (
     cwd, started_at, originator, source, cli_version, model_provider,
     size_bytes, line_count, event_count, tool_call_count,
     user_prompt_excerpt, latest_agent_message_excerpt, status,
-    created_at, updated_at, indexed_at
+    created_at, updated_at, indexed_at,
+    primary_mtime_ns, parser_version
 ) values (
     :id, :active_path, :archive_path, :snapshot_path, :original_relative_path,
     :cwd, :started_at, :originator, :source, :cli_version, :model_provider,
     :size_bytes, :line_count, :event_count, :tool_call_count,
     :user_prompt_excerpt, :latest_agent_message_excerpt, :status,
-    :created_at, :updated_at, :indexed_at
+    :created_at, :updated_at, :indexed_at,
+    :primary_mtime_ns, :parser_version
 )
 """
 
@@ -621,13 +923,15 @@ insert into sessions (
     cwd, started_at, originator, source, cli_version, model_provider,
     size_bytes, line_count, event_count, tool_call_count,
     user_prompt_excerpt, latest_agent_message_excerpt, status,
-    created_at, updated_at, indexed_at
+    created_at, updated_at, indexed_at,
+    primary_mtime_ns, parser_version
 ) values (
     :id, :active_path, :archive_path, :snapshot_path, :original_relative_path,
     :cwd, :started_at, :originator, :source, :cli_version, :model_provider,
     :size_bytes, :line_count, :event_count, :tool_call_count,
     :user_prompt_excerpt, :latest_agent_message_excerpt, :status,
-    :created_at, :updated_at, :indexed_at
+    :created_at, :updated_at, :indexed_at,
+    :primary_mtime_ns, :parser_version
 )
 on conflict(id) do update set
     active_path = excluded.active_path,
@@ -649,7 +953,9 @@ on conflict(id) do update set
     status = excluded.status,
     created_at = excluded.created_at,
     updated_at = excluded.updated_at,
-    indexed_at = excluded.indexed_at
+    indexed_at = excluded.indexed_at,
+    primary_mtime_ns = excluded.primary_mtime_ns,
+    parser_version = excluded.parser_version
 """
 
 
@@ -687,7 +993,15 @@ _MUTATION_KEY_COLUMNS = {
 }
 
 
-def _entry_to_params(entry: CatalogSessionEntry, created_at: str, updated_at: str, indexed_at: str) -> dict[str, Any]:
+def _entry_to_params(
+    entry: CatalogSessionEntry,
+    created_at: str,
+    updated_at: str,
+    indexed_at: str,
+    *,
+    primary_mtime_ns: int = 0,
+    parser_version: int = 0,
+) -> dict[str, Any]:
     return {
         "id": entry.summary.id,
         "active_path": entry.active_path,
@@ -710,6 +1024,8 @@ def _entry_to_params(entry: CatalogSessionEntry, created_at: str, updated_at: st
         "created_at": created_at,
         "updated_at": updated_at,
         "indexed_at": indexed_at,
+        "primary_mtime_ns": primary_mtime_ns,
+        "parser_version": parser_version,
     }
 
 
@@ -902,6 +1218,90 @@ def _decode_attachments_json(row: sqlite3.Row) -> tuple[Attachment, ...]:
         if attachment is not None:
             attachments.append(attachment)
     return tuple(attachments)
+
+
+def _attachment_with_lightweight_preview(attachment: Attachment) -> Attachment:
+    """Return attachment metadata suitable for the full-session navigator.
+
+    Detail timeline pages still round-trip original ``data_uri`` bytes for
+    visible bubbles. The full Time Travel attachment list can contain hundreds
+    of screenshots, so it replaces inline image bytes with a tiny PNG preview.
+    That keeps the Images tab visually useful while avoiding a cache of every
+    full-resolution screenshot.
+    """
+    if attachment.data_uri is None:
+        return attachment
+    data_uri = None
+    if attachment.kind == "image":
+        data_uri = _build_inline_image_thumbnail_data_uri(attachment.data_uri)
+    return Attachment(
+        kind=attachment.kind,
+        mime=attachment.mime,
+        data_uri=data_uri,
+        path=attachment.path,
+        alt=attachment.alt,
+        name=attachment.name,
+        source=attachment.source,
+    )
+
+
+def _build_inline_image_thumbnail_data_uri(data_uri: str) -> str | None:
+    decoded = _decode_data_uri_bytes(data_uri)
+    if decoded is None:
+        return None
+    buffer = QBuffer()
+    buffer.setData(QByteArray(decoded))
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        return None
+    reader = QImageReader(buffer)
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.width() > 0 and source_size.height() > 0:
+        scaled_size = source_size.scaled(_ATTACHMENT_THUMBNAIL_SIZE, Qt.KeepAspectRatio)
+        if (
+            scaled_size.width() > 0
+            and scaled_size.height() > 0
+            and scaled_size != source_size
+        ):
+            reader.setScaledSize(scaled_size)
+    image = reader.read()
+    if image.isNull():
+        return None
+    if (
+        image.width() > _ATTACHMENT_THUMBNAIL_SIZE.width()
+        or image.height() > _ATTACHMENT_THUMBNAIL_SIZE.height()
+    ):
+        image = image.scaled(
+            _ATTACHMENT_THUMBNAIL_SIZE,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+    out_buffer = QBuffer()
+    if not out_buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+        return None
+    if not image.save(out_buffer, "PNG"):
+        return None
+    encoded = base64.b64encode(bytes(out_buffer.data())).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _decode_data_uri_bytes(data_uri: str) -> bytes | None:
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    comma = data_uri.find(",")
+    if comma < 0:
+        return None
+    payload = data_uri[comma + 1 :]
+    try:
+        encoded = payload.encode("ascii", errors="ignore")
+        if len(encoded) // 4 * 3 > _ATTACHMENT_THUMBNAIL_MAX_SOURCE_BYTES:
+            return None
+        decoded = base64.b64decode(encoded, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) > _ATTACHMENT_THUMBNAIL_MAX_SOURCE_BYTES:
+        return None
+    return decoded
 
 
 def _now_iso() -> str:

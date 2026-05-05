@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,6 +20,82 @@ from .models import (
 )
 
 
+# Manual cache buster for parser-output changes.
+#
+# Two mechanisms feed PARSER_VERSION:
+#   1. Source-hash (dev): hashing this file auto-invalidates the cache
+#      whenever you save the parser during dev — see
+#      ``_compute_parser_version_from_source``.
+#   2. Build-time fingerprint (installer): ``scripts/publish.ps1`` calls
+#      ``scripts/compute-parser-fingerprint.py`` right before PyInstaller
+#      and bundles the result as ``parser_fingerprint.json``. The runtime
+#      reads it when ``sys.frozen`` is true. So installer releases get a
+#      deterministic per-build version automatically — no manual ritual.
+#
+# This BUMP is a manual override for the rare case where parser-output
+# changes live in a file the fingerprint doesn't cover (e.g. a new field
+# added in ``models.py`` that the parser fills). Bump it then.
+_PARSER_BUMP = 1
+
+
+_FINGERPRINT_FILENAME = "parser_fingerprint.json"
+
+
+def _fingerprint_path() -> Path:
+    """Where the build-time fingerprint JSON lives. Separated so tests
+    can monkeypatch the lookup without writing into the real package
+    directory."""
+    return Path(__file__).parent / _FINGERPRINT_FILENAME
+
+
+def _compute_parser_version_from_source() -> int:
+    """Pure source-hash + ``_PARSER_BUMP`` — what dev imports use, and
+    what ``scripts/compute-parser-fingerprint.py`` calls at build time
+    to bake the value into the bundled JSON.
+
+    First 8 hex chars of sha256 over this file's bytes + the bump,
+    cast to a 32-bit int for the SQLite ``parser_version`` column. Any
+    change to this file (including comments/whitespace) flips the value
+    and invalidates the incremental-rescan cache for every session row —
+    the next access lazily reparses, then subsequent ones go fast."""
+    try:
+        source_bytes = Path(__file__).read_bytes()
+    except OSError:
+        # PyInstaller bundles don't keep .py source on disk. The
+        # constant keeps the hash deterministic across frozen runs of
+        # the same build (the fingerprint JSON above is the preferred
+        # path; this is a last-resort fallback for broken bundles).
+        source_bytes = b"codex_quota_viewer.sessions.jsonl_parser:frozen"
+    digest = hashlib.sha256(
+        source_bytes + str(_PARSER_BUMP).encode("ascii")
+    ).hexdigest()[:8]
+    return int(digest, 16)
+
+
+def _compute_parser_version() -> int:
+    """Resolve ``PARSER_VERSION`` at module load.
+
+    Frozen PyInstaller bundles read the build-time fingerprint JSON
+    that ``publish.ps1`` baked in — gives a deterministic version per
+    release without manual ``_PARSER_BUMP`` updates.
+
+    Source checkouts (and frozen builds whose fingerprint went missing
+    or got corrupted) hash this file's source instead. In dev that
+    auto-invalidates the cache whenever the parser is edited."""
+    if getattr(sys, "frozen", False):
+        try:
+            data = json.loads(_fingerprint_path().read_text(encoding="utf-8"))
+            version = int(data["parser_version"])
+            if 0 <= version <= 0xFFFFFFFF:
+                return version
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return _compute_parser_version_from_source()
+
+
+PARSER_VERSION: int = _compute_parser_version()
+
+
 _DATA_URI_MIME_RE = re.compile(r"^data:(image/[a-z0-9.+\-]+);base64,", re.IGNORECASE)
 _GENERIC_DATA_URI_MIME_RE = re.compile(r"^data:([a-z0-9.+\-]+/[a-z0-9.+\-]+);base64,", re.IGNORECASE)
 # Matches both the bare ``<image>`` placeholder Codex used historically
@@ -27,6 +105,7 @@ _GENERIC_DATA_URI_MIME_RE = re.compile(r"^data:([a-z0-9.+\-]+/[a-z0-9.+\-]+);bas
 # adjacency to a real ``input_image`` part — see
 # ``_read_response_message_content``).
 _IMAGE_OPEN_BRACKET_RE = re.compile(r"^<image\b[^>]*>$", re.IGNORECASE)
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)\)")
 
 
 # Codex Desktop serialises @-file mentions as a single ``input_text``
@@ -90,7 +169,7 @@ except ImportError:
 
 # Detail views should never default to a near-full timeline load. The UI seeds
 # the panel from a bounded tail page and pages older rows on demand.
-DEFAULT_TIMELINE_PAGE_SIZE = 200
+DEFAULT_TIMELINE_PAGE_SIZE = 64
 MAX_TIMELINE_PAGE_SIZE = 500
 _PARSER_CACHE_LIMIT = 128
 _EPOCH_TIMESTAMP = "1970-01-01T00:00:00.000Z"
@@ -197,6 +276,11 @@ def parse_session_catalog(file_path: Path) -> ParsedSessionCatalog | None:
                     cleaned_message = message
                     if payload_type == "user_message":
                         cleaned_message, extracted_attachments = _extract_files_mentioned(message)
+                    cleaned_message, markdown_attachments = _extract_markdown_image_attachments(
+                        cleaned_message
+                    )
+                    if markdown_attachments:
+                        extracted_attachments = extracted_attachments + markdown_attachments
                     fallback_messages.append(
                         _TimelineDraft(
                             id=f"event-{sequence + 1}",
@@ -518,6 +602,9 @@ def _read_response_message_content(
     text_value, mention_attachments = _extract_files_mentioned(text_value)
     if mention_attachments:
         attachments.extend(mention_attachments)
+    text_value, markdown_attachments = _extract_markdown_image_attachments(text_value)
+    if markdown_attachments:
+        attachments.extend(markdown_attachments)
     return text_value, tuple(attachments)
 
 
@@ -570,6 +657,59 @@ def _extract_files_mentioned(text: str) -> tuple[str, tuple[Attachment, ...]]:
     if not attachments:
         return text, ()
     return request_body, tuple(attachments)
+
+
+def _extract_markdown_image_attachments(text: str) -> tuple[str, tuple[Attachment, ...]]:
+    """Lift local markdown image links into ``Attachment`` entries.
+
+    Local file paths and ``data:image/...`` data URIs become
+    ``Attachment(kind="image", source="markdown")`` records and the
+    original ``![]()`` fragment is stripped from the displayed text.
+    Remote ``http(s)://`` images stay in the text so Qt can render them
+    inline without a download/zoom card.
+    """
+    if not text or "![" not in text:
+        return text, ()
+    attachments: list[Attachment] = []
+
+    def replace(match: re.Match[str]) -> str:
+        src = match.group("src").strip()
+        alt = match.group("alt") or ""
+        if not src:
+            return match.group(0)
+        if src.startswith("data:"):
+            mime_match = _GENERIC_DATA_URI_MIME_RE.match(src)
+            mime = mime_match.group(1).lower() if mime_match else "image/octet-stream"
+            attachments.append(
+                Attachment(
+                    kind="image",
+                    mime=mime,
+                    data_uri=src,
+                    alt=alt or None,
+                    source="markdown",
+                )
+            )
+            return ""
+        lowered = src.lower()
+        if lowered.startswith(("http://", "https://")):
+            return match.group(0)
+        suffix = Path(src).suffix.lower()
+        mime = _FILE_EXTENSION_MIME.get(suffix)
+        if mime is not None and mime.startswith("image/"):
+            attachments.append(
+                Attachment(
+                    kind="image",
+                    mime=mime,
+                    path=src,
+                    alt=alt or None,
+                    source="markdown",
+                )
+            )
+            return ""
+        return match.group(0)
+
+    rewritten = _MARKDOWN_IMAGE_RE.sub(replace, text)
+    return rewritten, tuple(attachments)
 
 
 def _is_image_part(part: dict[str, Any]) -> bool:

@@ -19,6 +19,7 @@ $assetsDir = Join-Path $root "src\CodexQuotaViewerWindows.Qt\codex_quota_viewer\
 $sessionsSchema = Join-Path $root "src\CodexQuotaViewerWindows.Qt\codex_quota_viewer\sessions\schema.sql"
 $iconPath = Join-Path $assetsDir "cqv-app-icon.ico"
 $tempRoot = Join-Path $root ".tmp"
+$binaryName = "CodeXrosser"
 
 function Copy-TreeRobust {
     param(
@@ -83,22 +84,34 @@ Remove-Item -LiteralPath $pyInstallerDist -Recurse -Force -ErrorAction SilentlyC
 Remove-Item -LiteralPath $pyInstallerWork -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $pyInstallerSpec -Recurse -Force -ErrorAction SilentlyContinue
 
+# Bake the parser fingerprint into the bundle so the runtime
+# ``_compute_parser_version`` in jsonl_parser.py reads a deterministic
+# per-build value when ``sys.frozen`` is true. Frozen builds can't read
+# the .py source on disk, so without this they'd all share the same
+# hash and users wouldn't get auto-reparse on parser upgrades.
+$parserFingerprint = Join-Path $tempRoot "parser_fingerprint.json"
+& $python (Join-Path $PSScriptRoot "compute-parser-fingerprint.py") --output $parserFingerprint
+if ($LASTEXITCODE -ne 0) {
+    throw "compute-parser-fingerprint.py failed with exit code $LASTEXITCODE."
+}
+
 & $python -m PyInstaller `
     --noconfirm `
     --clean `
     --windowed `
     --onedir `
-    --name CodexQuotaViewerWindowsQt `
+    --name $binaryName `
     --icon $iconPath `
     --paths (Join-Path $root "src\CodexQuotaViewerWindows.Qt") `
     --add-data "$assetsDir;codex_quota_viewer/assets" `
     --add-data "$sessionsSchema;codex_quota_viewer/sessions" `
+    --add-data "$parserFingerprint;codex_quota_viewer/sessions" `
     --distpath $pyInstallerDist `
     --workpath $pyInstallerWork `
     --specpath $pyInstallerSpec `
     $entry
 
-Copy-TreeRobust (Join-Path $pyInstallerDist "CodexQuotaViewerWindowsQt") $publishDir
+Copy-TreeRobust (Join-Path $pyInstallerDist $binaryName) $publishDir
 if ($IncludeLegacySessionManager -and (Test-Path -LiteralPath $sessionBundle)) {
     Remove-Item -LiteralPath $publishedSessionBundle -Recurse -Force -ErrorAction SilentlyContinue
     Copy-TreeRobust $sessionBundle $publishedSessionBundle
