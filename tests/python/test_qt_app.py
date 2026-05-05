@@ -16,9 +16,11 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent, QPalette  # noqa: E402
 from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget  # noqa: E402
 
+from codex_quota_viewer import qt_app  # noqa: E402
 from codex_quota_viewer.qt_app import ConfirmPhraseDialog, MainWindow, StatusBanner, StatusDetailsPopup, StatusPopupFrame, _apply_dark_palette  # noqa: E402
 from codex_quota_viewer.models import AccountMetadata, AccountRecord, AuthMode, CodexHomeTarget, UiLanguage, now_utc  # noqa: E402
 from codex_quota_viewer.task_worker import emit, serialize  # noqa: E402
+from PySide6.QtNetwork import QLocalServer  # noqa: E402
 
 
 def test_button_wrapper_ignores_qt_checked_argument() -> None:
@@ -500,3 +502,51 @@ def test_snapshot_target_switch_preserves_settings_scroll() -> None:
 
     assert window._snapshot_target == CodexHomeTarget.REAL
     window._show_settings_preserving_scroll.assert_called_once_with(scroll_value=123)
+
+
+def test_single_instance_socket_name_is_per_user(monkeypatch) -> None:
+    """The socket name suffix must be a sanitized username so multiple
+    Windows users on the same machine don't collide on the global named
+    pipe namespace, and so usernames with spaces / unicode don't break
+    the named-pipe address rules."""
+    monkeypatch.setattr(qt_app.getpass, "getuser", lambda: "Alice Doe")
+    assert qt_app._single_instance_socket_name() == "CodeXrosser-singleton-Alice_Doe"
+
+    monkeypatch.setattr(qt_app.getpass, "getuser", lambda: "用户")
+    name = qt_app._single_instance_socket_name()
+    # Whatever sanitization gave us, must be ASCII and non-empty.
+    assert name.startswith("CodeXrosser-singleton-")
+    assert all(ord(ch) < 128 for ch in name)
+    assert name != "CodeXrosser-singleton-"
+
+
+def test_signal_existing_instance_round_trips(monkeypatch) -> None:
+    """End-to-end of the singleton handoff: when a server is listening,
+    ``_signal_existing_instance`` connects, fires ``newConnection``, and
+    returns True (caller should exit). Without a listener it returns
+    False (caller continues startup)."""
+    app = QApplication.instance() or QApplication([])
+    socket_name = "CodeXrosser-test-singleton"
+    monkeypatch.setattr(qt_app, "_single_instance_socket_name", lambda: socket_name)
+    QLocalServer.removeServer(socket_name)
+
+    # No server yet → should return False quickly.
+    assert qt_app._signal_existing_instance() is False
+
+    server = qt_app._start_singleton_server()
+    assert server is not None
+    received: list[bool] = []
+    server.newConnection.connect(lambda: received.append(True))
+    try:
+        assert qt_app._signal_existing_instance() is True
+        # Spin the event loop until the connection is accepted (or give
+        # up after a short budget; the round-trip is local so should
+        # finish within a few processEvents passes).
+        deadline_ticks = 50
+        while deadline_ticks > 0 and not received:
+            app.processEvents()
+            deadline_ticks -= 1
+        assert received == [True]
+    finally:
+        server.close()
+        QLocalServer.removeServer(socket_name)

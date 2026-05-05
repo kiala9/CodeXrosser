@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import os
 import re
 import sys
@@ -40,6 +41,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
 )
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -3502,8 +3504,92 @@ def _install_acrylic_blur(window: QWidget, enabled: bool = True, tint_alpha: int
         return False
 
 
+_SINGLETON_TIMEOUT_MS = 200
+
+
+def _single_instance_socket_name() -> str:
+    """Per-user named-pipe address. Including the username keeps multiple
+    Windows users on the same machine from colliding on the global pipe
+    namespace."""
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "default"
+    safe_user = re.sub(r"[^A-Za-z0-9_-]", "_", user) or "default"
+    return f"CodeXrosser-singleton-{safe_user}"
+
+
+def _signal_existing_instance() -> bool:
+    """Try to hand off to an already-running instance. Returns True when
+    a peer answered (caller should exit), False when no peer is reachable
+    (caller continues startup as the primary)."""
+    socket_name = _single_instance_socket_name()
+    socket = QLocalSocket()
+    socket.connectToServer(socket_name)
+    if not socket.waitForConnected(_SINGLETON_TIMEOUT_MS):
+        return False
+
+    # Without this, raise_() across processes is silently dropped on
+    # Windows 7+ — the existing instance has to have been granted
+    # foreground rights by the launching process. ASFW_ANY = -1.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        except Exception:
+            pass
+
+    socket.write(b"raise\n")
+    socket.flush()
+    socket.waitForBytesWritten(_SINGLETON_TIMEOUT_MS)
+    socket.disconnectFromServer()
+    return True
+
+
+def _start_singleton_server() -> "QLocalServer | None":
+    """Bind the local server so future launches can find us. ``None`` if
+    we can't take ownership (rare — would degrade to allow-multiple)."""
+    socket_name = _single_instance_socket_name()
+    server = QLocalServer()
+    if server.listen(socket_name):
+        return server
+    # Stale pipe from a crashed previous run — clean and retry once.
+    QLocalServer.removeServer(socket_name)
+    if server.listen(socket_name):
+        return server
+    return None
+
+
+def _bring_window_forward(window: QMainWindow) -> None:
+    """Show + raise + activate the main window. The state-clear handles
+    the case where the user closed-to-tray and the window is sitting
+    minimized; show() handles the case where it was hidden entirely."""
+    if window.isMinimized():
+        window.setWindowState(window.windowState() & ~Qt.WindowMinimized)
+    window.show()
+    window.raise_()
+    window.activateWindow()
+
+
+def _handle_singleton_raise(server: QLocalServer, window: QMainWindow) -> None:
+    socket = server.nextPendingConnection()
+    if socket is not None:
+        try:
+            socket.readAll()
+        finally:
+            socket.disconnectFromServer()
+            socket.deleteLater()
+    _bring_window_forward(window)
+
+
 def run_app() -> int:
     app = QApplication(sys.argv)
+    if _signal_existing_instance():
+        # Another instance picked up the activation — exit quietly so
+        # double-clicking the desktop icon while the app is in the tray
+        # just brings the existing window forward instead of spinning
+        # up a second process.
+        return 0
     _apply_dark_palette(app)
     app.setQuitOnLastWindowClosed(False)
     app_icon = _asset_icon(APP_ICON_ASSET)
@@ -3535,6 +3621,12 @@ def run_app() -> int:
     window.show()
     _install_native_window_chrome(window)
     _install_acrylic_blur(window)
+    singleton_server = _start_singleton_server()
+    if singleton_server is not None:
+        singleton_server.newConnection.connect(
+            lambda: _handle_singleton_raise(singleton_server, window)
+        )
+        app.aboutToQuit.connect(singleton_server.close)
     app.aboutToQuit.connect(lambda: (tray.hide(), services.dispose()))
     return app.exec()
 
